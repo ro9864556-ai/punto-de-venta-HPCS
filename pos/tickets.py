@@ -99,6 +99,8 @@ def build_sale_ticket(sale, items, s, reprint=False):
     if reprint:
         t.text("** REIMPRESIÓN **", "C", bold=True)
     t.cols("Nota / folio:", sale["folio"], bold=True)
+    if s.get("multi_branch") == "1" and s.get("branch_name"):
+        t.cols("Sucursal:", s["branch_name"])
     t.cols("Fecha:", _fecha(sale["created_at"]))
     seller = sale.get("seller_name") or sale.get("cashier") or ""
     if seller:
@@ -237,6 +239,8 @@ def build_cut_ticket(report, s):
         t.text(s.get("store_name", ""), "C", bold=True, big=True)
     t.text("CORTE DE CAJA", "C", bold=True)
     t.sep("=")
+    if report.get("branches"):
+        t.text(report["branches"], "C")
     t.cols("Desde:", report["from"])
     t.cols("Hasta:", report["to"])
     t.cols("Impreso:", report["generated_at"][:16])
@@ -261,6 +265,11 @@ def build_cut_ticket(report, s):
     t.cols("IVA incluido:", m(report["tax"]))
     t.cols("Costo de lo vendido:", m(report["cost"]))
     t.cols("Utilidad bruta:", m(report["profit"]), bold=True)
+    if len(report.get("by_branch") or []) > 1:
+        t.sep()
+        t.text("POR SUCURSAL", bold=True)
+        for row in report["by_branch"]:
+            t.cols(f"{row['branch']} ({row['n']})", m(row["total"]))
     if report.get("by_seller"):
         t.sep()
         t.text("POR VENDEDOR", bold=True)

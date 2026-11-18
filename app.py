@@ -59,8 +59,43 @@ def create_app(db_path=None):
     def handle_print_error(err):
         return jsonify({"error": str(err)}), 502
 
-    def settings():
-        return dbm.get_settings(conn())
+    def branch_id():
+        """Sucursal en la que trabaja el usuario (los administradores pueden cambiarla)."""
+        if "branch" in g:
+            return g.branch
+        u = current_user() if session.get("uid") else None
+        bid = (u or {}).get("branch_id") or session.get("branch_id")
+        ok = bid and conn().execute("SELECT 1 FROM branches WHERE id=? AND active=1", (bid,)).fetchone()
+        if not ok:
+            row = conn().execute("SELECT id FROM branches WHERE active=1 ORDER BY id LIMIT 1").fetchone()
+            bid = row["id"] if row else 1
+        g.branch = int(bid)
+        return g.branch
+
+    def settings(bid=None):
+        return dbm.get_settings(conn(), bid or branch_id())
+
+    def branch_row(bid):
+        row = conn().execute("SELECT * FROM branches WHERE id=?", (bid,)).fetchone()
+        if not row:
+            raise ApiError("Sucursal no encontrada", 404)
+        return dict(row)
+
+    def stock_of(c, pid, bid):
+        r = c.execute("SELECT stock FROM branch_stock WHERE product_id=? AND branch_id=?", (pid, bid)).fetchone()
+        return float(r["stock"]) if r else 0.0
+
+    def add_stock(c, pid, bid, delta):
+        c.execute("""INSERT INTO branch_stock(product_id, branch_id, stock) VALUES (?,?,?)
+                     ON CONFLICT(product_id, branch_id) DO UPDATE SET stock=stock+excluded.stock""", (pid, bid, delta))
+
+    def set_stock(c, pid, bid, value):
+        c.execute("""INSERT INTO branch_stock(product_id, branch_id, stock) VALUES (?,?,?)
+                     ON CONFLICT(product_id, branch_id) DO UPDATE SET stock=excluded.stock""", (pid, bid, value))
+
+    def log_move(c, pid, bid, qty, kind, reference="", notes="", ts=None):
+        c.execute("""INSERT INTO inventory_moves(product_id, branch_id, qty, kind, reference, notes, created_at)
+                     VALUES (?,?,?,?,?,?,?)""", (pid, bid, qty, kind, reference, notes, ts or dbm.now()))
 
     def body():
         return request.get_json(silent=True) or {}
@@ -82,17 +117,33 @@ def create_app(db_path=None):
         d_to = request.args.get("to") or d_from
         return d_from, d_to
 
-    def get_product(pid):
-        row = conn().execute(
-            "SELECT p.*, c.name AS category_name FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.id=?",
-            (pid,)).fetchone()
+    _pcols = []
+
+    def product_select():
+        """Columnas del producto con la existencia de la sucursal actual y el total de todas."""
+        if not _pcols:
+            _pcols.extend(r[1] for r in conn().execute("PRAGMA table_info(products)") if r[1] != "stock")
+        cols = ", ".join(f"p.{x}" for x in _pcols)
+        return (f"SELECT {cols}, c.name AS category_name, "
+                "COALESCE((SELECT stock FROM branch_stock WHERE product_id=p.id AND branch_id=?), 0) AS stock, "
+                "COALESCE((SELECT SUM(stock) FROM branch_stock WHERE product_id=p.id), 0) AS stock_total "
+                "FROM products p LEFT JOIN categories c ON c.id=p.category_id")
+
+    STOCK_EXPR = "COALESCE((SELECT stock FROM branch_stock WHERE product_id=p.id AND branch_id=?), 0)"
+
+    def get_product(pid, bid=None):
+        row = conn().execute(product_select() + " WHERE p.id=?", (bid or branch_id(), pid)).fetchone()
         if not row:
             raise ApiError("Producto no encontrado", 404)
         return dict(row)
 
-    def sync_serial_stock(c, product_id):
-        n = c.execute("SELECT COUNT(*) FROM serials WHERE product_id=? AND status='disponible'", (product_id,)).fetchone()[0]
-        c.execute("UPDATE products SET stock=?, updated_at=? WHERE id=?", (n, dbm.now(), product_id))
+    def sync_serial_stock(c, product_id, bid=None):
+        """La existencia de un producto con IMEI = equipos disponibles en esa sucursal."""
+        bids = [bid] if bid else [r["id"] for r in c.execute("SELECT id FROM branches")]
+        for b in bids:
+            n = c.execute("SELECT COUNT(*) FROM serials WHERE product_id=? AND status='disponible' AND branch_id=?",
+                          (product_id, b)).fetchone()[0]
+            set_stock(c, product_id, b, n)
 
     # ------------------------------------------------------------ usuarios y permisos
     # Lo que no aparece aquí lo puede usar cualquier usuario con sesión iniciada.
@@ -102,13 +153,14 @@ def create_app(db_path=None):
         "api_next_sku", "api_new_barcode", "api_pricing_suggest", "api_pricing_bulk", "api_delete_serial",
         "api_cancel_sale", "api_export_csv", "api_import_csv", "api_csv_template", "api_backup",
         "api_users", "api_user_create", "api_user_update",
+        "api_branch_create", "api_branch_update", "api_branch_select", "api_agent_config",
     }
     STAFF_ONLY = {  # administrador y cajero
         "api_add_serials", "api_inventory_adjust", "api_inventory_moves", "api_cash_create", "api_cash_list",
         "api_report", "corte_page", "api_corte_print", "api_dashboard", "api_label_preview", "api_label_zpl",
-        "api_create_claim", "api_print_claim",
+        "api_create_claim", "api_print_claim", "api_inventory_transfer",
     }
-    PUBLIC = {"login_page", "api_login", "static", "logo_png"}
+    PUBLIC = {"login_page", "api_login", "static", "logo_png", "api_agent_jobs", "api_agent_job_done"}
     ADMIN_ONLY.add("api_upload_logo")
     DATA_DIR = os.path.dirname(os.path.abspath(app.config["DB_PATH"]))
 
@@ -155,7 +207,7 @@ def create_app(db_path=None):
             g.user = None
             uid = session.get("uid")
             if uid:
-                row = conn().execute("SELECT id, username, full_name, role, must_change, active FROM users WHERE id=?",
+                row = conn().execute("SELECT id, username, full_name, role, must_change, active, branch_id FROM users WHERE id=?",
                                      (uid,)).fetchone()
                 if row and row["active"]:
                     g.user = dict(row)
@@ -219,7 +271,153 @@ def create_app(db_path=None):
     def api_me():
         u = dict(current_user())
         u["role_name"] = dbm.ROLES.get(u["role"], u["role"])
+        b = branch_row(branch_id())
+        u["branch"] = {"id": b["id"], "name": b["name"], "code": b["code"]}
+        u["can_switch_branch"] = u["role"] == "admin" and not u.get("branch_id")
         return jsonify(u)
+
+    # ------------------------------------------------------------ sucursales
+    def _branch_public(b, with_secret=False):
+        out = {k: b[k] for k in ("id", "name", "code", "address", "phone", "active")}
+        if with_secret:
+            out["agent_token"] = b["agent_token"]
+            seen = conn().execute("SELECT value FROM branch_settings WHERE branch_id=? AND key='agent_last_seen'", (b["id"],)).fetchone()
+            out["agent_last_seen"] = seen["value"] if seen else None
+            out["pending_jobs"] = conn().execute("SELECT COUNT(*) FROM print_jobs WHERE branch_id=? AND status IN ('pendiente','enviado')",
+                                                 (b["id"],)).fetchone()[0]
+        return out
+
+    @app.get("/api/branches")
+    def api_branches():
+        admin = current_user()["role"] == "admin"
+        rows = conn().execute("SELECT * FROM branches ORDER BY id").fetchall()
+        return jsonify([_branch_public(dict(r), admin) for r in rows if admin or r["active"]])
+
+    def _branch_values(d):
+        name = (d.get("name") or "").strip()
+        code = re.sub(r"[^A-Z0-9]", "", (d.get("code") or "").upper())[:4]
+        if not name or not code:
+            raise ApiError("Nombre y clave de folio son obligatorios")
+        return name, code, (d.get("address") or "").strip(), (d.get("phone") or "").strip()
+
+    @app.post("/api/branches")
+    def api_branch_create():
+        import secrets
+        name, code, address, phone = _branch_values(body())
+        c = conn()
+        try:
+            bid = c.execute("INSERT INTO branches(name, code, address, phone, agent_token, created_at) VALUES (?,?,?,?,?,?)",
+                            (name, code, address, phone, secrets.token_urlsafe(18), dbm.now())).lastrowid
+        except Exception:
+            raise ApiError("Ya existe una sucursal con ese nombre o clave")
+        for key, value in (("store_address", address), ("store_phone", phone)):
+            c.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?,?,?)", (bid, key, value))
+        c.commit()
+        return jsonify({"id": bid}), 201
+
+    @app.put("/api/branches/<int:bid>")
+    def api_branch_update(bid):
+        d = body()
+        branch_row(bid)
+        name, code, address, phone = _branch_values(d)
+        active = 0 if d.get("active") in (0, False, "0") else 1
+        c = conn()
+        if not active and not c.execute("SELECT COUNT(*) FROM branches WHERE active=1 AND id<>?", (bid,)).fetchone()[0]:
+            raise ApiError("Debe quedar al menos una sucursal activa")
+        try:
+            c.execute("UPDATE branches SET name=?, code=?, address=?, phone=?, active=? WHERE id=?", (name, code, address, phone, active, bid))
+        except Exception:
+            raise ApiError("Ya existe una sucursal con ese nombre o clave")
+        for key, value in (("store_address", address), ("store_phone", phone)):
+            c.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?,?,?)", (bid, key, value))
+        c.commit()
+        return jsonify({"ok": True})
+
+    @app.post("/api/branch/select")
+    def api_branch_select():
+        """El administrador elige en qué sucursal está trabajando."""
+        bid = int(body().get("branch_id") or 0)
+        b = branch_row(bid)
+        if not b["active"]:
+            raise ApiError("La sucursal está desactivada")
+        session["branch_id"] = bid
+        return jsonify({"ok": True, "branch": _branch_public(b)})
+
+    def report_branches():
+        """Sucursales que entran en reportes/listados: cajero y vendedor solo la suya."""
+        if current_user()["role"] != "admin" or current_user().get("branch_id"):
+            return [branch_id()]
+        sel = request.args.get("branch") or ""
+        if sel == "all":
+            return None
+        return [int(sel)] if sel.isdigit() else [branch_id()]
+
+    def branch_filter(column, bids):
+        if bids is None:
+            return "", []
+        return f" AND {column} IN ({','.join('?' * len(bids))})", list(bids)
+
+    # ------------------------------------------------------------ agente de impresión de cada sucursal
+    def _agent_branch():
+        code = (request.args.get("code") or body().get("code") or "").upper()
+        token = request.args.get("token") or body().get("token") or ""
+        b = conn().execute("SELECT * FROM branches WHERE UPPER(code)=? AND active=1", (code,)).fetchone()
+        import hmac
+        if not b or not token or not hmac.compare_digest(b["agent_token"], token):
+            raise ApiError("Sucursal o clave del agente incorrecta", 401)
+        return dict(b)
+
+    @app.get("/api/agent/jobs")
+    def api_agent_jobs():
+        import base64
+        b = _agent_branch()
+        c = conn()
+        c.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?, 'agent_last_seen', ?)", (b["id"], dbm.now()))
+        # trabajos que se enviaron hace más de 2 minutos sin confirmación se reintentan
+        c.execute("""UPDATE print_jobs SET status='pendiente' WHERE branch_id=? AND status='enviado'
+                     AND created_at < datetime('now', 'localtime', '-2 minutes')""", (b["id"],))
+        rows = c.execute("SELECT * FROM print_jobs WHERE branch_id=? AND status='pendiente' ORDER BY id LIMIT 20", (b["id"],)).fetchall()
+        for r in rows:
+            c.execute("UPDATE print_jobs SET status='enviado' WHERE id=?", (r["id"],))
+        c.commit()
+        return jsonify({"branch": b["name"], "jobs": [{"id": r["id"], "target": r["target"], "title": r["title"],
+                                                        "data": base64.b64encode(r["data"]).decode()} for r in rows]})
+
+    @app.post("/api/agent/jobs/<int:job_id>/done")
+    def api_agent_job_done(job_id):
+        b = _agent_branch()
+        d = body()
+        c = conn()
+        c.execute("UPDATE print_jobs SET status=?, error=?, done_at=? WHERE id=? AND branch_id=?",
+                  ("impreso" if d.get("ok") else "error", (d.get("error") or "")[:500], dbm.now(), job_id, b["id"]))
+        c.commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/branches/<int:bid>/agente.json")
+    def api_agent_config(bid):
+        """Archivo de configuración listo para el agente de impresión de esa sucursal."""
+        import json
+        b = branch_row(bid)
+        s = settings(bid)
+        cfg = {
+            "servidor": request.host_url.rstrip("/"),
+            "sucursal": b["code"],
+            "token": b["agent_token"],
+            "impresora_tickets": {"modo": "local", "nombre": s.get("ticket_printer_name") or "Hospital para celulares Shop",
+                                  "host": s.get("ticket_printer_host", ""), "puerto": int(num(s.get("ticket_printer_port"), 9100))},
+            "impresora_etiquetas": {"modo": "local", "nombre": s.get("label_printer_name", ""),
+                                    "host": s.get("label_printer_host", ""), "puerto": int(num(s.get("label_printer_port"), 9100))},
+        }
+        return Response(json.dumps(cfg, ensure_ascii=False, indent=2), mimetype="application/json",
+                        headers={"Content-Disposition": "attachment; filename=agente.json"})
+
+    def enqueue_print(bid, target, data, title=""):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        c = conn()
+        c.execute("INSERT INTO print_jobs(branch_id, target, title, data, created_at) VALUES (?,?,?,?,?)",
+                  (bid, target, title, data, dbm.now()))
+        c.commit()
 
     @app.post("/api/me/password")
     def api_change_password():
@@ -237,7 +435,8 @@ def create_app(db_path=None):
 
     @app.get("/api/sellers")
     def api_sellers():
-        rows = conn().execute("SELECT id, full_name, role FROM users WHERE active=1 ORDER BY full_name").fetchall()
+        rows = conn().execute("SELECT id, full_name, role FROM users WHERE active=1 AND (branch_id IS NULL OR branch_id=?) ORDER BY full_name",
+                              (branch_id(),)).fetchall()
         return jsonify(dbm.rows_to_list(rows))
 
     @app.get("/api/device-models")
@@ -254,7 +453,7 @@ def create_app(db_path=None):
 
     @app.get("/api/users")
     def api_users():
-        rows = conn().execute("SELECT id, username, full_name, role, active, must_change, created_at FROM users ORDER BY role, full_name").fetchall()
+        rows = conn().execute("SELECT id, username, full_name, role, active, must_change, created_at, branch_id FROM users ORDER BY role, full_name").fetchall()
         return jsonify({"users": dbm.rows_to_list(rows), "roles": dbm.ROLES})
 
     def _user_values(d, require_password):
@@ -268,7 +467,14 @@ def create_app(db_path=None):
         pwd = d.get("password") or ""
         if (require_password or pwd) and len(pwd) < 4:
             raise ApiError("La contraseña debe tener al menos 4 caracteres")
-        return username, full_name, role, pwd
+        # cajeros y vendedores trabajan en una sucursal; un administrador puede quedar en "todas"
+        bid = d.get("branch_id")
+        bid = int(bid) if str(bid or "").isdigit() and int(bid) else None
+        if bid:
+            branch_row(bid)
+        elif role != "admin":
+            bid = branch_id()
+        return username, full_name, role, pwd, bid
 
     def _check_last_admin(uid, role, active):
         if role == "admin" and active:
@@ -279,10 +485,10 @@ def create_app(db_path=None):
 
     @app.post("/api/users")
     def api_user_create():
-        username, full_name, role, pwd = _user_values(body(), True)
+        username, full_name, role, pwd, ubid = _user_values(body(), True)
         try:
-            cur = conn().execute("INSERT INTO users(username, full_name, role, password_hash, created_at) VALUES (?,?,?,?,?)",
-                                 (username, full_name, role, generate_password_hash(pwd), dbm.now()))
+            cur = conn().execute("INSERT INTO users(username, full_name, role, password_hash, created_at, branch_id) VALUES (?,?,?,?,?,?)",
+                                 (username, full_name, role, generate_password_hash(pwd), dbm.now(), ubid))
             conn().commit()
         except Exception:
             raise ApiError(f"El usuario '{username}' ya existe")
@@ -291,12 +497,13 @@ def create_app(db_path=None):
     @app.put("/api/users/<int:uid>")
     def api_user_update(uid):
         d = body()
-        username, full_name, role, pwd = _user_values(d, False)
+        username, full_name, role, pwd, ubid = _user_values(d, False)
         active = 0 if d.get("active") in (0, False, "0") else 1
         _check_last_admin(uid, role, active)
         c = conn()
         try:
-            c.execute("UPDATE users SET username=?, full_name=?, role=?, active=? WHERE id=?", (username, full_name, role, active, uid))
+            c.execute("UPDATE users SET username=?, full_name=?, role=?, active=?, branch_id=? WHERE id=?",
+                      (username, full_name, role, active, ubid, uid))
         except Exception:
             raise ApiError(f"El usuario '{username}' ya existe")
         if pwd:
@@ -320,8 +527,11 @@ def create_app(db_path=None):
     def api_put_settings():
         data = body()
         c = conn()
+        bid = branch_id()
         for key, value in data.items():
-            if key in dbm.DEFAULT_SETTINGS or key in ("ticket_zebra_width_mm", "allow_negative_stock"):
+            if key in dbm.BRANCH_KEYS:
+                c.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?,?,?)", (bid, key, str(value)))
+            elif key in dbm.DEFAULT_SETTINGS or key in ("ticket_zebra_width_mm", "allow_negative_stock"):
                 c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(value)))
         c.commit()
         return jsonify({"settings": settings()})
@@ -397,16 +607,17 @@ def create_app(db_path=None):
     @app.get("/api/products")
     def api_products():
         q = (request.args.get("q") or "").strip()
-        sql = ["""SELECT p.*, c.name AS category_name FROM products p
-                  LEFT JOIN categories c ON c.id=p.category_id WHERE 1=1"""]
-        params = []
+        bid = branch_id()
+        sql = [product_select() + " WHERE 1=1"]
+        params = [bid]
         if request.args.get("inactive") != "1":
             sql.append("AND p.active=1")
         if request.args.get("category"):
             sql.append("AND p.category_id=?")
             params.append(request.args["category"])
         if request.args.get("low") == "1":
-            sql.append("AND p.track_stock=1 AND p.stock<=p.min_stock")
+            sql.append(f"AND p.track_stock=1 AND {STOCK_EXPR}<=p.min_stock")
+            params.append(bid)
         if q:
             for word in q.split():
                 like = f"%{word}%"
@@ -421,8 +632,12 @@ def create_app(db_path=None):
     def api_product(pid):
         p = get_product(pid)
         p["serials"] = dbm.rows_to_list(conn().execute(
-            "SELECT s.*, sa.folio FROM serials s LEFT JOIN sales sa ON sa.id=s.sale_id WHERE s.product_id=? ORDER BY s.status, s.id DESC",
+            """SELECT s.*, sa.folio, b.name AS branch_name FROM serials s LEFT JOIN sales sa ON sa.id=s.sale_id
+               LEFT JOIN branches b ON b.id=s.branch_id WHERE s.product_id=? ORDER BY s.status, s.id DESC""",
             (pid,)).fetchall())
+        p["stock_by_branch"] = dbm.rows_to_list(conn().execute(
+            """SELECT b.id, b.name, COALESCE(bs.stock, 0) stock FROM branches b
+               LEFT JOIN branch_stock bs ON bs.branch_id=b.id AND bs.product_id=? WHERE b.active=1 ORDER BY b.id""", (pid,)).fetchall())
         return jsonify(strip_costs(p))
 
     @app.get("/api/products/next-sku")
@@ -484,9 +699,8 @@ def create_app(db_path=None):
         pid = cur.lastrowid
         initial = num(d.get("initial_stock"), 0)
         if initial and not vals["serialized"]:
-            c.execute("UPDATE products SET stock=? WHERE id=?", (initial, pid))
-            c.execute("INSERT INTO inventory_moves(product_id, qty, kind, notes, created_at) VALUES (?,?,?,?,?)",
-                      (pid, initial, "entrada", "Inventario inicial", ts))
+            add_stock(c, pid, branch_id(), initial)
+            log_move(c, pid, branch_id(), initial, "entrada", notes="Inventario inicial", ts=ts)
         imeis = _parse_imeis(d.get("imeis"))
         if imeis and vals["serialized"]:
             _add_serials(c, pid, imeis, "Alta de producto")
@@ -511,9 +725,8 @@ def create_app(db_path=None):
                                 f"VALUES ({', '.join('?' * len(cols))}, 0, ?, ?)", [vals[k] for k in cols] + [ts, ts]).lastrowid
                 initial = num(row.get("initial_stock"), 0)
                 if initial and vals["track_stock"] and not vals["serialized"]:
-                    c.execute("UPDATE products SET stock=? WHERE id=?", (initial, pid))
-                    c.execute("INSERT INTO inventory_moves(product_id, qty, kind, notes, created_at) VALUES (?,?,?,?,?)",
-                              (pid, initial, "entrada", "Inventario inicial", ts))
+                    add_stock(c, pid, branch_id(), initial)
+                    log_move(c, pid, branch_id(), initial, "entrada", notes="Inventario inicial", ts=ts)
                 created.append({"id": pid, "sku": vals["sku"], "name": vals["name"]})
             except ApiError as exc:
                 errors.append(f"Renglón {n} ({row.get('name')}): {exc}")
@@ -566,6 +779,9 @@ def create_app(db_path=None):
         if serial:
             if serial["status"] != "disponible":
                 raise ApiError(f"El IMEI {code} ya fue vendido.", 409)
+            if serial["branch_id"] != branch_id():
+                other = branch_row(serial["branch_id"])["name"]
+                raise ApiError(f"Ese equipo está en la sucursal {other}. Haz un traspaso en Inventario para venderlo aquí.", 409)
             return jsonify({"product": strip_costs(get_product(serial["product_id"])), "imei": serial["imei"]})
         raise ApiError(f"No se encontró ningún producto con el código {code}", 404)
 
@@ -627,17 +843,18 @@ def create_app(db_path=None):
 
     def _add_serials(c, pid, imeis, notes=""):
         ts = dbm.now()
+        bid = branch_id()
         added, skipped = [], []
         for imei in imeis:
             if c.execute("SELECT 1 FROM serials WHERE imei=? OR imei2=?", (imei, imei)).fetchone():
                 skipped.append(imei)
                 continue
-            c.execute("INSERT INTO serials(product_id, imei, status, created_at) VALUES (?,?,?,?)", (pid, imei, "disponible", ts))
+            c.execute("INSERT INTO serials(product_id, imei, status, branch_id, created_at) VALUES (?,?,?,?,?)",
+                      (pid, imei, "disponible", bid, ts))
             added.append(imei)
         if added:
-            c.execute("INSERT INTO inventory_moves(product_id, qty, kind, notes, created_at) VALUES (?,?,?,?,?)",
-                      (pid, len(added), "entrada", (notes + " IMEI: " + ", ".join(added))[:900], ts))
-        sync_serial_stock(c, pid)
+            log_move(c, pid, bid, len(added), "entrada", notes=(notes + " IMEI: " + ", ".join(added))[:900], ts=ts)
+        sync_serial_stock(c, pid, bid)
         return added, skipped
 
     @app.post("/api/products/<int:pid>/serials")
@@ -662,9 +879,8 @@ def create_app(db_path=None):
         if row["status"] != "disponible":
             raise ApiError("No se puede borrar un IMEI vendido")
         c.execute("DELETE FROM serials WHERE id=?", (sid,))
-        c.execute("INSERT INTO inventory_moves(product_id, qty, kind, notes, created_at) VALUES (?,?,?,?,?)",
-                  (row["product_id"], -1, "salida", f"Baja de IMEI {row['imei']}", dbm.now()))
-        sync_serial_stock(c, row["product_id"])
+        log_move(c, row["product_id"], row["branch_id"], -1, "salida", notes=f"Baja de IMEI {row['imei']}")
+        sync_serial_stock(c, row["product_id"], row["branch_id"])
         c.commit()
         return jsonify({"ok": True})
 
@@ -681,23 +897,68 @@ def create_app(db_path=None):
         elif kind == "salida":
             delta = -abs(qty)
         elif kind == "conteo":
-            delta = qty - float(p["stock"])
+            delta = qty - stock_of(conn(), p["id"], branch_id())
         else:
             raise ApiError("Tipo de movimiento inválido")
         c = conn()
-        ts = dbm.now()
-        c.execute("UPDATE products SET stock=stock+?, updated_at=? WHERE id=?", (delta, ts, p["id"]))
+        bid = branch_id()
+        add_stock(c, p["id"], bid, delta)
         if d.get("cost") not in (None, "") and kind == "entrada":
-            c.execute("UPDATE products SET cost=? WHERE id=?", (num(d.get("cost")), p["id"]))
-        c.execute("INSERT INTO inventory_moves(product_id, qty, kind, notes, created_at) VALUES (?,?,?,?,?)",
-                  (p["id"], delta, kind, d.get("notes", ""), ts))
+            c.execute("UPDATE products SET cost=?, updated_at=? WHERE id=?", (num(d.get("cost")), dbm.now(), p["id"]))
+        log_move(c, p["id"], bid, delta, kind, notes=d.get("notes", ""))
         c.commit()
         return jsonify(get_product(p["id"]))
 
+    @app.post("/api/inventory/transfer")
+    def api_inventory_transfer():
+        """Traspaso de mercancía de la sucursal actual a otra."""
+        d = body()
+        p = get_product(int(d.get("product_id") or 0))
+        src = branch_id()
+        dst = int(d.get("to_branch_id") or 0)
+        dst_row = branch_row(dst)
+        if dst == src:
+            raise ApiError("Elige una sucursal distinta a la actual")
+        if not dst_row["active"]:
+            raise ApiError("La sucursal destino está desactivada")
+        c = conn()
+        ts = dbm.now()
+        src_name = branch_row(src)["name"]
+        notes = (d.get("notes") or "").strip()
+        if p["serialized"]:
+            imeis = _parse_imeis(d.get("imeis"))
+            if not imeis:
+                raise ApiError("Escanea los IMEI que se van a traspasar")
+            for imei in imeis:
+                ser = c.execute("SELECT * FROM serials WHERE product_id=? AND imei=?", (p["id"], imei)).fetchone()
+                if not ser or ser["status"] != "disponible" or ser["branch_id"] != src:
+                    raise ApiError(f"El IMEI {imei} no está disponible en {src_name}")
+            for imei in imeis:
+                c.execute("UPDATE serials SET branch_id=? WHERE product_id=? AND imei=?", (dst, p["id"], imei))
+            qty = len(imeis)
+            detail = "IMEI: " + ", ".join(imeis)
+            sync_serial_stock(c, p["id"], src)
+            sync_serial_stock(c, p["id"], dst)
+        else:
+            qty = abs(num(d.get("qty")))
+            if not qty:
+                raise ApiError("Captura la cantidad")
+            if p["track_stock"] and stock_of(c, p["id"], src) < qty and settings().get("allow_negative_stock", "0") != "1":
+                raise ApiError(f"Solo hay {stock_of(c, p['id'], src):g} en {src_name}")
+            add_stock(c, p["id"], src, -qty)
+            add_stock(c, p["id"], dst, qty)
+            detail = ""
+        log_move(c, p["id"], src, -qty, "traspaso", f"→ {dst_row['name']}", f"{detail} {notes}".strip(), ts)
+        log_move(c, p["id"], dst, qty, "traspaso", f"← {src_name}", f"{detail} {notes}".strip(), ts)
+        c.commit()
+        return jsonify({"message": f"{qty:g} pieza(s) de {p['name']} enviadas a {dst_row['name']}", "product": get_product(p["id"])})
+
     @app.get("/api/inventory/moves")
     def api_inventory_moves():
-        sql = """SELECT m.*, p.name, p.sku FROM inventory_moves m JOIN products p ON p.id=m.product_id WHERE 1=1"""
-        params = []
+        sql = """SELECT m.*, p.name, p.sku, b.name AS branch_name FROM inventory_moves m JOIN products p ON p.id=m.product_id
+                 LEFT JOIN branches b ON b.id=m.branch_id WHERE 1=1"""
+        extra, params = branch_filter("m.branch_id", report_branches())
+        sql += extra
         if request.args.get("product_id"):
             sql += " AND m.product_id=?"
             params.append(request.args["product_id"])
@@ -734,6 +995,8 @@ def create_app(db_path=None):
                 ser = c.execute("SELECT * FROM serials WHERE product_id=? AND imei=?", (p["id"], imei)).fetchone()
                 if not ser or ser["status"] != "disponible" or imei in used_imeis:
                     raise ApiError(f"El IMEI {imei} no está disponible")
+                if ser["branch_id"] != branch_id():
+                    raise ApiError(f"El equipo {imei} está en la sucursal {branch_row(ser['branch_id'])['name']}")
                 used_imeis.add(imei)
             line_total = r2(qty * price - discount)
             if line_total < 0:
@@ -743,7 +1006,7 @@ def create_app(db_path=None):
                           "warranty": max(0, warranty), "changes": max(0, min(changes, 20))})
         if check_stock and not allow_negative:
             for pid, qty in qty_by_product.items():
-                p = get_product(pid)
+                p = get_product(pid)  # existencia de la sucursal actual
                 if p["track_stock"] and not p["serialized"] and float(p["stock"]) < qty:
                     raise ApiError(f"Sin existencia suficiente de {p['name']} (hay {float(p['stock']):g})")
         subtotal = r2(sum(l["total"] for l in lines))
@@ -786,12 +1049,13 @@ def create_app(db_path=None):
                        l["imei"], l["warranty"], l["changes"]))
 
     def _new_sale_row(c, status):
-        s = settings()
+        bid = branch_id()
         ts = dbm.now()
-        cur = c.execute("INSERT INTO sales(folio, created_at, subtotal, total, payment_method, status) VALUES (?,?,0,0,'',?)",
-                        (f"TMP-{ts}-{os.getpid()}-{id(c)}", ts, status))
+        cur = c.execute("INSERT INTO sales(folio, created_at, subtotal, total, payment_method, status, branch_id) VALUES (?,?,0,0,'',?,?)",
+                        (f"TMP-{ts}-{os.getpid()}-{id(c)}", ts, status, bid))
         sale_id = cur.lastrowid
-        c.execute("UPDATE sales SET folio=? WHERE id=?", (f"{s.get('folio_prefix', 'V-')}{sale_id:06d}", sale_id))
+        # el folio lleva la clave de la sucursal: V-000123, S2-000124…
+        c.execute("UPDATE sales SET folio=? WHERE id=?", (f"{branch_row(bid)['code']}-{sale_id:06d}", sale_id))
         return sale_id
 
     @app.post("/api/sales/pending")
@@ -807,7 +1071,7 @@ def create_app(db_path=None):
             model = dimei = ""  # el equipo del cliente solo se registra cuando la venta lleva garantía
         sale_id = int(d.get("pending_id") or 0)
         if sale_id:  # actualizar una nota pendiente propia
-            row = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente'", (sale_id,)).fetchone()
+            row = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente' AND branch_id=?", (sale_id, branch_id())).fetchone()
             if not row or (is_vendedor() and row["seller_id"] != user["id"]):
                 raise ApiError("Nota pendiente no encontrada", 404)
         else:
@@ -825,8 +1089,8 @@ def create_app(db_path=None):
     def api_list_pending():
         sql = """SELECT s.id, s.folio, s.sent_at, s.total, s.customer_name, s.customer_phone, s.seller_id, s.seller_name,
                         s.device_model, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) units
-                 FROM sales s WHERE s.status='pendiente'"""
-        params = []
+                 FROM sales s WHERE s.status='pendiente' AND s.branch_id=?"""
+        params = [branch_id()]
         if is_vendedor():
             sql += " AND s.seller_id=?"
             params.append(current_user()["id"])
@@ -853,7 +1117,8 @@ def create_app(db_path=None):
         c = conn()
         pending = None
         if d.get("pending_id"):
-            pending = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente'", (int(d["pending_id"]),)).fetchone()
+            pending = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente' AND branch_id=?",
+                                (int(d["pending_id"]), branch_id())).fetchone()
             if not pending:
                 raise ApiError("Esa nota ya fue cobrada o descartada")
         calc = _sale_lines(d, c)
@@ -901,23 +1166,22 @@ def create_app(db_path=None):
                    seller["id"], seller["full_name"], sale_id))
         folio = c.execute("SELECT folio FROM sales WHERE id=?", (sale_id,)).fetchone()["folio"]
         _insert_items(c, sale_id, lines)
+        bid = branch_id()
         for l in lines:
             p = l["p"]
             if p["serialized"]:
                 c.execute("UPDATE serials SET status='vendido', sale_id=? WHERE product_id=? AND imei=?", (sale_id, p["id"], l["imei"]))
-                sync_serial_stock(c, p["id"])
-                c.execute("INSERT INTO inventory_moves(product_id, qty, kind, reference, notes, created_at) VALUES (?,?,?,?,?,?)",
-                          (p["id"], -1, "venta", folio, f"IMEI {l['imei']}", ts))
+                sync_serial_stock(c, p["id"], bid)
+                log_move(c, p["id"], bid, -1, "venta", folio, f"IMEI {l['imei']}", ts)
             elif p["track_stock"]:
-                c.execute("UPDATE products SET stock=stock-?, updated_at=? WHERE id=?", (l["qty"], ts, p["id"]))
-                c.execute("INSERT INTO inventory_moves(product_id, qty, kind, reference, created_at) VALUES (?,?,?,?,?)",
-                          (p["id"], -l["qty"], "venta", folio, ts))
+                add_stock(c, p["id"], bid, -l["qty"])
+                log_move(c, p["id"], bid, -l["qty"], "venta", folio, ts=ts)
         c.commit()
         sale = _sale(sale_id)
         result = {"sale": strip_costs(dict(sale))}
         if d.get("print", True):
             try:
-                result["print"] = _print_sale(sale, s)
+                result["print"] = _print_sale(sale, settings(sale["branch_id"]))
             except printing.PrintError as exc:
                 result["print_error"] = str(exc)
         return jsonify(result), 201
@@ -935,8 +1199,10 @@ def create_app(db_path=None):
     def api_sales():
         d_from, d_to = date_range()
         q = (request.args.get("q") or "").strip()
-        sql = "SELECT s.*, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) AS units FROM sales s WHERE s.status<>'descartada'"
-        params = []
+        sql = """SELECT s.*, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) AS units, b.name AS branch_name
+                 FROM sales s LEFT JOIN branches b ON b.id=s.branch_id WHERE s.status<>'descartada'"""
+        extra, params = branch_filter("s.branch_id", report_branches())
+        sql += extra
         if not (q and request.args.get("all") == "1"):
             sql += " AND date(s.created_at) BETWEEN ? AND ?"
             params += [d_from, d_to]
@@ -973,15 +1239,14 @@ def create_app(db_path=None):
             p = c.execute("SELECT * FROM products WHERE id=?", (it["product_id"],)).fetchone()
             if not p:
                 continue
+            bid = sale["branch_id"]
             if it["imei"]:
-                c.execute("UPDATE serials SET status='disponible', sale_id=NULL WHERE imei=?", (it["imei"],))
-                sync_serial_stock(c, p["id"])
-                c.execute("INSERT INTO inventory_moves(product_id, qty, kind, reference, notes, created_at) VALUES (?,?,?,?,?,?)",
-                          (p["id"], 1, "cancelación", sale["folio"], f"IMEI {it['imei']}", ts))
+                c.execute("UPDATE serials SET status='disponible', sale_id=NULL, branch_id=? WHERE imei=?", (bid, it["imei"]))
+                sync_serial_stock(c, p["id"], bid)
+                log_move(c, p["id"], bid, 1, "cancelación", sale["folio"], f"IMEI {it['imei']}", ts)
             elif p["track_stock"]:
-                c.execute("UPDATE products SET stock=stock+? WHERE id=?", (it["qty"], p["id"]))
-                c.execute("INSERT INTO inventory_moves(product_id, qty, kind, reference, created_at) VALUES (?,?,?,?,?)",
-                          (p["id"], it["qty"], "cancelación", sale["folio"], ts))
+                add_stock(c, p["id"], bid, it["qty"])
+                log_move(c, p["id"], bid, it["qty"], "cancelación", sale["folio"], ts=ts)
         notes = (sale.get("notes") or "") + (f" | Cancelada: {reason}" if reason else "")
         c.execute("UPDATE sales SET status='cancelada', cancelled_at=?, notes=? WHERE id=?", (ts, notes.strip(" |"), sale_id))
         c.commit()
@@ -990,15 +1255,23 @@ def create_app(db_path=None):
     # ------------------------------------------------------------ tickets
     def _dispatch_ticket(t, s, title, copies=1):
         mode = s.get("ticket_printer_mode", "browser")
+        bid = int(s.get("branch_id") or branch_id())
         if mode == "browser":
             return jsonify({"mode": "browser"})
         if mode == "zebra":
             data = tickets.to_zpl(t, s, logo_file())
             for _ in range(copies):
-                printing.send(data, s.get("label_printer_mode") if s.get("label_printer_mode") != "download" else "network",
-                              s.get("label_printer_host"), s.get("label_printer_port"), s.get("label_printer_name"))
+                if s.get("label_printer_mode") == "agent":
+                    enqueue_print(bid, "label", data, title)
+                else:
+                    printing.send(data, s.get("label_printer_mode") if s.get("label_printer_mode") != "download" else "network",
+                                  s.get("label_printer_host"), s.get("label_printer_port"), s.get("label_printer_name"))
             return jsonify({"mode": "zebra", "message": f"{title}: enviado a la Zebra"})
         data = tickets.to_escpos(t, open_drawer=s.get("ticket_open_drawer") == "1", logo_path=logo_file())
+        if mode == "agent":
+            for _ in range(copies):
+                enqueue_print(bid, "ticket", data, title)
+            return jsonify({"mode": "agent", "message": f"{title}: enviado a la impresora de {s.get('branch_name', 'la sucursal')}"})
         for _ in range(copies):
             printing.send(data, mode, s.get("ticket_printer_host"), s.get("ticket_printer_port"), s.get("ticket_printer_name"))
         return jsonify({"mode": mode, "message": f"{title}: enviado a la impresora de tickets"})
@@ -1015,8 +1288,8 @@ def create_app(db_path=None):
 
     @app.get("/tickets/<int:sale_id>")
     def ticket_page(sale_id):
-        s = settings()
         sale = _sale(sale_id)
+        s = settings(sale["branch_id"])  # dirección y teléfono de la sucursal donde se vendió
         fmt = request.args.get("format", "html")
         t = tickets.build_sale_ticket(sale, sale["items"], s, reprint=request.args.get("reprint") == "1")
         if fmt == "txt":
@@ -1109,14 +1382,13 @@ def create_app(db_path=None):
         took = 0
         p = c.execute("SELECT * FROM products WHERE id=?", (it["product_id"],)).fetchone() if it["product_id"] else None
         if p and p["track_stock"] and not p["serialized"] and d.get("take_stock", True):
-            c.execute("UPDATE products SET stock=stock-1, updated_at=? WHERE id=?", (ts, p["id"]))
-            c.execute("INSERT INTO inventory_moves(product_id, qty, kind, reference, notes, created_at) VALUES (?,?,?,?,?,?)",
-                      (p["id"], -1, "garantía", it["folio"], f"Cambio {it['changes_used'] + 1}", ts))
+            add_stock(c, p["id"], branch_id(), -1)
+            log_move(c, p["id"], branch_id(), -1, "garantía", it["folio"], f"Cambio {it['changes_used'] + 1}", ts)
             took = 1
         cur = c.execute("""INSERT INTO warranty_claims(sale_id, sale_item_id, number, product_id, took_stock, forced, user_id,
-                                                       user_name, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                                       user_name, notes, created_at, branch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                         (it["sale_id"], item_id, it["changes_used"] + 1, it["product_id"], took, 1 if problems else 0,
-                         user["id"], user["full_name"], (d.get("notes") or "").strip(), ts))
+                         user["id"], user["full_name"], (d.get("notes") or "").strip(), ts, branch_id()))
         c.commit()
         claim_id = cur.lastrowid
         result = {"claim_id": claim_id, "item": next(x for x in _warranty_items([it["sale_id"]]) if x["id"] == item_id)}
@@ -1159,47 +1431,61 @@ def create_app(db_path=None):
         if not amount:
             raise ApiError("Captura el monto")
         c = conn()
-        c.execute("INSERT INTO cash_movements(kind, amount, notes, created_at) VALUES (?,?,?,?)",
-                  (kind, amount, d.get("notes", ""), dbm.now()))
+        c.execute("INSERT INTO cash_movements(kind, amount, notes, created_at, branch_id) VALUES (?,?,?,?,?)",
+                  (kind, amount, d.get("notes", ""), dbm.now(), branch_id()))
         c.commit()
         return jsonify({"ok": True})
 
     @app.get("/api/cash")
     def api_cash_list():
         d_from, d_to = date_range()
+        extra, params = branch_filter("m.branch_id", report_branches())
         return jsonify(dbm.rows_to_list(conn().execute(
-            "SELECT * FROM cash_movements WHERE date(created_at) BETWEEN ? AND ? ORDER BY id DESC", (d_from, d_to)).fetchall()))
+            f"""SELECT m.*, b.name AS branch_name FROM cash_movements m LEFT JOIN branches b ON b.id=m.branch_id
+                WHERE date(m.created_at) BETWEEN ? AND ? {extra} ORDER BY m.id DESC""", [d_from, d_to] + params).fetchall()))
 
-    def _report(d_from, d_to):
+    def _report(d_from, d_to, bids=None):
+        """bids: lista de sucursales (None = todas)."""
         c = conn()
-        where = "date(created_at) BETWEEN ? AND ?"
+        bf, bp = branch_filter("branch_id", bids)
+        sbf, sbp = branch_filter("s.branch_id", bids)
+        rng = [d_from, d_to]
+        where = "date(created_at) BETWEEN ? AND ?" + bf
         agg = c.execute(f"""SELECT COUNT(*) n, COALESCE(SUM(total),0) total, COALESCE(SUM(paid_cash),0) cash,
                                COALESCE(SUM(paid_card),0) card, COALESCE(SUM(paid_transfer),0) transfer,
                                COALESCE(SUM(tax),0) tax, COALESCE(SUM(cost_total),0) cost, COALESCE(SUM(discount),0) disc
-                            FROM sales WHERE status='completada' AND {where}""", (d_from, d_to)).fetchone()
+                            FROM sales WHERE status='completada' AND {where}""", rng + bp).fetchone()
         line_disc = c.execute(f"""SELECT COALESCE(SUM(i.discount),0), COALESCE(SUM(i.qty),0) FROM sale_items i JOIN sales s ON s.id=i.sale_id
-                                  WHERE s.status='completada' AND date(s.created_at) BETWEEN ? AND ?""", (d_from, d_to)).fetchone()
-        cancelled = c.execute(f"SELECT COUNT(*) FROM sales WHERE status='cancelada' AND {where}", (d_from, d_to)).fetchone()[0]
-        cash_in = c.execute(f"SELECT COALESCE(SUM(amount),0) FROM cash_movements WHERE kind='entrada' AND {where}", (d_from, d_to)).fetchone()[0]
-        cash_out = c.execute(f"SELECT COALESCE(SUM(amount),0) FROM cash_movements WHERE kind='salida' AND {where}", (d_from, d_to)).fetchone()[0]
-        by_cat = c.execute("""SELECT COALESCE(cat.name,'Sin categoría') category, SUM(i.qty) units, SUM(i.total) total,
+                                  WHERE s.status='completada' AND date(s.created_at) BETWEEN ? AND ? {sbf}""", rng + sbp).fetchone()
+        cancelled = c.execute(f"SELECT COUNT(*) FROM sales WHERE status='cancelada' AND {where}", rng + bp).fetchone()[0]
+        cash_in = c.execute(f"SELECT COALESCE(SUM(amount),0) FROM cash_movements WHERE kind='entrada' AND {where}", rng + bp).fetchone()[0]
+        cash_out = c.execute(f"SELECT COALESCE(SUM(amount),0) FROM cash_movements WHERE kind='salida' AND {where}", rng + bp).fetchone()[0]
+        by_cat = c.execute(f"""SELECT COALESCE(cat.name,'Sin categoría') category, SUM(i.qty) units, SUM(i.total) total,
                                      SUM(i.total - i.qty*i.unit_cost) profit
                               FROM sale_items i JOIN sales s ON s.id=i.sale_id LEFT JOIN products p ON p.id=i.product_id
                               LEFT JOIN categories cat ON cat.id=p.category_id
-                              WHERE s.status='completada' AND date(s.created_at) BETWEEN ? AND ?
-                              GROUP BY 1 ORDER BY total DESC""", (d_from, d_to)).fetchall()
-        top = c.execute("""SELECT i.name, i.sku, SUM(i.qty) units, SUM(i.total) total FROM sale_items i JOIN sales s ON s.id=i.sale_id
-                           WHERE s.status='completada' AND date(s.created_at) BETWEEN ? AND ?
-                           GROUP BY i.product_id ORDER BY units DESC, total DESC LIMIT 15""", (d_from, d_to)).fetchall()
-        by_day = c.execute("""SELECT date(created_at) day, COUNT(*) n, SUM(total) total FROM sales
-                              WHERE status='completada' AND date(created_at) BETWEEN ? AND ? GROUP BY 1 ORDER BY 1""",
-                           (d_from, d_to)).fetchall()
-        by_seller = c.execute("""SELECT COALESCE(NULLIF(seller_name,''), cashier, 'Sin vendedor') seller, COUNT(*) n, SUM(total) total,
+                              WHERE s.status='completada' AND date(s.created_at) BETWEEN ? AND ? {sbf}
+                              GROUP BY 1 ORDER BY total DESC""", rng + sbp).fetchall()
+        top = c.execute(f"""SELECT i.name, i.sku, SUM(i.qty) units, SUM(i.total) total FROM sale_items i JOIN sales s ON s.id=i.sale_id
+                           WHERE s.status='completada' AND date(s.created_at) BETWEEN ? AND ? {sbf}
+                           GROUP BY i.product_id ORDER BY units DESC, total DESC LIMIT 15""", rng + sbp).fetchall()
+        by_day = c.execute(f"""SELECT date(created_at) day, COUNT(*) n, SUM(total) total FROM sales
+                              WHERE status='completada' AND {where} GROUP BY 1 ORDER BY 1""", rng + bp).fetchall()
+        by_seller = c.execute(f"""SELECT COALESCE(NULLIF(seller_name,''), cashier, 'Sin vendedor') seller, COUNT(*) n, SUM(total) total,
                                         SUM(total - cost_total) profit
-                                 FROM sales WHERE status='completada' AND date(created_at) BETWEEN ? AND ?
-                                 GROUP BY 1 ORDER BY total DESC""", (d_from, d_to)).fetchall()
+                                 FROM sales WHERE status='completada' AND {where}
+                                 GROUP BY 1 ORDER BY total DESC""", rng + bp).fetchall()
+        by_branch = c.execute(f"""SELECT b.id, b.name branch, COUNT(s.id) n, COALESCE(SUM(s.total),0) total,
+                                         COALESCE(SUM(s.total - s.cost_total),0) profit, COALESCE(SUM(s.paid_cash),0) cash
+                                  FROM branches b LEFT JOIN sales s ON s.branch_id=b.id AND s.status='completada'
+                                       AND date(s.created_at) BETWEEN ? AND ?
+                                  WHERE 1=1 {branch_filter("b.id", bids)[0]} GROUP BY b.id ORDER BY b.id""",
+                              rng + branch_filter("b.id", bids)[1]).fetchall()
         total = r2(agg["total"])
+        names = [r["branch"] for r in by_branch]
         return {
+            "branches": "Todas las sucursales" if bids is None else ", ".join(names),
+            "by_branch": [{**dict(r), "total": r2(r["total"]), "profit": r2(r["profit"]), "cash": r2(r["cash"])} for r in by_branch],
             "by_seller": [{**dict(r), "total": r2(r["total"] or 0), "profit": r2(r["profit"] or 0)} for r in by_seller],
             "from": d_from, "to": d_to, "generated_at": dbm.now(),
             "sales_count": agg["n"], "cancelled_count": cancelled, "units": float(line_disc[1]),
@@ -1215,27 +1501,29 @@ def create_app(db_path=None):
 
     @app.get("/api/reports/summary")
     def api_report():
-        return jsonify(_report(*date_range()))
+        return jsonify(_report(*date_range(), report_branches()))
 
     @app.get("/reports/corte")
     def corte_page():
         s = settings()
-        t = tickets.build_cut_ticket(_report(*date_range()), s)
+        t = tickets.build_cut_ticket(_report(*date_range(), report_branches()), s)
         return tickets.to_html(t, s.get("ticket_width", "80"), "Corte de caja", autoprint=request.args.get("print") == "1")
 
     @app.post("/api/reports/corte/print")
     def api_corte_print():
         s = settings()
-        return _dispatch_ticket(tickets.build_cut_ticket(_report(*date_range()), s), s, "Corte de caja")
+        return _dispatch_ticket(tickets.build_cut_ticket(_report(*date_range(), report_branches()), s), s, "Corte de caja")
 
     @app.get("/api/dashboard")
     def api_dashboard():
         c = conn()
         today = date.today().isoformat()
-        rep = _report(today, today)
-        low = c.execute("SELECT COUNT(*) FROM products WHERE active=1 AND track_stock=1 AND stock<=min_stock").fetchone()[0]
+        rep = _report(today, today, [branch_id()])
+        bid = branch_id()
+        low = c.execute(f"SELECT COUNT(*) FROM products p WHERE active=1 AND track_stock=1 AND {STOCK_EXPR}<=min_stock", (bid,)).fetchone()[0]
         products = c.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
-        value = c.execute("SELECT COALESCE(SUM(stock*cost),0), COALESCE(SUM(stock*price),0) FROM products WHERE active=1 AND track_stock=1").fetchone()
+        value = c.execute(f"""SELECT COALESCE(SUM({STOCK_EXPR}*cost),0), COALESCE(SUM({STOCK_EXPR}*price),0)
+                              FROM products p WHERE active=1 AND track_stock=1""", (bid, bid)).fetchone()
         return jsonify({"today": rep, "low_stock": low, "products": products,
                         "inventory_cost": r2(value[0]), "inventory_retail": r2(value[1])})
 
@@ -1259,8 +1547,8 @@ def create_app(db_path=None):
                 continue
             p = get_product(int(item.get("product_id") or 0))
             if item.get("all_imeis") and p["serialized"]:
-                for ser in conn().execute("SELECT imei FROM serials WHERE product_id=? AND status='disponible' ORDER BY id",
-                                          (p["id"],)).fetchall():
+                for ser in conn().execute("SELECT imei FROM serials WHERE product_id=? AND status='disponible' AND branch_id=? ORDER BY id",
+                                          (p["id"], branch_id())).fetchall():
                     jobs.append((tpl, labels.label_data_from_product(p, s, ser["imei"]), max(1, copies)))
             elif copies:
                 jobs.append((tpl, labels.label_data_from_product(p, s, item.get("imei")), copies))
@@ -1289,6 +1577,9 @@ def create_app(db_path=None):
             mode = s.get("label_printer_mode", "download")
             if mode == "download":
                 raise ApiError("La impresora de etiquetas está en modo 'Descargar archivo'. Configúrala en Configuración.")
+            if mode == "agent":
+                enqueue_print(branch_id(), "label", zpl, f"{total} etiqueta(s)")
+                return jsonify({"message": f"{total} etiqueta(s) enviadas a la Zebra de {s.get('branch_name', 'la sucursal')}", "count": total})
             printing.send(zpl, mode, s.get("label_printer_host"), s.get("label_printer_port"), s.get("label_printer_name"))
             return jsonify({"message": f"{total} etiqueta(s) enviadas a la Zebra", "count": total})
         if d.get("download"):
@@ -1302,13 +1593,12 @@ def create_app(db_path=None):
 
     @app.get("/api/products/export.csv")
     def api_export_csv():
-        rows = conn().execute("""SELECT p.*, c.name AS category FROM products p LEFT JOIN categories c ON c.id=p.category_id
-                                 WHERE p.active=1 ORDER BY p.name""").fetchall()
+        rows = conn().execute(product_select() + " WHERE p.active=1 ORDER BY p.name", (branch_id(),)).fetchall()
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(CSV_FIELDS)
         for r in rows:
-            w.writerow([r[f] if f != "category" else (r["category"] or "") for f in CSV_FIELDS])
+            w.writerow([r[f] if f != "category" else (r["category_name"] or "") for f in CSV_FIELDS])
         return Response("﻿" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f"attachment; filename=productos_{date.today()}.csv"})
 
@@ -1365,11 +1655,10 @@ def create_app(db_path=None):
                     created += 1
                 if row.get("stock") not in (None, "") and not vals["serialized"]:
                     new_stock = num(row["stock"])
-                    old = c.execute("SELECT stock FROM products WHERE id=?", (pid,)).fetchone()["stock"]
+                    old = stock_of(c, pid, branch_id())
                     if new_stock != old:
-                        c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, pid))
-                        c.execute("INSERT INTO inventory_moves(product_id, qty, kind, notes, created_at) VALUES (?,?,?,?,?)",
-                                  (pid, new_stock - old, "conteo", "Importación CSV", ts))
+                        set_stock(c, pid, branch_id(), new_stock)
+                        log_move(c, pid, branch_id(), new_stock - old, "conteo", notes="Importación CSV", ts=ts)
             except ApiError as exc:
                 errors.append(f"Fila {n}: {exc}")
         c.commit()
@@ -1401,19 +1690,45 @@ def create_app(db_path=None):
     return app
 
 
+def _local_addresses():
+    import socket
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:  # IP de la red local por la que sale el equipo
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("10.255.255.255", 1))
+            ips.add(sock.getsockname()[0])
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith("127."))
+
+
 def main():
     port = int(os.environ.get("PORT", 5000))
     host = os.environ.get("HOST", "127.0.0.1")
     app = create_app()
     url = f"http://localhost:{port}"
-    print("=" * 60)
+    print("=" * 64)
     print(" Punto de venta listo. Abre en tu navegador:", url)
+    if host == "0.0.0.0":
+        print(" MODO RED: las sucursales y administración entran con:")
+        for ip in _local_addresses():
+            hint = "  (Tailscale)" if ip.startswith("100.") else ""
+            print(f"     http://{ip}:{port}{hint}")
     print(" Base de datos:", app.config["DB_PATH"])
     print(" Para cerrar presiona Ctrl+C")
-    print("=" * 60)
+    print("=" * 64)
     if os.environ.get("NO_BROWSER") != "1":
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
-    app.run(host=host, port=port, debug=False, threaded=True)
+    try:
+        from waitress import serve  # servidor estable para varias computadoras a la vez
+        serve(app, host=host, port=port, threads=12)
+    except ImportError:
+        app.run(host=host, port=port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

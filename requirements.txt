@@ -1,4 +1,6 @@
 Flask>=3.0
+# Servidor web estable (varias sucursales conectadas a la vez):
+waitress>=3.0
 # Logo en tickets térmicos y Zebra:
 Pillow>=10.0
 # Solo en Windows, para imprimir directo a impresoras USB (Zebra / térmica):

@@ -31,6 +31,47 @@ Crea a tu equipo en **Configuración → Usuarios**:
 | **Cajero** | Vender y cobrar a nombre de cualquier vendedor, etiquetas, inventario e IMEI, corte de caja. |
 | **Vendedor** | Hacer notas de venta a su nombre, buscar garantías. No ve costos, no cambia precios (sí puede dar descuento) y no cancela. |
 
+## Varias sucursales en red
+
+Una sola computadora es el **servidor** (normalmente la de la Matriz) y guarda toda la información.
+Las sucursales y la computadora de administración entran desde el navegador. Todas ven los mismos
+productos y precios; cada sucursal tiene **su propia existencia, sus IMEI, sus folios** (`V-000123`,
+`S2-000124`), **su caja y sus impresoras**. El administrador puede trabajar en cualquier sucursal
+(selector 📍 en el menú) y ver reportes de una o de **todas las sucursales**. Los cajeros y vendedores
+solo ven la suya. Entre sucursales se hacen **traspasos** (Inventario → movimiento “Traspaso”).
+
+### Paso 1 · Red privada con Tailscale (gratis)
+Así las computadoras se ven entre sí por internet de forma cifrada, sin abrir puertos ni contratar IP fija.
+1. En **cada** computadora (servidor, sucursales y administración) instala Tailscale desde
+   <https://tailscale.com/download> e inicia sesión con **la misma cuenta** (la de la tienda).
+2. En la computadora servidor abre **`iniciar_servidor_red.bat`**. La ventana muestra la dirección,
+   p. ej. `http://100.101.102.103:5000  (Tailscale)`. Si Windows pregunta por el firewall, da **Permitir**.
+3. En las demás computadoras abre esa dirección en el navegador (crea un acceso directo en el escritorio).
+
+> La computadora servidor debe estar encendida mientras las sucursales trabajan (desactiva la
+> suspensión en Opciones de energía). Si una sucursal pierde internet, no podrá vender hasta que regrese.
+
+### Paso 2 · Dar de alta las sucursales
+Como administrador: **Configuración → Sucursales** → nombre, clave del folio (p. ej. `S2`), dirección y
+teléfono (salen en el ticket de esa sucursal). En **Usuarios** asigna la sucursal de cada cajero y vendedor.
+Para mover mercancía: **Inventario** → selecciona el producto → “Traspaso a otra sucursal”
+(los celulares se traspasan escaneando su IMEI).
+
+### Paso 3 · Impresoras de cada sucursal (agente de impresión)
+El servidor no puede llegar a las impresoras USB de otra sucursal; por eso en cada sucursal corre un
+programa pequeño, el **agente**, que recibe los tickets y etiquetas y los manda a sus impresoras.
+1. Copia la carpeta del programa a la computadora de la sucursal (con Python instalado).
+2. En el sistema: **Configuración → Sucursales → Descargar agente.json** de esa sucursal y guárdalo
+   en la carpeta del programa. Revisa ahí el nombre de la impresora de tickets y de la Zebra
+   (como aparecen en Windows).
+3. Abre **`iniciar_agente.bat`** y déjalo abierto (puedes ponerlo en Inicio de Windows). Debe decir
+   “Conectado al servidor”.
+4. En el sistema, como administrador, cambia a esa sucursal (📍) y en **Configuración → Tickets** y
+   **Etiquetas Zebra** elige “Agente de impresión de la sucursal”. En Configuración → Sucursales verás
+   el agente como **Conectado**.
+
+En la computadora servidor (Matriz) las impresoras siguen como “USB instalada en este equipo”.
+
 ## Logo
 
 El logo de **Hospital para Celulares Shop** aparece en el inicio de sesión, el menú y arriba de cada

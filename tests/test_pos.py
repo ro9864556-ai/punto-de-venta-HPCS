@@ -309,3 +309,62 @@ def test_phone_label_and_scan_to_sell(client):
     assert sale["items"][0]["imei"] == "350000000000000" and sale["items"][0]["warranty_days"] == 365
     assert client.get(f"/api/products/{phone['id']}").get_json()["stock"] == 0
     assert client.get("/api/lookup?code=350000000000000").status_code == 409  # ya vendido
+
+
+def test_branches_stock_transfer_reports_and_agent(app, client):
+    import base64
+    r = client.post("/api/branches", json={"name": "Centro", "code": "S2", "address": "Calle 5 #20", "phone": "55 2222 3333"})
+    assert r.status_code == 201
+    s2 = r.get_json()["id"]
+    client.post("/api/users", json={"username": "caja2", "full_name": "Caja Centro", "role": "cajero", "password": "1234", "branch_id": s2})
+    funda = _product(client, initial_stock=5)  # se da de alta en la Matriz
+    phone = _product(client, name="Galaxy A07", category_id=1, price=2899, serialized=1, initial_stock=0, imeis="350000000000000")
+    caja2 = login(app, "caja2", "1234")
+    assert caja2.get("/api/me").get_json()["branch"]["code"] == "S2"
+    assert caja2.get(f"/api/products/{funda['id']}").get_json()["stock"] == 0  # existencia separada
+    assert caja2.post("/api/sales", json={"items": [{"product_id": funda["id"], "qty": 1}], "payment_method": "tarjeta"}).status_code == 400
+    # el teléfono está en la Matriz
+    r = caja2.get("/api/lookup?code=350000000000000")
+    assert r.status_code == 409 and "Matriz" in r.get_json()["error"]
+    # traspasos Matriz → Centro
+    assert client.post("/api/inventory/transfer", json={"product_id": funda["id"], "to_branch_id": s2, "qty": 2}).status_code == 200
+    assert client.post("/api/inventory/transfer", json={"product_id": phone["id"], "to_branch_id": s2, "imeis": "350000000000000"}).status_code == 200
+    assert client.post("/api/inventory/transfer", json={"product_id": funda["id"], "to_branch_id": s2, "qty": 50}).status_code == 400
+    p = client.get(f"/api/products/{funda['id']}").get_json()
+    assert p["stock"] == 3 and p["stock_total"] == 5
+    assert {b["name"]: b["stock"] for b in p["stock_by_branch"]} == {"Matriz": 3, "Centro": 2}
+    # venta en Centro: folio con su clave y existencia de Centro
+    sale = caja2.post("/api/sales", json={"items": [{"product_id": funda["id"], "qty": 1},
+                                                   {"product_id": phone["id"], "qty": 1, "imei": "350000000000000"}],
+                                          "payment_method": "efectivo", "received": 5000}).get_json()["sale"]
+    assert sale["folio"].startswith("S2-") and sale["branch_id"] == s2
+    assert caja2.get(f"/api/products/{funda['id']}").get_json()["stock"] == 1
+    assert client.get(f"/api/products/{funda['id']}").get_json()["stock"] == 3
+    txt = caja2.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
+    assert "Sucursal:" in txt and "Centro" in txt and "Calle 5 #20" in txt
+    m = client.post("/api/sales", json={"items": [{"product_id": funda["id"], "qty": 1}], "payment_method": "tarjeta"}).get_json()["sale"]
+    assert m["folio"].startswith("V-")
+    # reportes: cajero solo su sucursal; administrador elige una o todas
+    assert caja2.get("/api/reports/summary?branch=all").get_json()["sales_count"] == 1
+    assert client.get("/api/reports/summary").get_json()["sales_count"] == 1
+    allr = client.get("/api/reports/summary?branch=all").get_json()
+    assert allr["sales_count"] == 2 and {b["branch"]: b["n"] for b in allr["by_branch"]} == {"Matriz": 1, "Centro": 1}
+    assert len(caja2.get("/api/sales?from=2000-01-01&to=2999-12-31&branch=all").get_json()) == 1
+    # impresión por agente: el administrador configura la impresora de Centro
+    assert client.post("/api/branch/select", json={"branch_id": s2}).status_code == 200
+    client.put("/api/settings", json={"ticket_printer_mode": "agent"})
+    assert client.get("/api/settings").get_json()["settings"]["ticket_printer_mode"] == "agent"
+    client.post("/api/branch/select", json={"branch_id": 1})
+    assert client.get("/api/settings").get_json()["settings"]["ticket_printer_mode"] != "agent"  # la Matriz no cambia
+    r = caja2.post(f"/api/sales/{sale['id']}/print").get_json()
+    assert r["mode"] == "agent"
+    token = [b for b in client.get("/api/branches").get_json() if b["id"] == s2][0]["agent_token"]
+    assert "agent_token" not in caja2.get("/api/branches").get_json()[0]
+    anon = app.test_client()
+    assert anon.get("/api/agent/jobs?code=S2&token=mal").status_code == 401
+    jobs = anon.get(f"/api/agent/jobs?code=S2&token={token}").get_json()["jobs"]
+    assert len(jobs) == 1 and base64.b64decode(jobs[0]["data"]).startswith(b"\x1b@")
+    assert anon.post(f"/api/agent/jobs/{jobs[0]['id']}/done?code=S2&token={token}", json={"ok": True}).status_code == 200
+    assert anon.get(f"/api/agent/jobs?code=S2&token={token}").get_json()["jobs"] == []
+    cfg = client.get(f"/api/branches/{s2}/agente.json").get_json()
+    assert cfg["sucursal"] == "S2" and cfg["token"] == token

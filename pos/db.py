@@ -266,10 +266,85 @@ def migrate(conn):
         notes TEXT DEFAULT '',
         created_at TEXT NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_item ON warranty_claims(sale_item_id)")
+    migrate_branches(conn)
 
 
-def get_settings(conn):
-    return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings") if r["key"] != "secret_key"}
+# Ajustes que cada sucursal puede tener distintos (dirección en el ticket e impresoras).
+BRANCH_KEYS = [
+    "store_address", "store_phone", "store_whatsapp",
+    "ticket_printer_mode", "ticket_printer_host", "ticket_printer_port", "ticket_printer_name", "ticket_width",
+    "ticket_open_drawer", "ticket_copies", "ticket_zebra_width_mm",
+    "label_printer_mode", "label_printer_host", "label_printer_port", "label_printer_name", "label_dpi",
+    "label_darkness", "label_speed", "label_offset_x", "label_offset_y", "label_template",
+]
+
+
+def migrate_branches(conn):
+    """Sucursales: existencia, IMEI, ventas, caja y ajustes de impresora por sucursal."""
+    import secrets
+    conn.execute("""CREATE TABLE IF NOT EXISTS branches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        code TEXT NOT NULL UNIQUE,
+        address TEXT DEFAULT '',
+        phone TEXT DEFAULT '',
+        agent_token TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL)""")
+    if not conn.execute("SELECT COUNT(*) FROM branches").fetchone()[0]:
+        row = conn.execute("SELECT value FROM settings WHERE key='folio_prefix'").fetchone()
+        code = (row[0] if row else "V").strip(" -") or "V"
+        conn.execute("INSERT INTO branches(id, name, code, agent_token, created_at) VALUES (1, 'Matriz', ?, ?, ?)",
+                     (code, secrets.token_urlsafe(18), now()))
+    conn.execute("""CREATE TABLE IF NOT EXISTS branch_stock (
+        product_id INTEGER NOT NULL REFERENCES products(id),
+        branch_id INTEGER NOT NULL REFERENCES branches(id),
+        stock REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (product_id, branch_id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS branch_settings (
+        branch_id INTEGER NOT NULL REFERENCES branches(id),
+        key TEXT NOT NULL,
+        value TEXT,
+        PRIMARY KEY (branch_id, key))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS print_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        branch_id INTEGER NOT NULL REFERENCES branches(id),
+        target TEXT NOT NULL,
+        title TEXT DEFAULT '',
+        data BLOB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pendiente',
+        error TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        done_at TEXT)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs ON print_jobs(branch_id, status)")
+    for table, column, ddl in [("serials", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
+                               ("sales", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
+                               ("inventory_moves", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
+                               ("cash_movements", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
+                               ("warranty_claims", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
+                               ("users", "branch_id", "INTEGER")]:
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    if not conn.execute("SELECT 1 FROM settings WHERE key='branch_stock_migrated'").fetchone():
+        # la existencia que ya había pasa a la Matriz
+        conn.execute("INSERT OR IGNORE INTO branch_stock(product_id, branch_id, stock) SELECT id, 1, stock FROM products WHERE stock<>0")
+        conn.execute("INSERT INTO settings(key, value) VALUES ('branch_stock_migrated', '1')")
+
+
+def get_settings(conn, branch_id=None):
+    """Ajustes generales con los de la sucursal encima."""
+    out = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")
+           if r["key"] not in ("secret_key", "branch_stock_migrated")}
+    if branch_id:
+        for r in conn.execute("SELECT key, value FROM branch_settings WHERE branch_id=?", (branch_id,)):
+            out[r["key"]] = r["value"]
+        b = conn.execute("SELECT * FROM branches WHERE id=?", (branch_id,)).fetchone()
+        if b:
+            out["branch_id"], out["branch_name"], out["branch_code"] = str(b["id"]), b["name"], b["code"]
+        n = conn.execute("SELECT COUNT(*) FROM branches WHERE active=1").fetchone()[0]
+        out["multi_branch"] = "1" if n > 1 else "0"
+    return out
 
 
 def warranty_label(days):

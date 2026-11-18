@@ -239,3 +239,9 @@ nav a:has(.nav-badge:not(.hidden)) kbd { margin-left: 6px; }
 .dots span.x { border-color: var(--bad); background: var(--bad); color: #fff; }
 .w-hist { margin-top: 10px; font-size: 13px; }
 .w-hist div { display: flex; gap: 10px; align-items: center; padding: 4px 0; border-bottom: 1px solid #f3f4f6; }
+
+/* ---------- sucursales ---------- */
+.branch-box { margin-top: 6px; color: #e2e8f0; }
+.branch-box select { width: auto; max-width: 170px; padding: 3px 6px; font-size: 13px; background: #1b2f57; color: #fff; border-color: #34508a; }
+.single-branch .multi-col { display: none; }
+.no-branch-pick .admin-branch { display: none; }

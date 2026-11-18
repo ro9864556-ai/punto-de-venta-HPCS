@@ -40,6 +40,11 @@ const warrantyOptions = (sel) => {
   return opts.map(([d, t]) => `<option value="${d}" ${d === Math.round(num(sel)) ? "selected" : ""}>${t}</option>`).join("");
 };
 const can = (...roles) => S.me && roles.includes(S.me.role);
+const branchOptions = (sel, { all = true, current = true } = {}) =>
+  (current ? `<option value="">${esc(S.me.branch.name)} (esta)</option>` : "") +
+  (all ? `<option value="all" ${sel === "all" ? "selected" : ""}>Todas las sucursales</option>` : "") +
+  S.branches.filter((b) => b.active && (!current || b.id !== S.me.branch.id)).map((b) => `<option value="${b.id}" ${String(sel) === String(b.id) ? "selected" : ""}>${esc(b.name)}</option>`).join("");
+const branchParam = (id) => { const v = $(id)?.value; return v ? `&branch=${v}` : ""; };
 const sellerOnly = () => can("vendedor") && S.settings.seller_can_charge !== "1";
 const changesOptions = (sel) => [0, 1, 2, 3, 4, 5, 6].map((n) => `<option value="${n}" ${n === Math.round(num(sel)) ? "selected" : ""}>${n ? n + (n > 1 ? " cambios" : " cambio") : "Sin cambios"}</option>`).join("");
 const debounce = (fn, ms = 250) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
@@ -52,7 +57,7 @@ async function api(method, url, body) {
   if (res.status === 401 && !url.includes("/api/login")) { location.href = "/login"; throw new Error("Sesión expirada"); }
   const isJson = (res.headers.get("content-type") || "").includes("json");
   const data = isJson ? await res.json() : await res.text();
-  if (!res.ok) throw new Error((data && data.error) || `Error ${res.status}`);
+  if (!res.ok) { const err = new Error((data && data.error) || `Error ${res.status}`); err.status = res.status; throw err; }
   return data;
 }
 const GET = (u) => api("GET", u);
@@ -184,6 +189,8 @@ function attachProductSearch(input, onPick, { lookupFirst = true, allowFreeEnter
           beep(true);
           return pick(r.product, r.imei);
         } catch (err) {
+          // 409 = IMEI ya vendido o en otra sucursal: se avisa y no se busca por nombre
+          if (err.status === 409) { beep(false); fail(err); input.select(); return; }
           if (dd && results[sel]) return pick(results[sel], null);
           try {
             const list = await GET(`/api/products?limit=15&q=${encodeURIComponent(code)}`);
@@ -225,9 +232,19 @@ const NAV_ROLES = { vender: ["admin", "cajero", "vendedor"], productos: ["admin"
 async function loadBase() {
   S.me = await GET("/api/me");
   S.sellers = await GET("/api/sellers");
+  S.branches = await GET("/api/branches");
+  S.multi = S.branches.filter((b) => b.active).length > 1;
   $$("#nav a").forEach((a) => a.classList.toggle("hidden", !NAV_ROLES[a.dataset.view].includes(S.me.role)));
   $("#user-box").innerHTML = `<div><b>${esc(S.me.full_name)}</b> · ${esc(S.me.role_name)}</div>
+    <div class="branch-box">📍 ${S.me.can_switch_branch && S.multi
+      ? `<select id="u-branch" title="Sucursal en la que trabajas">${S.branches.filter((b) => b.active).map((b) => `<option value="${b.id}" ${b.id === S.me.branch.id ? "selected" : ""}>${esc(b.name)}</option>`).join("")}</select>`
+      : `<b>${esc(S.me.branch.name)}</b>`}</div>
     <div class="row" style="margin-top:6px"><a id="u-pass" class="small">Cambiar contraseña</a><a id="u-out" class="small">Salir</a></div>`;
+  const ub = $("#u-branch");
+  if (ub) ub.onchange = async () => {
+    if (S.cart.length && !await confirmBox("Hay un ticket en curso. ¿Cambiar de sucursal de todos modos? El ticket se vacía.", "Cambiar", true)) { ub.value = S.me.branch.id; return; }
+    try { await POST("/api/branch/select", { branch_id: +ub.value }); clearCart(); location.reload(); } catch (e) { fail(e); }
+  };
   $("#u-pass").onclick = () => changePassword(false);
   $("#u-out").onclick = async () => { await POST("/api/logout"); location.href = "/login"; };
   const s = await GET("/api/settings");
@@ -435,8 +452,13 @@ function pickImei(p) {
   return new Promise(async (resolve) => {
     let detail;
     try { detail = await GET(`/api/products/${p.id}`); } catch (e) { fail(e); return resolve(null); }
-    const avail = detail.serials.filter((s) => s.status === "disponible" && !S.cart.some((l) => l.imei === s.imei));
-    if (!avail.length) { toast(`No hay equipos disponibles de ${p.name}. Registra IMEIs en Inventario.`, "bad"); return resolve(null); }
+    const avail = detail.serials.filter((s) => s.status === "disponible" && s.branch_id === S.me.branch.id && !S.cart.some((l) => l.imei === s.imei));
+    if (!avail.length) {
+      const elsewhere = detail.serials.filter((s) => s.status === "disponible" && s.branch_id !== S.me.branch.id);
+      toast(elsewhere.length ? `No hay equipos de ${p.name} en ${S.me.branch.name}; hay ${elsewhere.length} en ${[...new Set(elsewhere.map((s) => s.branch_name))].join(", ")}. Pide un traspaso.`
+        : `No hay equipos disponibles de ${p.name}. Registra IMEIs en Inventario.`, "bad");
+      return resolve(null);
+    }
     let done = false;
     modal({
       title: `Selecciona el IMEI — ${esc(p.name)}`, size: "narrow",
@@ -685,7 +707,7 @@ function initProductos() {
       <span class="spacer"></span><span class="muted small" id="p-count"></span>
     </div>
     <div class="table-wrap"><table><thead><tr>
-      <th>SKU</th><th>Código</th><th>Producto</th><th>Categoría</th><th class="num cost-col">Costo</th><th class="num">Precio</th><th class="num cost-col">Margen</th><th class="num">Garantía</th><th class="num">Exist.</th><th></th>
+      <th>SKU</th><th>Código</th><th>Producto</th><th>Categoría</th><th class="num cost-col">Costo</th><th class="num">Precio</th><th class="num cost-col">Margen</th><th class="num">Garantía</th><th class="num">Exist.</th><th class="num multi-col">Total</th><th></th>
     </tr></thead><tbody id="p-body"></tbody></table></div>`;
   $("#p-new").onclick = () => productForm();
   $("#p-bulk").onclick = bulkPricing;
@@ -716,17 +738,18 @@ async function loadProducts() {
       const margin = p.price ? ((p.price - p.cost) / p.price) * 100 : 0;
       const st = !p.track_stock ? '<span class="badge">N/A</span>' : `<span class="badge ${p.stock <= 0 ? "bad" : p.stock <= p.min_stock ? "warn" : "ok"}">${Number(p.stock)}</span>`;
       return `<tr data-id="${p.id}">
-        <td class="mono small">${esc(p.sku)}</td><td class="mono small">${esc(p.barcode || "")}</td>
+        <td class="mono small nowrap">${esc(p.sku)}</td><td class="mono small">${esc(p.barcode || "")}</td>
         <td><b>${esc(p.name)}</b>${p.serialized ? ' <span class="badge info">IMEI</span>' : ""}<div class="small muted">${esc([p.brand, p.model, p.ram ? p.ram + " RAM" : "", p.capacity, p.color, p.condition].filter(Boolean).join(" · "))}</div></td>
         <td>${esc(p.category_name || "—")}</td><td class="num cost-col">${money(p.cost)}</td><td class="num"><b>${money(p.price)}</b></td>
-        <td class="num cost-col ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num small">${p.warranty_days ? warrantyLabel(p.warranty_days) : "—"}${p.warranty_changes ? `<div class="muted">${p.warranty_changes} cambio${p.warranty_changes > 1 ? "s" : ""}</div>` : ""}</td><td class="num">${st}</td>
+        <td class="num cost-col ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num small">${p.warranty_days ? warrantyLabel(p.warranty_days) : "—"}${p.warranty_changes ? `<div class="muted">${p.warranty_changes} cambio${p.warranty_changes > 1 ? "s" : ""}</div>` : ""}</td><td class="num">${st}</td><td class="num multi-col small muted">${p.track_stock ? Number(p.stock_total) : ""}</td>
         <td>${can("admin") ? '<button class="sm" data-a="edit">Editar</button> ' : ""}${can("admin", "cajero") ? '<button class="sm" data-a="label">🏷️</button> ' : ""}
           ${p.serialized && can("admin", "cajero") ? '<button class="sm" data-a="imei">IMEI</button>' : ""} ${can("admin") ? '<button class="sm danger icon-btn" data-a="del" title="Eliminar">✕</button>' : ""}</td></tr>`;
-    }).join("") : `<tr><td colspan="10" class="empty">No hay productos. Da clic en “Nuevo producto” o importa un CSV.</td></tr>`;
+    }).join("") : `<tr><td colspan="11" class="empty">No hay productos. Da clic en “Nuevo producto” o importa un CSV.</td></tr>`;
   } catch (e) { fail(e); }
 }
 
 VIEWS.productos = () => {
+  $("#view-productos").classList.toggle("single-branch", !S.multi);
   $$(".admin-only", $("#view-productos")).forEach((x) => x.classList.toggle("hidden", !can("admin")));
   $("#view-productos").classList.toggle("no-costs", can("vendedor"));
   const sel = $("#p-cat"), v = sel.value;
@@ -777,7 +800,7 @@ async function productForm(id) {
           <label class="f">Cambios incluidos<select name="warranty_changes">${changesOptions(p.warranty_changes || 0)}</select></label>
           <label class="chk span-2"><input type="checkbox" name="ask_device" ${p.ask_device ? "checked" : ""}> Pedir modelo e IMEI del equipo del cliente (micas, fundas, reparaciones)</label>
           ${isNew ? `<label class="f span-2" id="f-initial">Existencia inicial<input name="initial_stock" inputmode="decimal" value="0"></label>
-          <label class="f span-all hidden" id="f-imeis">IMEIs iniciales (uno por renglón; escanéalos)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia actual: <b>${Number(p.stock)}</b> — ajústala en Inventario.</div>`}
+          <label class="f span-all hidden" id="f-imeis">IMEIs iniciales (uno por renglón; escanéalos)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia en ${esc(S.me.branch.name)}: <b>${Number(p.stock)}</b>${S.multi ? ` · ${(p.stock_by_branch || []).filter((b) => b.id !== S.me.branch.id).map((b) => `${esc(b.name)}: ${Number(b.stock)}`).join(" · ")}` : ""} — ajústala en Inventario.</div>`}
           <label class="f span-all">Notas<input name="notes" value="${esc(p.notes)}"></label>
         </div>
       </fieldset>
@@ -866,7 +889,7 @@ async function imeiManager(id) {
       <div><h3 style="margin-bottom:8px">Registrados (${p.serials.length}) — disponibles: ${p.serials.filter((s) => s.status === "disponible").length}</h3>
         <div class="table-wrap" style="max-height:320px"><table><tbody>
         ${p.serials.map((s) => `<tr data-sid="${s.id}"><td class="mono">${esc(s.imei)}</td>
-          <td>${s.status === "disponible" ? '<span class="badge ok">Disponible</span>' : `<span class="badge">Vendido ${esc(s.folio || "")}</span>`}</td>
+          <td>${s.status === "disponible" ? `<span class="badge ok">Disponible${S.multi ? " · " + esc(s.branch_name || "") : ""}</span>` : `<span class="badge">Vendido ${esc(s.folio || "")}</span>`}</td>
           <td class="right">${s.status === "disponible" ? `<button class="sm" data-a="lbl" data-imei="${esc(s.imei)}">🏷️</button> <button class="sm danger" data-a="del">✕</button>` : ""}</td></tr>`).join("") || '<tr><td class="empty">Sin IMEIs</td></tr>'}
         </tbody></table></div></div></div>`,
     foot: `<button data-close class="primary">Cerrar</button>`,
@@ -1276,7 +1299,7 @@ function initInventario() {
       <div class="card"><h2>⚠️ Existencia baja</h2><div class="table-wrap" style="max-height:330px"><table><thead><tr><th>Producto</th><th class="num">Exist.</th><th class="num">Mín.</th><th></th></tr></thead><tbody id="inv-low"></tbody></table></div></div>
     </div>
     <div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Movimientos recientes</h2></div>
-      <div class="table-wrap" style="max-height:420px"><table><thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th class="num">Cantidad</th><th>Referencia / nota</th></tr></thead><tbody id="inv-moves"></tbody></table></div></div>`;
+      <div class="table-wrap" style="max-height:420px"><table><thead><tr><th>Fecha</th><th class="multi-col">Sucursal</th><th>Producto</th><th>Tipo</th><th class="num">Cantidad</th><th>Referencia / nota</th></tr></thead><tbody id="inv-moves"></tbody></table></div></div>`;
   attachProductSearch($("#inv-scan"), (p) => p && invSelect(p.id));
   $("#inv-low").addEventListener("click", (e) => { const b = e.target.closest("[data-id]"); if (b) invSelect(+b.dataset.id); });
 }
@@ -1290,7 +1313,18 @@ async function invSelect(id) {
     box.innerHTML = `<h3>${esc(p.name)} <span class="badge info">IMEI</span></h3><p class="small muted">${esc(p.sku)} · disponibles: <b>${Number(p.stock)}</b></p>
       <label class="f">Escanea los IMEIs que llegaron (uno por renglón)<textarea id="iv-imeis" class="mono" style="min-height:140px"></textarea></label>
       <label class="chk small" style="margin:8px 0"><input type="checkbox" id="iv-lbl" checked> Enviar a etiquetas (una por IMEI)</label>
-      <div class="row"><button class="primary" id="iv-add">Registrar IMEIs</button><button id="iv-manage">Ver / dar de baja IMEIs</button></div>`;
+      <div class="row"><button class="primary" id="iv-add">Registrar IMEIs</button><button id="iv-manage">Ver / dar de baja IMEIs</button></div>
+      ${S.multi ? `<fieldset style="margin-top:14px"><legend>🔁 Traspasar equipos a otra sucursal</legend>
+        <div class="grid" style="gap:8px"><select id="tr-dst">${branchOptions("", { all: false })}</select>
+        <textarea id="tr-imeis" class="mono" placeholder="Escanea los IMEI que se envían (uno por renglón)" style="min-height:70px"></textarea>
+        <div><button id="tr-go">Enviar a la sucursal</button></div></div></fieldset>` : ""}`;
+    const trg = $("#tr-go");
+    if (trg) {
+      $("#tr-dst").firstElementChild.remove();
+      trg.onclick = async () => {
+        try { const r = await POST("/api/inventory/transfer", { product_id: p.id, to_branch_id: +$("#tr-dst").value, imeis: $("#tr-imeis").value }); toast(r.message, "ok"); invSelect(p.id); VIEWS.inventario(); } catch (e) { fail(e); }
+      };
+    }
     $("#iv-imeis").focus();
     $("#iv-manage").onclick = () => imeiManager(p.id);
     $("#iv-add").onclick = async () => {
@@ -1305,15 +1339,25 @@ async function invSelect(id) {
   }
   box.innerHTML = `<h3>${esc(p.name)}</h3><p class="small muted">${esc(p.sku)} · existencia actual: <b>${Number(p.stock)}</b> · costo ${money(p.cost)}</p>
     <div class="form-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">
-      <label class="f">Movimiento<select id="iv-kind"><option value="entrada">Entrada (compra)</option><option value="salida">Salida (merma / uso)</option><option value="conteo">Conteo físico (fijar existencia)</option></select></label>
+      <label class="f">Movimiento<select id="iv-kind"><option value="entrada">Entrada (compra)</option><option value="salida">Salida (merma / uso)</option><option value="conteo">Conteo físico (fijar existencia)</option>${S.multi ? '<option value="traspaso">Traspaso a otra sucursal</option>' : ""}</select></label>
       <label class="f">Cantidad<input id="iv-qty" inputmode="decimal" value="1"></label>
-      <label class="f">Costo unitario nuevo<input id="iv-cost" inputmode="decimal" placeholder="${p.cost}"></label>
+      <label class="f" id="iv-cost-f">Costo unitario nuevo<input id="iv-cost" inputmode="decimal" placeholder="${p.cost ?? ""}"></label>
+      <label class="f hidden" id="iv-dst-f">Enviar a<select id="iv-dst">${S.multi ? branchOptions("", { all: false }) : ""}</select></label>
       <label class="f span-all" style="grid-column:1/-1">Nota / proveedor<input id="iv-notes"></label></div>
     <label class="chk small" style="margin:8px 0"><input type="checkbox" id="iv-lbl"> Enviar etiquetas de las piezas que entran</label>
     <div class="row"><button class="primary" id="iv-save">Registrar movimiento</button></div>`;
   $("#iv-qty").select();
+  if (S.multi) $("#iv-dst").firstElementChild.remove();
+  $("#iv-kind").onchange = () => {
+    const tr = $("#iv-kind").value === "traspaso";
+    $("#iv-dst-f").classList.toggle("hidden", !tr); $("#iv-cost-f").classList.toggle("hidden", tr);
+  };
   $("#iv-save").onclick = async () => {
     const kind = $("#iv-kind").value, qty = num($("#iv-qty").value);
+    if (kind === "traspaso") {
+      try { const r = await POST("/api/inventory/transfer", { product_id: p.id, to_branch_id: +$("#iv-dst").value, qty, notes: $("#iv-notes").value }); toast(r.message, "ok"); invSelect(p.id); VIEWS.inventario(); } catch (e) { fail(e); }
+      return;
+    }
     try {
       const r = await POST("/api/inventory/adjust", { product_id: p.id, kind, qty, cost: $("#iv-cost").value, notes: $("#iv-notes").value });
       toast(`Existencia de ${r.name}: ${Number(r.stock)}`, "ok");
@@ -1327,7 +1371,8 @@ VIEWS.inventario = async () => {
   try {
     const [low, moves] = await Promise.all([GET("/api/products?low=1"), GET("/api/inventory/moves")]);
     $("#inv-low").innerHTML = low.map((p) => `<tr><td>${esc(p.name)}<div class="small muted mono">${esc(p.sku)}</div></td><td class="num"><span class="badge ${p.stock <= 0 ? "bad" : "warn"}">${Number(p.stock)}</span></td><td class="num">${Number(p.min_stock)}</td><td><button class="sm" data-id="${p.id}">Surtir</button></td></tr>`).join("") || '<tr><td colspan="4" class="empty">Todo en orden 👍</td></tr>';
-    $("#inv-moves").innerHTML = moves.map((m) => `<tr><td class="small nowrap">${esc(m.created_at)}</td><td>${esc(m.name)}<div class="small muted mono">${esc(m.sku)}</div></td>
+    $("#view-inventario").classList.toggle("single-branch", !S.multi);
+    $("#inv-moves").innerHTML = moves.map((m) => `<tr><td class="small nowrap">${esc(m.created_at)}</td><td class="small multi-col">${esc(m.branch_name || "")}</td><td>${esc(m.name)}<div class="small muted mono">${esc(m.sku)}</div></td>
       <td><span class="badge ${m.qty > 0 ? "ok" : "warn"}">${esc(m.kind)}</span></td><td class="num">${m.qty > 0 ? "+" : ""}${Number(m.qty)}</td><td class="small">${esc(m.reference || "")} ${esc(m.notes || "")}</td></tr>`).join("") || '<tr><td colspan="5" class="empty">Sin movimientos</td></tr>';
   } catch (e) { fail(e); }
   setTimeout(() => $("#inv-scan").focus(), 30);
@@ -1341,12 +1386,14 @@ function initVentas() {
       <label class="f">Desde<input type="date" id="v-from"></label><label class="f">Hasta<input type="date" id="v-to"></label>
       <label class="f" style="flex:1;max-width:380px">Buscar (garantías)<input id="v-q" placeholder="Folio, cliente, teléfono, IMEI, modelo, producto…"></label>
       <label class="chk small" style="align-self:flex-end;margin-bottom:10px"><input type="checkbox" id="v-all" checked> Buscar en todas las fechas</label>
+      <label class="f admin-branch">Sucursal<select id="v-branch"></select></label>
       <span class="spacer"></span><div id="v-sum" class="muted"></div></div>
-    <div class="table-wrap"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Vendedor</th><th>Cliente</th><th>Equipo</th><th class="num">Piezas</th><th>Pago</th><th class="num">Total</th><th>Estado</th><th></th></tr></thead><tbody id="v-body"></tbody></table></div>`;
+    <div class="table-wrap"><table><thead><tr><th>Folio</th><th>Fecha</th><th class="multi-col">Sucursal</th><th>Vendedor</th><th>Cliente</th><th>Equipo</th><th class="num">Piezas</th><th>Pago</th><th class="num">Total</th><th>Estado</th><th></th></tr></thead><tbody id="v-body"></tbody></table></div>`;
   $("#v-from").value = today(); $("#v-to").value = today();
   ["v-from", "v-to"].forEach((i) => $("#" + i).onchange = VIEWS.ventas);
   $("#v-q").oninput = debounce(VIEWS.ventas, 250);
   $("#v-all").onchange = VIEWS.ventas;
+  $("#v-branch").onchange = VIEWS.ventas;
   $("#v-body").addEventListener("click", (e) => {
     const b = e.target.closest("[data-a]"); if (!b) return;
     const id = +b.closest("tr").dataset.id;
@@ -1356,14 +1403,17 @@ function initVentas() {
 }
 VIEWS.ventas = async () => {
   try {
-    const list = await GET(`/api/sales?from=${$("#v-from").value}&to=${$("#v-to").value}&q=${encodeURIComponent($("#v-q").value)}&all=${$("#v-all").checked ? 1 : 0}`);
+    if (!$("#v-branch").options.length) $("#v-branch").innerHTML = branchOptions("");
+    $("#view-ventas").classList.toggle("single-branch", !S.multi);
+    $("#view-ventas").classList.toggle("no-branch-pick", !(S.multi && S.me.can_switch_branch));
+    const list = await GET(`/api/sales?from=${$("#v-from").value}&to=${$("#v-to").value}&q=${encodeURIComponent($("#v-q").value)}&all=${$("#v-all").checked ? 1 : 0}${branchParam("#v-branch")}`);
     const ok = list.filter((s) => s.status === "completada");
     $("#v-sum").innerHTML = `${ok.length} venta(s) · <b>${money(ok.reduce((a, s) => a + s.total, 0))}</b>`;
-    $("#v-body").innerHTML = list.map((s) => `<tr data-id="${s.id}"><td class="mono"><a data-a="view">${esc(s.folio)}</a></td><td class="small">${esc(s.created_at)}</td><td>${esc(s.seller_name || s.cashier || "—")}</td>
+    $("#v-body").innerHTML = list.map((s) => `<tr data-id="${s.id}"><td class="mono"><a data-a="view">${esc(s.folio)}</a></td><td class="small">${esc(s.created_at)}</td><td class="small multi-col">${esc(s.branch_name || "")}</td><td>${esc(s.seller_name || s.cashier || "—")}</td>
       <td>${esc(s.customer_name || "—")}<div class="small muted">${esc(s.customer_phone || "")}</div></td><td class="small">${esc(s.device_model || "")}<div class="mono muted">${esc(s.device_imei || "")}</div></td><td class="num">${Number(s.units || 0)}</td>
       <td>${esc(s.payment_method)}</td><td class="num"><b>${money(s.total)}</b></td>
       <td>${s.status === "completada" ? '<span class="badge ok">Completada</span>' : s.status === "pendiente" ? '<span class="badge warn">Por cobrar</span>' : '<span class="badge bad">Cancelada</span>'}</td>
-      <td><button class="sm" data-a="view">Ver</button> <button class="sm" data-a="print">🖨</button></td></tr>`).join("") || '<tr><td colspan="10" class="empty">Sin ventas</td></tr>';
+      <td><button class="sm" data-a="view">Ver</button> <button class="sm" data-a="print">🖨</button></td></tr>`).join("") || '<tr><td colspan="11" class="empty">Sin ventas</td></tr>';
   } catch (e) { fail(e); }
 };
 
@@ -1374,7 +1424,8 @@ function initCorte() {
       <button id="c-print">🖨 Imprimir corte</button></div>
     <div class="row" style="margin-bottom:14px">
       <label class="f">Desde<input type="date" id="c-from"></label><label class="f">Hasta<input type="date" id="c-to"></label>
-      <div class="row" style="align-self:flex-end"><button class="sm" data-r="0">Hoy</button><button class="sm" data-r="1">Ayer</button><button class="sm" data-r="7">7 días</button><button class="sm" data-r="30">30 días</button><button class="sm" data-r="m">Este mes</button></div></div>
+      <div class="row" style="align-self:flex-end"><button class="sm" data-r="0">Hoy</button><button class="sm" data-r="1">Ayer</button><button class="sm" data-r="7">7 días</button><button class="sm" data-r="30">30 días</button><button class="sm" data-r="m">Este mes</button></div>
+      <label class="f admin-branch">Sucursal<select id="c-branch"></select></label></div>
     <div class="kpis" id="c-kpis"></div>
     <div class="grid cols-2">
       <div class="card"><h2>Formas de pago y caja</h2><table><tbody id="c-pay"></tbody></table>
@@ -1384,6 +1435,7 @@ function initCorte() {
         <table style="margin-top:8px"><tbody id="c-cash"></tbody></table></div>
       <div class="card"><h2>Ventas por categoría</h2><table><thead><tr><th>Categoría</th><th class="num">Piezas</th><th class="num">Venta</th><th class="num">Utilidad</th></tr></thead><tbody id="c-cat"></tbody></table></div>
     </div>
+    <div class="card multi-col" id="c-branch-card"><h2>Ventas por sucursal</h2><table><thead><tr><th>Sucursal</th><th class="num">Ventas</th><th class="num">Total</th><th class="num">Efectivo</th><th class="num">Utilidad</th></tr></thead><tbody id="c-bybranch"></tbody></table></div>
     <div class="card"><h2>Ventas por vendedor</h2><table><thead><tr><th>Vendedor</th><th class="num">Ventas</th><th class="num">Total</th><th class="num">Utilidad</th></tr></thead><tbody id="c-seller"></tbody></table></div>
     <div class="card"><h2>Productos más vendidos</h2><table><thead><tr><th>Producto</th><th>SKU</th><th class="num">Piezas</th><th class="num">Venta</th></tr></thead><tbody id="c-top"></tbody></table></div>`;
   $("#c-from").value = today(); $("#c-to").value = today();
@@ -1401,13 +1453,16 @@ function initCorte() {
     try { await POST("/api/cash", { kind: $("#c-kind").value, amount: $("#c-amt").value, notes: $("#c-note").value }); $("#c-amt").value = ""; $("#c-note").value = ""; toast("Movimiento registrado", "ok"); VIEWS.corte(); } catch (e) { fail(e); }
   };
   $("#c-print").onclick = async () => {
-    const q = `from=${$("#c-from").value}&to=${$("#c-to").value}`;
+    const q = `from=${$("#c-from").value}&to=${$("#c-to").value}${branchParam("#c-branch")}`;
     if (S.settings.ticket_printer_mode === "browser") return openTicketWindow(`/reports/corte?${q}&print=1`);
     try { const r = await POST(`/api/reports/corte/print?${q}`); toast(r.message, "ok"); } catch (e) { fail(e); }
   };
 }
 VIEWS.corte = async () => {
-  const q = `from=${$("#c-from").value}&to=${$("#c-to").value}`;
+  if (!$("#c-branch").options.length) { $("#c-branch").innerHTML = branchOptions(""); $("#c-branch").onchange = VIEWS.corte; }
+  $("#view-corte").classList.toggle("single-branch", !S.multi);
+  $("#view-corte").classList.toggle("no-branch-pick", !(S.multi && S.me.can_switch_branch));
+  const q = `from=${$("#c-from").value}&to=${$("#c-to").value}${branchParam("#c-branch")}`;
   try {
     const [r, cash] = await Promise.all([GET(`/api/reports/summary?${q}`), GET(`/api/cash?${q}`)]);
     const k = (label, v) => `<div class="kpi"><small>${label}</small><b>${v}</b></div>`;
@@ -1420,6 +1475,8 @@ VIEWS.corte = async () => {
       row(`IVA incluido`, money(r.tax)) + row("Ventas canceladas", r.cancelled_count);
     $("#c-cash").innerHTML = cash.map((c) => `<tr><td class="small">${esc(c.created_at.slice(11, 16))}</td><td><span class="badge ${c.kind === "entrada" ? "ok" : "warn"}">${c.kind}</span></td><td>${esc(c.notes)}</td><td class="num">${money(c.amount)}</td></tr>`).join("");
     $("#c-cat").innerHTML = r.by_category.map((c) => `<tr><td>${esc(c.category)}</td><td class="num">${c.units}</td><td class="num">${money(c.total)}</td><td class="num">${money(c.profit)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
+    $("#c-branch-card").classList.toggle("hidden", r.by_branch.length < 2);
+    $("#c-bybranch").innerHTML = r.by_branch.map((b) => `<tr><td>${esc(b.branch)}</td><td class="num">${b.n}</td><td class="num">${money(b.total)}</td><td class="num">${money(b.cash)}</td><td class="num">${money(b.profit)}</td></tr>`).join("");
     $("#c-seller").innerHTML = r.by_seller.map((v) => `<tr><td>${esc(v.seller)}</td><td class="num">${v.n}</td><td class="num">${money(v.total)}</td><td class="num">${money(v.profit)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
     $("#c-top").innerHTML = r.top_products.map((t) => `<tr><td>${esc(t.name)}</td><td class="mono small">${esc(t.sku || "")}</td><td class="num">${t.units}</td><td class="num">${money(t.total)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
   } catch (e) { fail(e); }
@@ -1437,6 +1494,42 @@ function field(key, label, opts = {}) {
 
 function initConfig() { /* se dibuja al entrar */ }
 
+const userBranchOptions = (sel) => `<option value="">Todas (solo administradores)</option>` +
+  S.branches.map((b) => `<option value="${b.id}" ${String(b.id) === String(sel ?? "") ? "selected" : ""}>${esc(b.name)}</option>`).join("");
+
+async function loadBranches() {
+  const body = $("#br-body"); if (!body) return;
+  let list;
+  try { list = await GET("/api/branches"); } catch (e) { return fail(e); }
+  const agentState = (b) => {
+    if (!b.agent_last_seen) return '<span class="badge">Sin conectar</span>';
+    const mins = (Date.now() - new Date(b.agent_last_seen.replace(" ", "T")).getTime()) / 60000;
+    return mins < 1 ? '<span class="badge ok">Conectado</span>' : `<span class="badge warn">Última vez ${esc(b.agent_last_seen.slice(5, 16))}</span>`;
+  };
+  body.innerHTML = list.map((b) => `<tr data-id="${b.id}"><td><input data-b="name" value="${esc(b.name)}"></td>
+      <td><input data-b="code" value="${esc(b.code)}" class="mono" style="width:70px"></td><td><input data-b="address" value="${esc(b.address || "")}"></td>
+      <td><input data-b="phone" value="${esc(b.phone || "")}" style="width:130px"></td><td class="center"><input type="checkbox" data-b="active" ${b.active ? "checked" : ""}></td>
+      <td>${agentState(b)}${b.pending_jobs ? ` <span class="badge warn">${b.pending_jobs} en cola</span>` : ""}<div><a class="small" href="/api/branches/${b.id}/agente.json">⬇ Descargar agente.json</a></div></td>
+      <td><button class="sm" data-a="save">Guardar</button></td></tr>`).join("") +
+    `<tr><td><input id="nb-name" placeholder="Nombre, p. ej. Centro"></td><td><input id="nb-code" class="mono" placeholder="S2" style="width:70px"></td>
+      <td><input id="nb-address" placeholder="Dirección (sale en el ticket)"></td><td><input id="nb-phone" placeholder="Teléfono" style="width:130px"></td><td></td><td></td>
+      <td><button class="sm primary" id="nb-add">Agregar</button></td></tr>`;
+  body.onclick = async (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    try {
+      if (b.id === "nb-add") {
+        await POST("/api/branches", { name: $("#nb-name").value, code: $("#nb-code").value, address: $("#nb-address").value, phone: $("#nb-phone").value });
+        toast("Sucursal agregada", "ok");
+      } else {
+        const tr = b.closest("tr"), v = (k) => tr.querySelector(`[data-b="${k}"]`);
+        await PUT(`/api/branches/${tr.dataset.id}`, { name: v("name").value, code: v("code").value, address: v("address").value, phone: v("phone").value, active: v("active").checked ? 1 : 0 });
+        toast("Sucursal guardada", "ok");
+      }
+      await loadBase(); loadBranches(); loadUsers();
+    } catch (er) { fail(er); }
+  };
+}
+
 async function loadUsers() {
   let data;
   try { data = await GET("/api/users"); } catch (e) { return fail(e); }
@@ -1444,20 +1537,21 @@ async function loadUsers() {
   const body = $("#usr-body");
   body.innerHTML = data.users.map((u) => `<tr data-id="${u.id}"><td><input data-u="username" value="${esc(u.username)}" style="width:130px"></td>
       <td><input data-u="full_name" value="${esc(u.full_name)}"></td><td><select data-u="role">${roleSel(u.role)}</select></td>
+      <td><select data-u="branch_id">${userBranchOptions(u.branch_id)}</select></td>
       <td><input data-u="password" type="password" placeholder="(sin cambio)" style="width:140px"></td>
       <td class="center"><input type="checkbox" data-u="active" ${u.active ? "checked" : ""}></td><td><button class="sm" data-a="save">Guardar</button></td></tr>`).join("") +
     `<tr><td><input id="nu-user" placeholder="usuario" style="width:130px"></td><td><input id="nu-name" placeholder="Nombre completo"></td>
-      <td><select id="nu-role">${roleSel("vendedor")}</select></td><td><input id="nu-pass" type="password" placeholder="contraseña" style="width:140px"></td><td></td>
+      <td><select id="nu-role">${roleSel("vendedor")}</select></td><td><select id="nu-branch">${userBranchOptions(S.me.branch.id)}</select></td><td><input id="nu-pass" type="password" placeholder="contraseña" style="width:140px"></td><td></td>
       <td><button class="sm primary" id="nu-add">Agregar</button></td></tr>`;
   body.onclick = async (e) => {
     const b = e.target.closest("button"); if (!b) return;
     try {
       if (b.id === "nu-add") {
-        await POST("/api/users", { username: $("#nu-user").value, full_name: $("#nu-name").value, role: $("#nu-role").value, password: $("#nu-pass").value });
+        await POST("/api/users", { username: $("#nu-user").value, full_name: $("#nu-name").value, role: $("#nu-role").value, password: $("#nu-pass").value, branch_id: $("#nu-branch").value });
         toast("Usuario creado", "ok");
       } else {
         const tr = b.closest("tr"), v = (k) => tr.querySelector(`[data-u="${k}"]`);
-        await PUT(`/api/users/${tr.dataset.id}`, { username: v("username").value, full_name: v("full_name").value, role: v("role").value, password: v("password").value, active: v("active").checked ? 1 : 0 });
+        await PUT(`/api/users/${tr.dataset.id}`, { username: v("username").value, full_name: v("full_name").value, role: v("role").value, password: v("password").value, branch_id: v("branch_id").value, active: v("active").checked ? 1 : 0 });
         toast("Usuario guardado", "ok");
       }
       S.sellers = await GET("/api/sellers"); fillSellers(); loadUsers();
@@ -1471,7 +1565,7 @@ VIEWS.config = async () => {
   const el = $("#view-config");
   el.innerHTML = `
     <div class="view-head"><h1>Configuración</h1><a class="btn" href="/api/backup">💾 Descargar respaldo</a><button class="primary" id="cfg-save">Guardar cambios</button></div>
-    <div class="tabs"><button data-t="tienda" class="on">Tienda</button><button data-t="tickets">Tickets</button><button data-t="zebra">Etiquetas Zebra</button><button data-t="precios">Precios e IVA</button><button data-t="cats">Categorías</button><button data-t="users">👤 Usuarios</button></div>
+    <div class="tabs"><button data-t="tienda" class="on">Tienda</button><button data-t="tickets">Tickets</button><button data-t="zebra">Etiquetas Zebra</button><button data-t="precios">Precios e IVA</button><button data-t="cats">Categorías</button><button data-t="users">👤 Usuarios</button><button data-t="branches">🏬 Sucursales</button></div>
     <div data-p="tienda" class="card"><div class="form-grid">
       ${field("store_name", "Nombre comercial", { span: 2 })}${field("store_legal_name", "Razón social", { span: 2 })}
       ${field("store_rfc", "RFC")}${field("store_phone", "Teléfono")}${field("store_whatsapp", "WhatsApp")}
@@ -1482,8 +1576,8 @@ VIEWS.config = async () => {
         <div class="grid" style="gap:8px;max-width:340px"><input type="file" id="logo-file" accept="image/*">
           <div class="row"><button class="sm primary" id="logo-up">Subir logo nuevo</button><button class="sm" id="logo-reset">Usar logo original</button></div>
           ${field("ticket_logo", "Imprimir el logo en tickets y corte de caja", { type: "check" })}</div></div></fieldset></div>
-    <div data-p="tickets" class="card hidden"><div class="form-grid">
-      ${field("ticket_printer_mode", "Imprimir tickets en", { span: 2, options: { browser: "Navegador (cualquier impresora instalada)", network: "Impresora térmica en red (ESC/POS, puerto 9100)", local: "Impresora térmica USB instalada (ESC/POS crudo)", zebra: "Impresora Zebra (ZPL)" } })}
+    <div data-p="tickets" class="card hidden"><p class="small muted" style="margin-top:0">Impresora de tickets de la sucursal <b>${esc(S.me.branch.name)}</b>${S.multi ? " (cada sucursal tiene la suya)" : ""}.</p><div class="form-grid">
+      ${field("ticket_printer_mode", "Imprimir tickets en", { span: 2, options: { browser: "Navegador (cualquier impresora instalada)", network: "Impresora térmica en red (ESC/POS, puerto 9100)", local: "Impresora térmica USB instalada (ESC/POS crudo)", zebra: "Impresora Zebra (ZPL)", agent: "Agente de impresión de la sucursal (otra computadora)" } })}
       ${field("ticket_width", "Ancho de papel", { options: { 80: "80 mm (48 caracteres)", 58: "58 mm (32 caracteres)" } })}
       ${field("ticket_copies", "Copias")}
       ${field("ticket_printer_host", "IP impresora de tickets", { ph: "192.168.1.50" })}${field("ticket_printer_port", "Puerto")}
@@ -1495,8 +1589,8 @@ VIEWS.config = async () => {
       ${field("warranty_text", "Texto de garantía (se imprime cuando hay celulares o productos con garantía)", { type: "area", span: "all" })}
       ${field("ticket_change_boxes", "Imprimir recuadro “Control de cambios” con renglones de fecha y firma", { type: "check", span: "all" })}
       </div><div class="row" style="margin-top:12px"><button id="t-test">🖨 Ticket de prueba</button><span class="small muted">Guarda antes de probar.</span></div></div>
-    <div data-p="zebra" class="card hidden"><div class="form-grid">
-      ${field("label_printer_mode", "Conexión de la Zebra", { span: 2, options: { download: "Descargar archivo .ZPL (enviar manualmente)", network: "Zebra en red (IP, puerto 9100)", local: "Zebra USB instalada en este equipo" } })}
+    <div data-p="zebra" class="card hidden"><p class="small muted" style="margin-top:0">Zebra de la sucursal <b>${esc(S.me.branch.name)}</b>${S.multi ? " (cada sucursal tiene la suya)" : ""}.</p><div class="form-grid">
+      ${field("label_printer_mode", "Conexión de la Zebra", { span: 2, options: { download: "Descargar archivo .ZPL (enviar manualmente)", network: "Zebra en red (IP, puerto 9100)", local: "Zebra USB instalada en este equipo", agent: "Agente de impresión de la sucursal (otra computadora)" } })}
       ${field("label_printer_host", "IP de la Zebra", { ph: "192.168.1.60" })}${field("label_printer_port", "Puerto")}
       <label class="f span-2">Nombre de la Zebra USB<input data-k="label_printer_name" list="dl-printers" value="${esc(S.settings.label_printer_name)}" placeholder="ZDesigner GC420t"></label>
       ${field("label_dpi", "Resolución", { options: { 203: "203 dpi (8 puntos/mm) — GC420, ZD220, ZD410, GK420", 300: "300 dpi (12 puntos/mm) — ZD421-300, ZT230-300", 600: "600 dpi" } })}
@@ -1521,12 +1615,17 @@ VIEWS.config = async () => {
         <td><button class="sm" data-a="save">Guardar</button> <button class="sm danger" data-a="del">✕</button></td></tr>`).join("")}
       <tr><td><input id="nc-name" placeholder="Nueva categoría"></td><td><input id="nc-prefix" class="mono" placeholder="ABC" style="width:90px"></td><td class="center"><input type="checkbox" id="nc-ser"></td><td class="center"><input type="checkbox" id="nc-dev"></td><td><input id="nc-markup" value="100" style="width:90px"></td><td></td><td><button class="sm primary" id="nc-add">Agregar</button></td></tr>
       </tbody></table></div>
+    <div data-p="branches" class="card hidden">
+      <p class="small muted" style="margin-top:0">Todas las sucursales comparten productos y precios; cada una tiene su existencia, sus IMEI, sus folios (<span class="mono">CLAVE-000123</span>), su caja y sus impresoras.
+      En la computadora de cada sucursal corre el <b>agente de impresión</b> (<span class="mono">iniciar_agente.bat</span>) con su <span class="mono">agente.json</span>.</p>
+      <table><thead><tr><th>Sucursal</th><th>Clave folio</th><th>Dirección</th><th>Teléfono</th><th>Activa</th><th>Agente de impresión</th><th></th></tr></thead><tbody id="br-body"></tbody></table></div>
     <div data-p="users" class="card hidden">
       <p class="small muted" style="margin-top:0"><b>Administrador</b>: todo. <b>Cajero</b>: cobra las notas de los vendedores, hace notas, registra cambios por garantía, etiquetas, inventario, corte de caja. <b>Vendedor</b>: arma la venta y la envía a caja, consulta garantías (no ve costos, no cambia precios, no cancela ventas).</p>
       <div style="margin-bottom:12px">${field("seller_can_charge", "Permitir que los vendedores también cobren (si no, solo envían la nota a caja)", { type: "check" })}</div>
-      <table><thead><tr><th>Usuario</th><th>Nombre (sale en el ticket)</th><th>Rol</th><th>Nueva contraseña</th><th>Activo</th><th></th></tr></thead><tbody id="usr-body"></tbody></table></div>
+      <table><thead><tr><th>Usuario</th><th>Nombre (sale en el ticket)</th><th>Rol</th><th>Sucursal</th><th>Nueva contraseña</th><th>Activo</th><th></th></tr></thead><tbody id="usr-body"></tbody></table></div>
     <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;
   loadUsers();
+  loadBranches();
   $("#logo-up").onclick = async () => {
     const f = $("#logo-file").files[0]; if (!f) return toast("Selecciona una imagen", "bad");
     const fd = new FormData(); fd.append("file", f);
