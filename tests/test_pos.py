@@ -214,3 +214,16 @@ def test_bulk_create_micas(client):
     r = client.post("/api/products/bulk", json={"rows": rows}).get_json()
     assert len(r["created"]) == 2 and not r["errors"]
     assert r["created"][0]["sku"].startswith("MIC-")
+
+
+def test_logo_in_tickets(client):
+    p = _product(client)
+    sale = client.post("/api/sales", json={"items": [{"product_id": p["id"], "qty": 1}], "payment_method": "tarjeta",
+                                           "print": False}).get_json()["sale"]
+    assert b"\x1dv0\x00" in client.get(f"/tickets/{sale['id']}?format=escpos").data  # imagen raster ESC/POS
+    assert "^GFA," in client.get(f"/tickets/{sale['id']}?format=zpl").get_data(as_text=True)
+    assert 'class="logo"' in client.get(f"/tickets/{sale['id']}").get_data(as_text=True)
+    assert client.get("/logo-ticket.png").status_code == 200
+    assert client.application.test_client().get("/logo.png").status_code == 200  # visible en el login
+    client.put("/api/settings", json={"ticket_logo": "0"})
+    assert b"\x1dv0\x00" not in client.get(f"/tickets/{sale['id']}?format=escpos").data

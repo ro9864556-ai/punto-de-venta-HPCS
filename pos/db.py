@@ -136,6 +136,7 @@ DEFAULT_SETTINGS = {
     "ticket_printer_name": "Hospital para celulares Shop",
     "ticket_open_drawer": "0",
     "ticket_copies": "1",
+    "ticket_logo": "1",
     "label_printer_mode": "local",
     "label_printer_host": "",
     "label_printer_port": "9100",

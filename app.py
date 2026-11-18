@@ -15,7 +15,7 @@ from flask import Flask, Response, g, jsonify, redirect, render_template, reques
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from pos import db as dbm
-from pos import labels, printing, tickets
+from pos import images, labels, printing, tickets
 from pos.barcodes import is_valid_ean13
 from pos.pricing import ROUNDING_MODES, generate_internal_barcode, generate_sku, suggest_price
 
@@ -107,7 +107,47 @@ def create_app(db_path=None):
         "api_add_serials", "api_inventory_adjust", "api_inventory_moves", "api_cash_create", "api_cash_list",
         "api_report", "corte_page", "api_corte_print", "api_dashboard", "api_label_preview", "api_label_zpl",
     }
-    PUBLIC = {"login_page", "api_login", "static"}
+    PUBLIC = {"login_page", "api_login", "static", "logo_png"}
+    ADMIN_ONLY.add("api_upload_logo")
+    DATA_DIR = os.path.dirname(os.path.abspath(app.config["DB_PATH"]))
+
+    def logo_file():
+        return images.logo_path(DATA_DIR)
+
+    @app.get("/logo.png")
+    def logo_png():
+        path = logo_file()
+        if not path:
+            return Response(status=404)
+        resp = send_file(path, mimetype="image/png", max_age=0)
+        return resp
+
+    @app.get("/logo-ticket.png")
+    def logo_ticket_png():
+        """Logo en blanco y negro, tal como lo imprime la térmica."""
+        img = images.monochrome(logo_file(), 400)
+        if img is None:
+            return Response(status=404)
+        return Response(images.png_bytes(img), mimetype="image/png", headers={"Cache-Control": "no-cache"})
+
+    @app.post("/api/logo")
+    def api_upload_logo():
+        f = request.files.get("file")
+        if not f:
+            raise ApiError("Selecciona una imagen")
+        try:
+            images.save_logo(DATA_DIR, f.read())
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(f"No se pudo usar la imagen: {exc}")
+        return jsonify({"ok": True})
+
+    @app.delete("/api/logo")
+    def api_reset_logo():
+        custom = os.path.join(DATA_DIR, "logo.png")
+        if os.path.exists(custom):
+            os.remove(custom)
+        return jsonify({"ok": True})
+    ADMIN_ONLY.add("api_reset_logo")
 
     def current_user():
         if "user" not in g:
@@ -862,12 +902,12 @@ def create_app(db_path=None):
         if mode == "browser":
             return jsonify({"mode": "browser"})
         if mode == "zebra":
-            data = tickets.to_zpl(t, s)
+            data = tickets.to_zpl(t, s, logo_file())
             for _ in range(copies):
                 printing.send(data, s.get("label_printer_mode") if s.get("label_printer_mode") != "download" else "network",
                               s.get("label_printer_host"), s.get("label_printer_port"), s.get("label_printer_name"))
             return jsonify({"mode": "zebra", "message": f"{title}: enviado a la Zebra"})
-        data = tickets.to_escpos(t, open_drawer=s.get("ticket_open_drawer") == "1")
+        data = tickets.to_escpos(t, open_drawer=s.get("ticket_open_drawer") == "1", logo_path=logo_file())
         for _ in range(copies):
             printing.send(data, mode, s.get("ticket_printer_host"), s.get("ticket_printer_port"), s.get("ticket_printer_name"))
         return jsonify({"mode": mode, "message": f"{title}: enviado a la impresora de tickets"})
@@ -891,10 +931,10 @@ def create_app(db_path=None):
         if fmt == "txt":
             return Response(tickets.to_text(t), mimetype="text/plain; charset=utf-8")
         if fmt == "zpl":
-            return Response(tickets.to_zpl(t, s), mimetype="text/plain; charset=utf-8",
+            return Response(tickets.to_zpl(t, s, logo_file()), mimetype="text/plain; charset=utf-8",
                             headers={"Content-Disposition": f"attachment; filename=ticket_{sale['folio']}.zpl"})
         if fmt == "escpos":
-            return Response(tickets.to_escpos(t), mimetype="application/octet-stream",
+            return Response(tickets.to_escpos(t, logo_path=logo_file()), mimetype="application/octet-stream",
                             headers={"Content-Disposition": f"attachment; filename=ticket_{sale['folio']}.bin"})
         return tickets.to_html(t, s.get("ticket_width", "80"), f"Ticket {sale['folio']}", autoprint=request.args.get("print") == "1")
 

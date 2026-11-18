@@ -1256,7 +1256,13 @@ VIEWS.config = async () => {
     <div data-p="tienda" class="card"><div class="form-grid">
       ${field("store_name", "Nombre comercial", { span: 2 })}${field("store_legal_name", "Razón social", { span: 2 })}
       ${field("store_rfc", "RFC")}${field("store_phone", "Teléfono")}${field("store_whatsapp", "WhatsApp")}
-      ${field("store_address", "Dirección", { span: "all" })}</div></div>
+      ${field("store_address", "Dirección", { span: "all" })}</div>
+      <fieldset><legend>Logo</legend><div class="row" style="align-items:flex-start;gap:16px">
+        <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:8px"><img id="cfg-logo" src="/logo.png?${Date.now()}" style="height:110px;display:block"></div>
+        <div style="background:#fff;border:1px dashed var(--line);border-radius:10px;padding:8px" title="Así sale en la impresora térmica"><img src="/logo-ticket.png?${Date.now()}" style="height:110px;display:block"><div class="small muted center">En el ticket</div></div>
+        <div class="grid" style="gap:8px;max-width:340px"><input type="file" id="logo-file" accept="image/*">
+          <div class="row"><button class="sm primary" id="logo-up">Subir logo nuevo</button><button class="sm" id="logo-reset">Usar logo original</button></div>
+          ${field("ticket_logo", "Imprimir el logo en tickets y corte de caja", { type: "check" })}</div></div></fieldset></div>
     <div data-p="tickets" class="card hidden"><div class="form-grid">
       ${field("ticket_printer_mode", "Imprimir tickets en", { span: 2, options: { browser: "Navegador (cualquier impresora instalada)", network: "Impresora térmica en red (ESC/POS, puerto 9100)", local: "Impresora térmica USB instalada (ESC/POS crudo)", zebra: "Impresora Zebra (ZPL)" } })}
       ${field("ticket_width", "Ancho de papel", { options: { 80: "80 mm (48 caracteres)", 58: "58 mm (32 caracteres)" } })}
@@ -1300,6 +1306,12 @@ VIEWS.config = async () => {
       <table><thead><tr><th>Usuario</th><th>Nombre (sale en el ticket)</th><th>Rol</th><th>Nueva contraseña</th><th>Activo</th><th></th></tr></thead><tbody id="usr-body"></tbody></table></div>
     <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;
   loadUsers();
+  $("#logo-up").onclick = async () => {
+    const f = $("#logo-file").files[0]; if (!f) return toast("Selecciona una imagen", "bad");
+    const fd = new FormData(); fd.append("file", f);
+    try { await api("POST", "/api/logo", fd); toast("Logo actualizado", "ok"); VIEWS.config(); $("#brand-logo").src = "/logo.png?" + Date.now(); } catch (e) { fail(e); }
+  };
+  $("#logo-reset").onclick = async () => { try { await DEL("/api/logo"); VIEWS.config(); $("#brand-logo").src = "/logo.png?" + Date.now(); } catch (e) { fail(e); } };
   $$(".tabs button", el).forEach((b) => b.onclick = () => {
     $$(".tabs button", el).forEach((x) => x.classList.toggle("on", x === b));
     $$("[data-p]", el).forEach((p) => p.classList.toggle("hidden", p.dataset.p !== b.dataset.t));

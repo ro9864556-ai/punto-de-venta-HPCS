@@ -1,3 +1,5 @@
 Flask>=3.0
+# Logo en tickets térmicos y Zebra:
+Pillow>=10.0
 # Solo en Windows, para imprimir directo a impresoras USB (Zebra / térmica):
 pywin32>=306; sys_platform == "win32"

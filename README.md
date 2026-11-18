@@ -31,6 +31,12 @@ Crea a tu equipo en **Configuración → Usuarios**:
 | **Cajero** | Vender y cobrar a nombre de cualquier vendedor, etiquetas, inventario e IMEI, corte de caja. |
 | **Vendedor** | Hacer notas de venta a su nombre, buscar garantías. No ve costos, no cambia precios (sí puede dar descuento) y no cancela. |
 
+## Logo
+
+El logo de **Hospital para Celulares Shop** aparece en el inicio de sesión, el menú y arriba de cada
+nota y corte de caja. En la impresora térmica y en la Zebra se imprime en blanco y negro (vista previa
+en **Configuración → Tienda → Logo**). Desde ahí se puede subir otro logo o desactivar su impresión.
+
 ## Nota de venta
 
 Cada nota lleva: fecha, vendedor, cliente, teléfono (y email opcional), los artículos con su precio y

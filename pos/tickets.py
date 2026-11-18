@@ -12,6 +12,7 @@ from .barcodes import code128_modules, svg_rects
 from .labels import DPMM, _code128_zpl_data, _zpl_escape, wrap_text
 from datetime import datetime, timedelta
 
+from . import images
 from .db import warranty_label
 from .pricing import money
 
@@ -59,6 +60,9 @@ class Ticket:
     def sep(self, char="-"):
         self.lines.append(("sep", char))
 
+    def logo(self):
+        self.lines.append(("logo",))
+
     def barcode(self, data):
         self.lines.append(("barcode", data))
 
@@ -69,7 +73,11 @@ class Ticket:
 # ---------------------------------------------------------------- construcción
 
 def _store_header(t, s):
-    t.text(s.get("store_name", ""), "C", bold=True, big=True)
+    if s.get("ticket_logo", "1") == "1":
+        t.logo()  # el logo ya trae el nombre de la tienda
+        t.feed()
+    else:
+        t.text(s.get("store_name", ""), "C", bold=True, big=True)
     for key in ("store_legal_name", "store_rfc", "store_address", "store_phone", "store_whatsapp"):
         value = (s.get(key) or "").strip()
         if not value:
@@ -166,7 +174,10 @@ def build_cut_ticket(report, s):
     sym = s.get("currency_symbol", "$")
     m = lambda v: money(v, sym)  # noqa: E731
     t = Ticket(chars_for_width(s.get("ticket_width", "80")))
-    t.text(s.get("store_name", ""), "C", bold=True, big=True)
+    if s.get("ticket_logo", "1") == "1":
+        t.logo()
+    else:
+        t.text(s.get("store_name", ""), "C", bold=True, big=True)
     t.text("CORTE DE CAJA", "C", bold=True)
     t.sep("=")
     t.cols("Desde:", report["from"])
@@ -245,6 +256,8 @@ def to_text(t):
             out.append(ln[1] * t.width)
         elif kind == "barcode":
             out.append(f"[{ln[1]}]".center(t.width))
+        elif kind == "logo":
+            continue
         elif kind == "feed":
             out.extend([""] * ln[1])
     return "\n".join(out)
@@ -257,11 +270,15 @@ def _enc(text):
     return text.encode("cp850", errors="replace")
 
 
-def to_escpos(t, open_drawer=False, cut=True):
+def to_escpos(t, open_drawer=False, cut=True, logo_path=None):
     out = bytearray(ESC + b"@" + ESC + b"t\x02")  # inicializa, página de códigos PC850 (acentos)
     for ln in t.lines:
         kind = ln[0]
-        if kind == "text":
+        if kind == "logo":
+            img = images.monochrome(logo_path, 340 if t.width >= 48 else 250)
+            if img is not None:
+                out += ESC + b"a\x01" + images.escpos_raster(img) + b"\n" + ESC + b"a\x00"
+        elif kind == "text":
             _, value, align, bold, big = ln
             out += ESC + b"a" + bytes([{"L": 0, "C": 1, "R": 2}[align]])
             out += ESC + b"E" + (b"\x01" if bold else b"\x00")
@@ -288,12 +305,15 @@ def to_escpos(t, open_drawer=False, cut=True):
     return bytes(out)
 
 
-def to_html(t, width_mm=80, title="Ticket", autoprint=False):
+def to_html(t, width_mm=80, title="Ticket", autoprint=False, logo_url="/logo-ticket.png"):
     paper = 58 if str(width_mm) == "58" else 80
     body = []
     for ln in t.lines:
         kind = ln[0]
-        if kind == "text":
+        if kind == "logo":
+            if logo_url:
+                body.append(f'<div class="ac"><img class="logo" src="{logo_url}" alt=""></div>')
+        elif kind == "text":
             _, value, align, bold, big = ln
             cls = ["l", {"L": "al", "C": "ac", "R": "ar"}[align]]
             if bold:
@@ -329,12 +349,13 @@ body {{ width: {paper}mm; padding: 3mm {pad}mm; font: {font_mm:.3f}mm/1.3 'Couri
 .row span:first-child {{ overflow: hidden; }}
 .row span:last-child {{ white-space: pre; }}
 .sep {{ margin: 3px 0; }} .sep-dash {{ border-top: 1px dashed #000; }} .sep-eq {{ border-top: 3px double #000; }}
+.logo {{ width: 60%; display: block; margin: 0 auto 2mm; image-rendering: pixelated; }}
 .bc svg {{ width: 80%; height: 34px; display: block; margin: 4px auto 1px; }}
 @media screen {{ body {{ margin: 12px auto; box-shadow: 0 2px 14px rgba(0,0,0,.18); }} html {{ background: #e9e9e9; }} }}
 </style></head><body>{''.join(body)}{script}</body></html>"""
 
 
-def to_zpl(t, settings):
+def to_zpl(t, settings, logo_path=None):
     """Ticket como etiqueta continua para impresora Zebra."""
     dpmm = DPMM.get(str(settings.get("label_dpi", "203")), 8)
     width_mm = float(settings.get("ticket_zebra_width_mm", "76") or 76)
@@ -347,7 +368,12 @@ def to_zpl(t, settings):
     z = []
     for ln in t.lines:
         kind = ln[0]
-        if kind == "text":
+        if kind == "logo":
+            img = images.monochrome(logo_path, int(inner * 0.6))
+            if img is not None:
+                z.append(images.zpl_graphic(img, margin + (inner - img.width) // 2, y))
+                y += img.height + lh // 2
+        elif kind == "text":
             _, value, align, bold, big = ln
             h = fh * 2 if big else fh
             z.append(f"^FO{margin},{y}^A0N,{h},{h}^FB{inner},1,0,{align},0^FH^FD{_zpl_escape(value)}^FS")

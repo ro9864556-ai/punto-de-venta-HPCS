@@ -4,21 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Entrar · {{ store }}</title>
+  <link rel="icon" href="{{ url_for('static', filename='icono.png') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <style>
     body { align-items: center; justify-content: center; background: var(--side); min-height: 100vh; padding: 16px; }
     .login { width: 100%; max-width: 380px; }
     .login h1 { margin: 8px 0 4px; }
     .login form { display: grid; gap: 12px; margin-top: 18px; }
-    .login .logo { color: var(--accent); }
+    .login .logo { display: block; width: 220px; max-width: 70%; margin: 0 auto 6px; }
+    .login { text-align: center; } .login form { text-align: left; }
+    body::before { content: ""; position: fixed; left: 0; right: 0; top: 0; height: 6px; background: linear-gradient(90deg, var(--brand-red) 50%, var(--accent) 50%); }
     .hint { background: var(--warn-soft); color: var(--warn); padding: 10px 12px; border-radius: 8px; font-size: 13px; }
     #err { color: var(--bad); min-height: 20px; font-size: 13px; }
   </style>
 </head>
 <body>
   <div class="card login">
-    <svg class="logo" viewBox="0 0 24 24" width="40" height="40" aria-hidden="true"><rect x="6" y="1.5" width="12" height="21" rx="3" fill="currentColor"/><rect x="8.2" y="4.5" width="7.6" height="12.5" rx="1" fill="#fff"/><circle cx="12" cy="19.6" r="1" fill="#fff"/></svg>
-    <h1>{{ store or "Punto de venta" }}</h1>
+    <img class="logo" src="/logo.png" alt="{{ store }}">
+    <h1 class="hidden">{{ store or "Punto de venta" }}</h1>
     <div class="muted">Inicia sesión para continuar</div>
     <form id="f" autocomplete="on">
       {% if first_run %}<div class="hint">Primer inicio: usuario <b>admin</b>, contraseña <b>admin</b>. Te pediremos cambiarla.</div>{% endif %}
