@@ -98,14 +98,14 @@ def test_sale_flow_and_cancel(client):
     sale = r.get_json()["sale"]
     assert sale["total"] == 199 * 2 - 20 + 3499
     assert sale["change"] == round(4000 - sale["total"], 2)
-    assert sale["folio"] == "JR-000001"  # venta en J. Jesús Reynoso
+    assert sale["folio"] == "JR-00001"  # venta en J. Jesús Reynoso
     assert client.get(f"/api/products/{p['id']}").get_json()["stock"] == 3
     assert client.get(f"/api/products/{phone['id']}").get_json()["stock"] == 1
     # IMEI ya vendido
     assert client.get("/api/lookup?code=356789012345678").status_code == 409
     # ticket
     html = client.get(f"/tickets/{sale['id']}").get_data(as_text=True)
-    assert "JR-000001" in html and "356789012345678" in html
+    assert "JR-00001" in html and "356789012345678" in html
     assert client.get(f"/tickets/{sale['id']}?format=zpl").get_data(as_text=True).startswith("^XA")
     assert client.get(f"/tickets/{sale['id']}?format=escpos").data.startswith(b"\x1b@")
     rep = client.get("/api/reports/summary").get_json()
@@ -205,7 +205,7 @@ def test_roles_and_vendedor_rules(app, client):
     assert sale["device_imei"] == "351234567890123"
     text = vend.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
     for frag in ("Vendedor:", "Luis Vendedor", "María López", "5512345678", "Mica de hidrogel HD",
-                 "Garantía: 6 meses", "iPhone 17 Pro Max", "351234567890123", "TOTAL $250.00"):
+                 "6 meses de garantía", "iPhone 17 Pro Max", "351234567890123", "TOTAL $250.00"):
         assert frag in text, frag
     # el vendedor puede descartar su propia nota pendiente
     p2 = vend.post("/api/sales/pending", json={"items": [{"product_id": mica["id"], "qty": 1}]}).get_json()["sale"]
@@ -233,7 +233,7 @@ def test_warranty_changes(app, client):
                                          "device_imei": "359876543210987"}).get_json()["sale"]
     assert sale["items"][0]["warranty_changes"] == 3
     text = caja.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
-    assert "Incluye 3 cambios" in text and "CONTROL DE CAMBIOS" in text and text.count("Firma:") == 3
+    assert "1 año de garantía · 3 cambios" in text and "CONTROL DE CAMBIOS" in text and text.count("Firma:") == 3
     # búsqueda: por folio escaneado, IMEI y teléfono
     for q in (sale["folio"], "359876543210987", "5511112222"):
         res = caja.get(f"/api/warranty?q={q}").get_json()
@@ -376,7 +376,7 @@ def test_branches_stock_transfer_reports_and_agent(app, client):
     assert anon.get("/api/agent/jobs?code=JR&token=mal").status_code == 401
     jobs = anon.get(f"/api/agent/jobs?code=JR&token={token}").get_json()["jobs"]
     # venta original + reimpresión: las sucursales imprimen por agente desde la instalación
-    assert [j["title"] for j in jobs] == ["Ticket JR-000001", "Ticket JR-000001"]
+    assert [j["title"] for j in jobs] == ["Ticket JR-00001", "Ticket JR-00001"]
     assert all(base64.b64decode(j["data"]).startswith(b"\x1b@") for j in jobs)
     for j in jobs:
         assert anon.post(f"/api/agent/jobs/{j['id']}/done?code=JR&token={token}", json={"ok": True}).status_code == 200
@@ -453,3 +453,35 @@ def test_branch_labels_its_own_inventory(app, client):
     gg.post("/api/sales", json={"items": [{"product_id": a07["id"], "qty": 1, "imei": imeis[0]}], "payment_method": "tarjeta", "print": False})
     again = {r["name"]: r for r in gg.get("/api/inventory/incoming").get_json()}
     assert again["Samsung Galaxy A07 4GB/128GB Verde"]["pending"] == 7
+
+
+def test_nota_como_talonario(client):
+    """La nota sale como la nota física: folio de la sucursal, WhatsApp, descripción con equipo, letra y póliza."""
+    from pos.letras import importe_con_letra
+    assert importe_con_letra(259) == "DOSCIENTOS CINCUENTA Y NUEVE PESOS 00/100 M.N."
+    assert importe_con_letra(1521.5) == "MIL QUINIENTOS VEINTIÚN PESOS 50/100 M.N."
+    assert importe_con_letra(1) == "UN PESO 00/100 M.N."
+    # González Gallo continúa su talonario en 51367
+    gg = [b for b in client.get("/api/branches").get_json() if b["code"] == "GG"][0]
+    assert client.put(f"/api/branches/{gg['id']}", json={**gg, "next_folio": 51367}).status_code == 200
+    client.post("/api/branch/select", json={"branch_id": gg["id"]})
+    mica = _product(client, name="Mica Hidrogel Matte", category_id=3, cost=40, price=259, track_stock=0,
+                    warranty_days=180, warranty_changes=1, ask_device=1)
+    sale = client.post("/api/sales", json={"items": [{"product_id": mica["id"], "qty": 1}], "payment_method": "efectivo",
+                                           "received": 300, "customer_name": "Jesús", "customer_phone": "3781852433",
+                                           "device_model": "Samsung S24", "device_imei": "357425227138540",
+                                           "print": False}).get_json()["sale"]
+    assert sale["folio"] == "GG-51367"
+    txt = " ".join(client.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True).split())
+    for frag in ("GALLO", "HEADBANGER CASES", "González Gallo #160", "NOTA DE VENTA GG-51367", "Nombre:", "Jesús",
+                 "WhatsApp:", "3781852433", "1 Mica Hidrogel Matte", "Equipo: Samsung S24 IMEI 357425227138540",
+                 "6 meses de garantía · 1 cambio", "TOTAL $259.00", "DOSCIENTOS CINCUENTA Y NUEVE PESOS 00/100 M.N.",
+                 "NO APLICA GARANTÍA SIN NOTA, HOLOGRAMA Y EMPAQUE", "ESTA GARANTÍA NO SERÁ VÁLIDA",
+                 "9. En baterías", "Acepto y estoy consciente de las políticas de garantía.", "Firma del cliente"):
+        assert frag in txt, frag
+    # la siguiente nota sigue el consecutivo; una venta sin garantía no lleva la póliza completa
+    cable = _product(client, name="Cable USB-C", category_id=5, price=99, track_stock=0)
+    s2 = client.post("/api/sales", json={"items": [{"product_id": cable["id"], "qty": 1}], "payment_method": "tarjeta",
+                                         "print": False}).get_json()["sale"]
+    assert s2["folio"] == "GG-51368"
+    assert "ESTA GARANTÍA NO SERÁ VÁLIDA" not in client.get(f"/tickets/{s2['id']}?format=txt").get_data(as_text=True)

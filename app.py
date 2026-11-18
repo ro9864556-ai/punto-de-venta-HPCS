@@ -285,7 +285,7 @@ def create_app(db_path=None):
 
     # ------------------------------------------------------------ sucursales
     def _branch_public(b, with_secret=False):
-        out = {k: b[k] for k in ("id", "name", "code", "address", "phone", "active", "sells")}
+        out = {k: b[k] for k in ("id", "name", "code", "address", "phone", "active", "sells", "next_folio")}
         if with_secret:
             out["agent_token"] = b["agent_token"]
             seen = conn().execute("SELECT value FROM branch_settings WHERE branch_id=? AND key='agent_last_seen'", (b["id"],)).fetchone()
@@ -345,6 +345,8 @@ def create_app(db_path=None):
         try:
             c.execute("UPDATE branches SET name=?, code=?, address=?, phone=?, active=?, sells=? WHERE id=?",
                       (name, code, address, phone, active, _sells(d), bid))
+            if str(d.get("next_folio") or "").isdigit() and int(d["next_folio"]) > 0:
+                c.execute("UPDATE branches SET next_folio=? WHERE id=?", (int(d["next_folio"]), bid))
         except Exception:
             raise ApiError("Ya existe una sucursal con ese nombre o clave")
         for key, value in (("store_address", address), ("store_phone", phone)):
@@ -551,7 +553,8 @@ def create_app(db_path=None):
         for key, value in data.items():
             if key in dbm.BRANCH_KEYS:
                 c.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?,?,?)", (bid, key, str(value)))
-            elif key in dbm.DEFAULT_SETTINGS or key in ("ticket_zebra_width_mm", "allow_negative_stock"):
+            elif key in dbm.DEFAULT_SETTINGS or key in ("ticket_zebra_width_mm", "allow_negative_stock", "warranty_policy",
+                                                        "warranty_policy_print", "ticket_amount_words"):
                 c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(value)))
         c.commit()
         return jsonify({"settings": settings()})
@@ -1105,8 +1108,15 @@ def create_app(db_path=None):
         cur = c.execute("INSERT INTO sales(folio, created_at, subtotal, total, payment_method, status, branch_id) VALUES (?,?,0,0,'',?,?)",
                         (f"TMP-{ts}-{os.getpid()}-{id(c)}", ts, status, bid))
         sale_id = cur.lastrowid
-        # el folio lleva la clave de la sucursal: V-000123, S2-000124…
-        c.execute("UPDATE sales SET folio=? WHERE id=?", (f"{branch_row(bid)['code']}-{sale_id:06d}", sale_id))
+        # folio consecutivo de cada sucursal, como el talonario: GG-51367, JR-00012…
+        code = branch_row(bid)["code"]
+        while True:
+            c.execute("UPDATE branches SET next_folio=next_folio+1 WHERE id=?", (bid,))
+            n = c.execute("SELECT next_folio-1 FROM branches WHERE id=?", (bid,)).fetchone()[0]
+            folio = f"{code}-{n:05d}"
+            if not c.execute("SELECT 1 FROM sales WHERE folio=?", (folio,)).fetchone():
+                break
+        c.execute("UPDATE sales SET folio=? WHERE id=?", (folio, sale_id))
         return sale_id
 
     @app.post("/api/sales/pending")

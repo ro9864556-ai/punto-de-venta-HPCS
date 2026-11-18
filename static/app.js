@@ -1526,7 +1526,7 @@ function field(key, label, opts = {}) {
   const cls = `f ${opts.span ? "span-" + opts.span : ""}`;
   if (opts.type === "check") return `<label class="chk ${opts.span ? "span-" + opts.span : ""}"><input type="checkbox" data-k="${key}" ${v === "1" ? "checked" : ""}> ${label}</label>`;
   if (opts.options) return `<label class="${cls}">${label}<select data-k="${key}">${Object.entries(opts.options).map(([k, t]) => `<option value="${k}" ${String(v) === k ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>`;
-  if (opts.type === "area") return `<label class="${cls}">${label}<textarea data-k="${key}">${esc(v)}</textarea></label>`;
+  if (opts.type === "area") return `<label class="${cls}">${label}<textarea data-k="${key}" ${opts.ph ? `placeholder="${esc(opts.ph)}"` : ""}>${esc(v)}</textarea></label>`;
   return `<label class="${cls}">${label}<input data-k="${key}" value="${esc(v)}" ${opts.ph ? `placeholder="${esc(opts.ph)}"` : ""}></label>`;
 }
 
@@ -1545,13 +1545,14 @@ async function loadBranches() {
     return mins < 1 ? '<span class="badge ok">Conectado</span>' : `<span class="badge warn">Última vez ${esc(b.agent_last_seen.slice(5, 16))}</span>`;
   };
   body.innerHTML = list.map((b) => `<tr data-id="${b.id}"><td><input data-b="name" value="${esc(b.name)}"></td>
-      <td><input data-b="code" value="${esc(b.code)}" class="mono" style="width:70px"></td><td><input data-b="address" value="${esc(b.address || "")}"></td>
+      <td><input data-b="code" value="${esc(b.code)}" class="mono" style="width:70px"></td>
+      <td><input data-b="next_folio" value="${b.next_folio}" class="mono" style="width:90px" title="Número con el que saldrá la próxima nota (para seguir tu talonario)"></td><td><input data-b="address" value="${esc(b.address || "")}"></td>
       <td><input data-b="phone" value="${esc(b.phone || "")}" style="width:130px"></td>
       <td class="center"><input type="checkbox" data-b="sells" ${b.sells ? "checked" : ""}>${b.sells ? "" : '<div class="small muted">Bodega</div>'}</td>
       <td class="center"><input type="checkbox" data-b="active" ${b.active ? "checked" : ""}></td>
       <td>${agentState(b)}${b.pending_jobs ? ` <span class="badge warn">${b.pending_jobs} en cola</span>` : ""}<div><a class="small" href="/api/branches/${b.id}/agente.json">⬇ Descargar agente.json</a></div></td>
       <td><button class="sm" data-a="save">Guardar</button></td></tr>`).join("") +
-    `<tr><td><input id="nb-name" placeholder="Nueva sucursal"></td><td><input id="nb-code" class="mono" placeholder="Clave" style="width:70px"></td>
+    `<tr><td><input id="nb-name" placeholder="Nueva sucursal"></td><td><input id="nb-code" class="mono" placeholder="Clave" style="width:70px"></td><td></td>
       <td><input id="nb-address" placeholder="Dirección (sale en el ticket)"></td><td><input id="nb-phone" placeholder="Teléfono" style="width:130px"></td><td class="center"><input type="checkbox" id="nb-sells" checked></td><td></td><td></td>
       <td><button class="sm primary" id="nb-add">Agregar</button></td></tr>`;
   body.onclick = async (e) => {
@@ -1562,7 +1563,7 @@ async function loadBranches() {
         toast("Sucursal agregada", "ok");
       } else {
         const tr = b.closest("tr"), v = (k) => tr.querySelector(`[data-b="${k}"]`);
-        await PUT(`/api/branches/${tr.dataset.id}`, { name: v("name").value, code: v("code").value, address: v("address").value, phone: v("phone").value, sells: v("sells").checked ? 1 : 0, active: v("active").checked ? 1 : 0 });
+        await PUT(`/api/branches/${tr.dataset.id}`, { name: v("name").value, code: v("code").value, address: v("address").value, phone: v("phone").value, next_folio: v("next_folio").value, sells: v("sells").checked ? 1 : 0, active: v("active").checked ? 1 : 0 });
         toast("Sucursal guardada", "ok");
       }
       await loadBase(); loadBranches(); loadUsers();
@@ -1625,8 +1626,11 @@ VIEWS.config = async () => {
       ${field("ticket_open_drawer", "Abrir cajón de dinero al imprimir", { type: "check", span: 2 })}
       ${field("ticket_zebra_width_mm", "Ancho del ticket en Zebra (mm)", { ph: "76" })}
       ${field("folio_prefix", "Prefijo de folio")}
-      ${field("ticket_header", "Leyenda superior", { type: "area", span: 2 })}${field("ticket_footer", "Pie del ticket", { type: "area", span: 2 })}
-      ${field("warranty_text", "Texto de garantía (se imprime cuando hay celulares o productos con garantía)", { type: "area", span: "all" })}
+      ${field("ticket_header", "Encabezado de esta sucursal (debajo del logo)", { type: "area", span: 2, ph: "GALLO\nHEADBANGER CASES" })}${field("ticket_footer", "Pie del ticket", { type: "area", span: 2 })}
+      ${field("warranty_text", "Políticas de garantía (recuadro corto al final de la nota)", { type: "area", span: "all" })}
+      ${field("warranty_policy", "Póliza de garantía completa (reverso de la nota, con firma del cliente)", { type: "area", span: "all" })}
+      ${field("warranty_policy_print", "Imprimir la póliza completa", { span: 2, options: { garantia: "Solo en notas con garantía", siempre: "En todas las notas", nunca: "Nunca" } })}
+      ${field("ticket_amount_words", "Imprimir cantidad con letra", { type: "check", span: 2 })}
       ${field("ticket_change_boxes", "Imprimir recuadro “Control de cambios” con renglones de fecha y firma", { type: "check", span: "all" })}
       </div><div class="row" style="margin-top:12px"><button id="t-test">🖨 Ticket de prueba</button><span class="small muted">Guarda antes de probar.</span></div></div>
     <div data-p="zebra" class="card hidden"><p class="small muted" style="margin-top:0">Zebra de la sucursal <b>${esc(S.me.branch.name)}</b>${S.multi ? " (cada sucursal tiene la suya)" : ""}.</p><div class="form-grid">
@@ -1658,7 +1662,7 @@ VIEWS.config = async () => {
     <div data-p="branches" class="card hidden">
       <p class="small muted" style="margin-top:0">Todas las sucursales comparten productos y precios; cada una tiene su existencia, sus IMEI, sus folios (<span class="mono">CLAVE-000123</span>), su caja y sus impresoras.
       En la computadora de cada sucursal corre el <b>agente de impresión</b> (<span class="mono">iniciar_agente.bat</span>) con su <span class="mono">agente.json</span>.</p>
-      <table><thead><tr><th>Sucursal</th><th>Clave folio</th><th>Dirección</th><th>Teléfono</th><th>Vende al público</th><th>Activa</th><th>Agente de impresión</th><th></th></tr></thead><tbody id="br-body"></tbody></table></div>
+      <table><thead><tr><th>Sucursal</th><th>Clave folio</th><th>Siguiente folio</th><th>Dirección</th><th>Teléfono</th><th>Vende al público</th><th>Activa</th><th>Agente de impresión</th><th></th></tr></thead><tbody id="br-body"></tbody></table></div>
     <div data-p="users" class="card hidden">
       <p class="small muted" style="margin-top:0"><b>Administración</b>: todo, en todas las sucursales. <b>Matriz (supervisor)</b>: revisa todas las sucursales, da de alta productos y sube inventario a cualquiera (entradas, IMEI, traspasos, etiquetas) y ve sus ventas y cortes; no configura ni cancela ventas. <b>Cajero</b>: cobra las notas de los vendedores, hace notas, registra cambios por garantía, etiquetas, inventario, corte de caja. <b>Vendedor</b>: arma la venta y la envía a caja, consulta garantías (no ve costos, no cambia precios, no cancela ventas).</p>
       <div style="margin-bottom:12px">${field("seller_can_charge", "Permitir que los vendedores también cobren (si no, solo envían la nota a caja)", { type: "check" })}</div>

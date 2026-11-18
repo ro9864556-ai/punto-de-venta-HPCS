@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 from . import images
 from .db import warranty_label
+from .letras import importe_con_letra
 from .pricing import money
 
 
@@ -44,8 +45,9 @@ class Ticket:
 
     def text(self, value, align="L", bold=False, big=False):
         limit = self.width // 2 if big else self.width
-        for line in wrap_text(value, limit, 50):
-            self.lines.append(("text", line, align, bold, big))
+        for paragraph in str(value).split("\n"):  # respeta los renglones del texto original
+            for line in wrap_text(paragraph, limit, 80):
+                self.lines.append(("text", line, align, bold, big))
 
     def cols(self, left, right, bold=False):
         left, right = str(left), str(right)
@@ -78,14 +80,16 @@ def _store_header(t, s):
         t.feed()
     else:
         t.text(s.get("store_name", ""), "C", bold=True, big=True)
+    if (s.get("ticket_header") or "").strip():
+        # encabezado de la sucursal, p. ej. "GALLO / HEADBANGER CASES"
+        for line in s["ticket_header"].strip().split("\n"):
+            t.text(line.strip(), "C", bold=True, big=len(line.strip()) <= t.width // 2)
     for key in ("store_legal_name", "store_rfc", "store_address", "store_phone", "store_whatsapp"):
         value = (s.get(key) or "").strip()
         if not value:
             continue
         prefix = {"store_rfc": "RFC: ", "store_phone": "Tel: ", "store_whatsapp": "WhatsApp: "}.get(key, "")
         t.text(prefix + value, "C")
-    if (s.get("ticket_header") or "").strip():
-        t.text(s["ticket_header"].strip(), "C")
 
 
 def build_sale_ticket(sale, items, s, reprint=False):
@@ -98,7 +102,8 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.text("*** VENTA CANCELADA ***", "C", bold=True)
     if reprint:
         t.text("** REIMPRESIÓN **", "C", bold=True)
-    t.cols("Nota / folio:", sale["folio"], bold=True)
+    t.text(f"NOTA DE VENTA {sale['folio']}", "C", bold=True, big=len(sale["folio"]) <= t.width // 2 - 14)
+    t.sep()
     if s.get("multi_branch") == "1" and s.get("branch_name"):
         t.cols("Sucursal:", s["branch_name"])
     t.cols("Fecha:", _fecha(sale["created_at"]))
@@ -107,36 +112,33 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.cols("Vendedor:", seller)
     if sale.get("cashier") and sale.get("cashier") != seller:
         t.cols("Cobró:", sale["cashier"])
-    t.cols("Cliente:", sale.get("customer_name") or "Público en general")
+    t.cols("Nombre:", sale.get("customer_name") or "Público en general")
     if sale.get("customer_phone"):
-        t.cols("Teléfono:", sale["customer_phone"])
+        t.cols("WhatsApp:", sale["customer_phone"])
+    t.sep()
+    t.cols("CANT. DESCRIPCIÓN", "IMPORTE", bold=True)
     t.sep()
     units = 0
+    device = " ".join(x for x in [sale.get("device_model"), sale.get("device_imei") and f"IMEI {sale['device_imei']}"] if x)
     for it in items:
         qty = float(it["qty"])
         units += qty
-        t.text(it["name"], bold=True)
-        if qty == 1:
-            t.cols("  Precio", m(it["unit_price"]))
-        else:
-            t.cols(f"  {qty:g} x {m(it['unit_price'])}", m(qty * float(it["unit_price"])))
+        t.cols(f"{qty:g}  {it['name']}", m(qty * float(it["unit_price"])), bold=True)
+        if qty != 1:
+            t.text(f"     {qty:g} x {m(it['unit_price'])}")
         if float(it.get("discount") or 0):
-            t.cols("  Descuento", "-" + m(it["discount"]))
+            t.cols("     Descuento", "-" + m(it["discount"]))
         if it.get("imei"):
-            t.text(f"  IMEI/Serie: {it['imei']}")
+            t.text(f"     IMEI: {it['imei']}")
         days = int(it.get("warranty_days") or 0)
-        if days:
-            t.text(f"  Garantía: {warranty_label(days)} (vence {_vence(sale['created_at'], days)})")
         changes = int(it.get("warranty_changes") or 0)
-        if changes:
-            t.text(f"  Incluye {changes} cambio{'s' if changes > 1 else ''} por garantía")
-    if sale.get("device_model") or sale.get("device_imei"):
-        t.sep()
-        t.text("EQUIPO DEL CLIENTE (GARANTÍA)", bold=True)
-        if sale.get("device_model"):
-            t.cols("Modelo:", sale["device_model"])
-        if sale.get("device_imei"):
-            t.cols("IMEI:", sale["device_imei"])
+        if (days or changes) and device and not it.get("imei"):
+            t.text(f"     Equipo: {device}")  # como en la nota: el modelo e IMEI del teléfono del cliente
+        if days:
+            extra = f" · {changes} cambio{'s' if changes > 1 else ''}" if changes else ""
+            t.text(f"     {warranty_label(days)} de garantía{extra} (vence {_vence(sale['created_at'], days)})")
+        elif changes:
+            t.text(f"     Incluye {changes} cambio{'s' if changes > 1 else ''} por garantía")
     if s.get("ticket_change_boxes", "1") == "1":
         with_changes = [i for i in items if int(i.get("warranty_changes") or 0)]
         for it in with_changes:
@@ -161,6 +163,9 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.cols("Subtotal:", m(float(sale["total"]) - float(sale["tax"])))
         t.cols(f"IVA {float(s.get('tax_rate', 16)):g}%:", m(sale["tax"]))
     t.text(f"TOTAL {m(sale['total'])}", "R", bold=True, big=True)
+    if s.get("ticket_amount_words", "1") == "1":
+        t.text("Cantidad con letra:")
+        t.text(importe_con_letra(sale["total"]), bold=True)
     t.sep()
     method = sale.get("payment_method", "efectivo")
     if method == "mixto":
@@ -175,13 +180,29 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.sep()
         t.text("Notas: " + sale["notes"])
     t.sep()
-    if (any(int(i.get("warranty_days") or 0) or i.get("imei") for i in items) or sale.get("device_imei")) and (s.get("warranty_text") or "").strip():
+    has_warranty = any(int(i.get("warranty_days") or 0) or int(i.get("warranty_changes") or 0) or i.get("imei") for i in items)
+    if (s.get("warranty_text") or "").strip():
+        t.text("POLÍTICAS DE GARANTÍA:", "C", bold=True)
         t.text(s["warranty_text"].strip(), "C")
         t.feed()
     if (s.get("ticket_footer") or "").strip():
         t.text(s["ticket_footer"].strip(), "C", bold=True)
     t.feed()
     t.barcode(sale["folio"])
+    mode = s.get("warranty_policy_print", "garantia")
+    if (s.get("warranty_policy") or "").strip() and (mode == "siempre" or (mode == "garantia" and has_warranty)):
+        # el reverso de la nota física: póliza completa y firma de aceptación
+        t.feed()
+        t.sep("=")
+        t.text("POLÍTICAS DE GARANTÍA", "C", bold=True)
+        t.text(f"Nota {sale['folio']} · {_fecha(sale['created_at'])[:10]}", "C")
+        t.sep()
+        t.text(s["warranty_policy"].strip())
+        t.feed()
+        t.text("Acepto y estoy consciente de las políticas de garantía.", "C", bold=True)
+        t.feed(3)
+        t.text("_" * min(34, t.width), "C")
+        t.text("Firma del cliente", "C", bold=True)
     t.feed(2)
     return t
 
