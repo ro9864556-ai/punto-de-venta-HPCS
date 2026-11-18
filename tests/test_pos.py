@@ -417,3 +417,39 @@ def test_matriz_supervisor_role(app, client):
     # el cajero no puede cambiar de sucursal ni dar de alta productos
     assert caja.post("/api/branch/select", json={"branch_id": 1}).status_code == 403
     assert caja.post("/api/products", json={"name": "x"}).status_code == 403
+
+
+def test_branch_labels_its_own_inventory(app, client):
+    """Ejemplo: la Matriz entrega 8 Samsung A07 a González Gallo y ellos imprimen sus etiquetas."""
+    client.post("/api/users", json={"username": "cajagg", "full_name": "Caja GG", "role": "cajero", "password": "1234", "branch_id": 3})
+    client.post("/api/branch/select", json={"branch_id": 1})  # Matriz
+    imeis = [f"3500000000000{n:02d}" for n in range(8)]
+    a07 = _product(client, name="Samsung Galaxy A07 4GB/128GB Verde", brand="Samsung", model="Galaxy A07", category_id=1,
+                   price=2899, serialized=1, initial_stock=0, imeis="\n".join(imeis))
+    funda = _product(client, name="Funda A07", initial_stock=10)
+    otra = _product(client, name="Mica sin existencia en GG", initial_stock=4)
+    assert client.post("/api/inventory/transfer", json={"product_id": a07["id"], "to_branch_id": 3, "imeis": "\n".join(imeis)}).status_code == 200
+    assert client.post("/api/inventory/transfer", json={"product_id": funda["id"], "to_branch_id": 3, "qty": 5}).status_code == 200
+    gg = login(app, "cajagg", "1234")
+    incoming = {r["name"]: r for r in gg.get("/api/inventory/incoming").get_json()}
+    assert incoming["Samsung Galaxy A07 4GB/128GB Verde"]["imeis"] == imeis
+    assert incoming["Funda A07"]["pending"] == 5 and incoming["Funda A07"]["reference"] == "← Matriz"
+    # imprime las 8 etiquetas (una por IMEI) en la Zebra de González Gallo (por su agente)
+    r = gg.post("/api/labels/zpl", json={"template": "celular_50x38", "items": [{"product_id": a07["id"], "all_imeis": True}],
+                                         "print": True})
+    assert r.status_code == 200 and r.get_json()["count"] == 8 and "González Gallo" in r.get_json()["message"]
+    token = [b for b in client.get("/api/branches").get_json() if b["id"] == 3][0]["agent_token"]
+    jobs = app.test_client().get(f"/api/agent/jobs?code=GG&token={token}").get_json()["jobs"]
+    assert len(jobs) == 1 and jobs[0]["target"] == "label"
+    import base64
+    zpl = base64.b64decode(jobs[0]["data"]).decode()
+    assert zpl.count("^XA") == 8 and all(f"IMEI: {i}" in zpl for i in imeis)
+    # solo lo que hay en su inventario
+    assert gg.post("/api/labels/zpl", json={"items": [{"product_id": funda["id"], "qty": 5}]}).status_code == 200
+    r = gg.post("/api/labels/zpl", json={"items": [{"product_id": otra["id"], "qty": 1}]})
+    assert r.status_code == 400 and "no tiene existencia" in r.get_json()["error"]
+    assert gg.post("/api/labels/zpl", json={"items": [{"product_id": a07["id"], "imei": "359999999999999"}]}).status_code == 400
+    # un equipo vendido ya no aparece para etiquetar
+    gg.post("/api/sales", json={"items": [{"product_id": a07["id"], "qty": 1, "imei": imeis[0]}], "payment_method": "tarjeta", "print": False})
+    again = {r["name"]: r for r in gg.get("/api/inventory/incoming").get_json()}
+    assert again["Samsung Galaxy A07 4GB/128GB Verde"]["pending"] == 7

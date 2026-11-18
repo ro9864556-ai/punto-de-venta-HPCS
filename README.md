@@ -38,7 +38,7 @@ La instalación nueva ya trae la estructura de la tienda:
 
 | Sucursal | Clave de folio | Quién trabaja ahí |
 |---|---|---|
-| **Matriz** | — (bodega, no vende) | Encargado de matriz: recibe la mercancía, la etiqueta y surte a las sucursales. Es la computadora **servidor**. |
+| **Matriz** | — (bodega, no vende) | Encargado de matriz: recibe la mercancía y surte a las sucursales. Es la computadora **servidor**. |
 | **J. Jesús Reynoso** | `JR-000001` | Cajeros y vendedores de esa sucursal. |
 | **González Gallo** | `GG-000001` | Cajeros y vendedores de esa sucursal. |
 
@@ -71,6 +71,14 @@ teléfono (salen en el ticket de esa sucursal). En **Usuarios** asigna la sucurs
 Para mover mercancía: **Inventario** → selecciona el producto → “Traspaso a otra sucursal”
 (los celulares se traspasan escaneando su IMEI).
 
+### Etiquetas en cada sucursal
+Cada sucursal tiene su propia Zebra y etiqueta **lo que tiene en su inventario**. Ejemplo: la Matriz traspasa
+8 Samsung A07 a González Gallo → en González Gallo, **Etiquetas Zebra → Mercancía recibida** muestra
+“8 × Samsung A07 · Traspaso ← Matriz” → **Etiquetar 8** carga una etiqueta por IMEI → **Imprimir en Zebra**
+y salen en la Zebra de González Gallo. Los cajeros solo pueden etiquetar productos con existencia en su
+sucursal y celulares cuyo IMEI está en su sucursal (los vendidos ya no aparecen). Administración y Matriz
+no tienen esa restricción.
+
 ### Paso 3 · Impresoras de cada sucursal (agente de impresión)
 El servidor no puede llegar a las impresoras USB de otra sucursal; por eso en cada sucursal corre un
 programa pequeño, el **agente**, que recibe los tickets y etiquetas y los manda a sus impresoras.
@@ -84,9 +92,10 @@ programa pequeño, el **agente**, que recibe los tickets y etiquetas y los manda
    **Etiquetas Zebra** elige “Agente de impresión de la sucursal”. En Configuración → Sucursales verás
    el agente como **Conectado**.
 
-La Matriz (servidor) imprime las etiquetas en su Zebra USB directamente (“USB instalada en este equipo”),
-así que **no necesita agente**. J. Jesús Reynoso y González Gallo ya vienen configuradas para imprimir por
-agente; solo falta instalar el agente en su computadora. Administración no necesita agente.
+Cada sucursal (J. Jesús Reynoso y González Gallo) conecta **su impresora de tickets y su Zebra** a su
+computadora; ya vienen configuradas para imprimir por agente, solo falta instalar el agente con su
+`agente.json` (ahí van los nombres de ambas impresoras). La Matriz (servidor), si tiene Zebra, imprime
+directo por USB y **no necesita agente**. Administración no necesita agente.
 
 ## Logo
 

@@ -344,7 +344,8 @@ def migrate_branches(conn):
                                ("inventory_moves", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
                                ("cash_movements", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
                                ("warranty_claims", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
-                               ("users", "branch_id", "INTEGER")]:
+                               ("users", "branch_id", "INTEGER"),
+                               ("inventory_moves", "imeis", "TEXT DEFAULT ''")]:
         cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
         if column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")

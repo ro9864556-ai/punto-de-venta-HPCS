@@ -1186,6 +1186,11 @@ function initEtiquetas() {
           </div>
         </div>
         <div class="table-wrap" style="margin-top:14px"><table><thead><tr><th>Etiqueta</th><th>Detalle</th><th class="center">Copias</th><th></th></tr></thead><tbody id="lb-body"></tbody></table></div>
+        <div class="card" id="lb-in-card" style="margin-top:14px">
+          <div class="row" style="margin-bottom:8px"><h2 style="margin:0">📦 Mercancía recibida</h2><span class="muted small" id="lb-in-branch"></span>
+            <span class="spacer"></span><select id="lb-in-days" style="width:auto"><option value="3">Últimos 3 días</option><option value="7" selected>Últimos 7 días</option><option value="30">Últimos 30 días</option></select></div>
+          <div class="table-wrap" style="max-height:300px"><table><thead><tr><th>Fecha</th><th>Producto</th><th>Llegó</th><th class="num">Piezas</th><th></th></tr></thead><tbody id="lb-in"></tbody></table></div>
+        </div>
       </div>
       <div class="card">
         <label class="f">Plantilla / tamaño de etiqueta<select id="lb-tpl"></select></label>
@@ -1238,6 +1243,15 @@ function initEtiquetas() {
     if (S.settings.label_printer_mode === "download") return $("#lb-dl").click();
     try { const r = await POST("/api/labels/zpl", { ...labelPayload(), print: true }); toast(r.message, "ok"); } catch (e) { fail(e); }
   };
+  $("#lb-in-days").onchange = loadIncoming;
+  $("#lb-in").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-in]"); if (!b) return;
+    const row = S.incoming.find((x) => x.id === +b.dataset.in); if (!row) return;
+    if (row.serialized) row.imeis.forEach((imei) => queueItem({ product_id: row.product_id, name: row.name, sku: row.sku, imei, qty: 1, serialized: 1 }));
+    else queueItem({ product_id: row.product_id, name: row.name, sku: row.sku, qty: Math.round(row.qty), serialized: 0 });
+    toast(`${row.pending} etiqueta(s) de ${row.name} agregadas`, "ok");
+    renderQueue();
+  });
   $("#lb-copy").onclick = () => { navigator.clipboard?.writeText($("#lb-zpl").value); toast("ZPL copiado"); };
 }
 
@@ -1291,7 +1305,18 @@ function renderQueue() {
   refreshPreview();
 }
 
+async function loadIncoming() {
+  $("#lb-in-branch").textContent = S.me ? `en ${S.me.branch.name}` : "";
+  try { S.incoming = await GET(`/api/inventory/incoming?days=${$("#lb-in-days").value}`); } catch (e) { S.incoming = []; }
+  $("#lb-in").innerHTML = S.incoming.map((r) => `<tr><td class="small nowrap">${esc(r.created_at.slice(0, 16))}</td>
+      <td><b>${esc(r.name)}</b><div class="small muted mono">${esc(r.sku)}${r.serialized ? ` · ${r.pending} con IMEI disponibles` : ""}</div></td>
+      <td class="small">${r.kind === "traspaso" ? `Traspaso ${esc(r.reference)}` : "Entrada"}</td><td class="num">${Number(r.qty)}</td>
+      <td>${r.pending ? `<button class="sm primary" data-in="${r.id}">🏷️ Etiquetar ${r.pending}</button>` : '<span class="small muted">Ya vendidos</span>'}</td></tr>`).join("")
+    || '<tr><td colspan="5" class="empty">No ha llegado mercancía en estos días.</td></tr>';
+}
+
 VIEWS.etiquetas = () => {
+  loadIncoming();
   const sel = $("#lb-tpl");
   sel.innerHTML = templateOptions(S.labelTemplate || S.settings.label_template);
   const modes = { download: "Modo: descargar archivo .ZPL", network: `Zebra en red: ${S.settings.label_printer_host}:${S.settings.label_printer_port}`, local: `Zebra USB: ${S.settings.label_printer_name}` };

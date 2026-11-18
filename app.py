@@ -96,9 +96,9 @@ def create_app(db_path=None):
         c.execute("""INSERT INTO branch_stock(product_id, branch_id, stock) VALUES (?,?,?)
                      ON CONFLICT(product_id, branch_id) DO UPDATE SET stock=excluded.stock""", (pid, bid, value))
 
-    def log_move(c, pid, bid, qty, kind, reference="", notes="", ts=None):
-        c.execute("""INSERT INTO inventory_moves(product_id, branch_id, qty, kind, reference, notes, created_at)
-                     VALUES (?,?,?,?,?,?,?)""", (pid, bid, qty, kind, reference, notes, ts or dbm.now()))
+    def log_move(c, pid, bid, qty, kind, reference="", notes="", ts=None, imeis=""):
+        c.execute("""INSERT INTO inventory_moves(product_id, branch_id, qty, kind, reference, notes, created_at, imeis)
+                     VALUES (?,?,?,?,?,?,?,?)""", (pid, bid, qty, kind, reference, notes, ts or dbm.now(), imeis))
 
     def body():
         return request.get_json(silent=True) or {}
@@ -164,7 +164,7 @@ def create_app(db_path=None):
     STAFF_ONLY = {  # administración, matriz y cajero
         "api_add_serials", "api_inventory_adjust", "api_inventory_moves", "api_cash_create", "api_cash_list",
         "api_report", "corte_page", "api_corte_print", "api_dashboard", "api_label_preview", "api_label_zpl",
-        "api_create_claim", "api_print_claim", "api_inventory_transfer",
+        "api_create_claim", "api_print_claim", "api_inventory_transfer", "api_inventory_incoming",
     }
     PUBLIC = {"login_page", "api_login", "static", "logo_png", "api_agent_jobs", "api_agent_job_done"}
     ADMIN_ONLY.add("api_upload_logo")
@@ -956,6 +956,7 @@ def create_app(db_path=None):
             for imei in imeis:
                 c.execute("UPDATE serials SET branch_id=? WHERE product_id=? AND imei=?", (dst, p["id"], imei))
             qty = len(imeis)
+            moved_imeis = ",".join(imeis)
             detail = "IMEI: " + ", ".join(imeis)
             sync_serial_stock(c, p["id"], src)
             sync_serial_stock(c, p["id"], dst)
@@ -968,10 +969,40 @@ def create_app(db_path=None):
             add_stock(c, p["id"], src, -qty)
             add_stock(c, p["id"], dst, qty)
             detail = ""
-        log_move(c, p["id"], src, -qty, "traspaso", f"→ {dst_row['name']}", f"{detail} {notes}".strip(), ts)
-        log_move(c, p["id"], dst, qty, "traspaso", f"← {src_name}", f"{detail} {notes}".strip(), ts)
+            moved_imeis = ""
+        log_move(c, p["id"], src, -qty, "traspaso", f"→ {dst_row['name']}", f"{detail} {notes}".strip(), ts, moved_imeis)
+        log_move(c, p["id"], dst, qty, "traspaso", f"← {src_name}", f"{detail} {notes}".strip(), ts, moved_imeis)
         c.commit()
         return jsonify({"message": f"{qty:g} pieza(s) de {p['name']} enviadas a {dst_row['name']}", "product": get_product(p["id"])})
+
+    @app.get("/api/inventory/incoming")
+    def api_inventory_incoming():
+        """Mercancía que llegó a esta sucursal (traspasos y entradas) para etiquetarla."""
+        days = int(num(request.args.get("days"), 30))
+        bid = branch_id()
+        rows = conn().execute(f"""SELECT m.id, m.product_id, m.qty, m.kind, m.reference, m.created_at, m.imeis,
+                                         p.name, p.sku, p.serialized
+                                  FROM inventory_moves m JOIN products p ON p.id=m.product_id
+                                  WHERE m.branch_id=? AND m.qty>0 AND m.kind IN ('traspaso', 'entrada')
+                                    AND m.created_at >= datetime('now', 'localtime', ?) AND p.active=1
+                                  ORDER BY m.id DESC LIMIT 100""", (bid, f"-{days} days")).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            if item["serialized"]:
+                listed = [x for x in (item["imeis"] or "").split(",") if x]
+                if not listed:  # entradas por IMEI guardan la lista en la nota
+                    listed = re.findall(r"\b\d{14,17}\b", conn().execute("SELECT notes FROM inventory_moves WHERE id=?",
+                                                                          (item["id"],)).fetchone()["notes"] or "")
+                # solo los que siguen disponibles aquí (los vendidos ya no se etiquetan)
+                item["imeis"] = [x for x in listed if conn().execute(
+                    "SELECT 1 FROM serials WHERE imei=? AND status='disponible' AND branch_id=?", (x, bid)).fetchone()]
+                item["pending"] = len(item["imeis"])
+            else:
+                item["imeis"] = []
+                item["pending"] = item["qty"]
+            out.append(item)
+        return jsonify(out)
 
     @app.get("/api/inventory/moves")
     def api_inventory_moves():
@@ -1553,6 +1584,7 @@ def create_app(db_path=None):
     def _label_jobs(d, s):
         """Convierte la cola de etiquetas en (plantilla, datos, copias)."""
         template = d.get("template") or s.get("label_template", "accesorio_50x25")
+        limited = current_user()["role"] == "cajero"  # administración y matriz no tienen esta restricción
         jobs = []
         for item in d.get("items") or []:
             copies = max(0, int(num(item.get("qty"), 1)))
@@ -1568,6 +1600,15 @@ def create_app(db_path=None):
                     jobs.append((tpl, data, copies))
                 continue
             p = get_product(int(item.get("product_id") or 0))
+            if limited:
+                if p["serialized"] and not item.get("all_imeis"):
+                    ok = item.get("imei") and conn().execute(
+                        "SELECT 1 FROM serials WHERE product_id=? AND imei=? AND status='disponible' AND branch_id=?",
+                        (p["id"], item["imei"], branch_id())).fetchone()
+                    if not ok:
+                        raise ApiError(f"El equipo {item.get('imei') or ''} de {p['name']} no está en el inventario de {s.get('branch_name')}")
+                elif p["track_stock"] and not p["serialized"] and float(p["stock"]) <= 0:
+                    raise ApiError(f"{p['name']} no tiene existencia en {s.get('branch_name')}; solo se etiqueta lo que hay en inventario")
             if item.get("all_imeis") and p["serialized"]:
                 for ser in conn().execute("SELECT imei FROM serials WHERE product_id=? AND status='disponible' AND branch_id=? ORDER BY id",
                                           (p["id"], branch_id())).fetchall():
