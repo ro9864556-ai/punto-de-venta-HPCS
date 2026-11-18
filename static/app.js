@@ -717,7 +717,7 @@ async function loadProducts() {
       const st = !p.track_stock ? '<span class="badge">N/A</span>' : `<span class="badge ${p.stock <= 0 ? "bad" : p.stock <= p.min_stock ? "warn" : "ok"}">${Number(p.stock)}</span>`;
       return `<tr data-id="${p.id}">
         <td class="mono small">${esc(p.sku)}</td><td class="mono small">${esc(p.barcode || "")}</td>
-        <td><b>${esc(p.name)}</b>${p.serialized ? ' <span class="badge info">IMEI</span>' : ""}<div class="small muted">${esc([p.brand, p.model, p.capacity, p.color].filter(Boolean).join(" · "))}</div></td>
+        <td><b>${esc(p.name)}</b>${p.serialized ? ' <span class="badge info">IMEI</span>' : ""}<div class="small muted">${esc([p.brand, p.model, p.ram ? p.ram + " RAM" : "", p.capacity, p.color, p.condition].filter(Boolean).join(" · "))}</div></td>
         <td>${esc(p.category_name || "—")}</td><td class="num cost-col">${money(p.cost)}</td><td class="num"><b>${money(p.price)}</b></td>
         <td class="num cost-col ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num small">${p.warranty_days ? warrantyLabel(p.warranty_days) : "—"}${p.warranty_changes ? `<div class="muted">${p.warranty_changes} cambio${p.warranty_changes > 1 ? "s" : ""}</div>` : ""}</td><td class="num">${st}</td>
         <td>${can("admin") ? '<button class="sm" data-a="edit">Editar</button> ' : ""}${can("admin", "cajero") ? '<button class="sm" data-a="label">🏷️</button> ' : ""}
@@ -736,7 +736,7 @@ VIEWS.productos = () => {
 
 async function productForm(id) {
   let p = { name: "", brand: "", model: "", color: "", capacity: "", category_id: "", sku: "", barcode: "", cost: "", price: "", wholesale_price: "",
-    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "", ask_device: 0, warranty_changes: 0 };
+    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "", ask_device: 0, warranty_changes: 0, ram: "", condition: "" };
   if (id) { try { p = await GET(`/api/products/${id}`); } catch (e) { return fail(e); } }
   const cat = S.categories.find((c) => String(c.id) === String(p.category_id));
   const isNew = !id;
@@ -747,8 +747,10 @@ async function productForm(id) {
       <label class="f">Categoría<select name="category_id">${catOptions(p.category_id)}</select></label>
       <label class="f">Marca<input name="brand" value="${esc(p.brand)}" placeholder="Samsung, Apple, Xiaomi…" list="dl-brands"></label>
       <label class="f">Modelo<input name="model" value="${esc(p.model)}" placeholder="Galaxy A15, iPhone 13…"></label>
-      <label class="f">Capacidad / medida<input name="capacity" value="${esc(p.capacity)}" placeholder="128GB, 20W, 1m…"></label>
+      <label class="f">RAM (celulares)<input name="ram" value="${esc(p.ram || "")}" placeholder="4GB" list="dl-ram"></label>
+      <label class="f">Almacenamiento / medida<input name="capacity" value="${esc(p.capacity)}" placeholder="128GB, 20W, 1m…" list="dl-rom"></label>
       <label class="f">Color<input name="color" value="${esc(p.color)}"></label>
+      <label class="f">Condición<select name="condition">${["", "Nuevo", "Seminuevo", "Reacondicionado", "Usado"].map((c) => `<option value="${c}" ${c === (p.condition || "") ? "selected" : ""}>${c || "—"}</option>`).join("")}</select></label>
       <label class="f">Ubicación<input name="location" value="${esc(p.location)}" placeholder="Vitrina 2, bodega…"></label>
       <label class="f span-2">SKU (vacío = automático)<div class="input-group"><input name="sku" value="${esc(p.sku)}" class="mono" placeholder="Se genera: CAT-MAR-0001"><button type="button" id="gen-sku">Generar</button></div></label>
       <label class="f span-2">Código de barras (escanea el del fabricante o genera uno)<div class="input-group"><input name="barcode" value="${esc(p.barcode)}" class="mono" placeholder="Vacío = EAN-13 interno automático"><button type="button" id="gen-bc">Generar EAN-13</button></div></label>
@@ -779,6 +781,8 @@ async function productForm(id) {
           <label class="f span-all">Notas<input name="notes" value="${esc(p.notes)}"></label>
         </div>
       </fieldset>
+      <datalist id="dl-ram">${["2GB", "3GB", "4GB", "6GB", "8GB", "12GB", "16GB"].map((x) => `<option value="${x}">`).join("")}</datalist>
+      <datalist id="dl-rom">${["32GB", "64GB", "128GB", "256GB", "512GB", "1TB"].map((x) => `<option value="${x}">`).join("")}</datalist>
       <datalist id="dl-brands">${["Samsung", "Apple", "Xiaomi", "Motorola", "Huawei", "Honor", "Oppo", "Realme", "ZTE", "Alcatel", "Nokia", "Vivo", "Infinix", "Tecno", "Genérico"].map((b) => `<option value="${b}">`).join("")}</datalist>
       </form>`,
     foot: `<button data-close>Cancelar</button>${isNew ? '<button id="pf-save-label">Guardar e imprimir etiqueta</button>' : ""}<button class="primary" id="pf-save">Guardar</button>`,
@@ -795,7 +799,7 @@ async function productForm(id) {
       toggleSerial();
       val("category_id").onchange = () => {
         const c = S.categories.find((x) => String(x.id) === val("category_id").value);
-        if (c) { $("#pg-markup", m).value = c.markup; if (isNew) { val("serialized").checked = !!c.serialized; toggleSerial(); val("track_stock").checked = c.prefix !== "SRV"; val("ask_device").checked = !!c.ask_device; } }
+        if (c) { $("#pg-markup", m).value = c.markup; if (isNew) { val("serialized").checked = !!c.serialized; toggleSerial(); val("track_stock").checked = c.prefix !== "SRV"; val("ask_device").checked = !!c.ask_device; if (c.serialized && !val("condition").value) val("condition").value = "Nuevo"; } }
         suggest();
       };
       let suggested = null;

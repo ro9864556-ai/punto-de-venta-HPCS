@@ -57,8 +57,25 @@ def format_price(value, symbol="$"):
     return f"{symbol}{value:,.2f}"
 
 
+def _ram(d):
+    ram = (d.get("ram") or "").strip()
+    return f"{ram} RAM" if ram and "RAM" not in ram.upper() else ram
+
+
 def _spec_line(d):
-    return " · ".join(x for x in [d.get("capacity"), d.get("color")] if x)
+    """4GB RAM · 128GB · Verde"""
+    return " · ".join(x for x in [_ram(d), d.get("capacity"), d.get("color")] if x)
+
+
+def _status_line(d):
+    """NUEVO · Garantía 1 año"""
+    from .db import warranty_label
+    parts = []
+    if d.get("condition"):
+        parts.append(str(d["condition"]).upper())
+    if int(d.get("warranty_days") or 0) > 0:
+        parts.append("Garantía " + warranty_label(d["warranty_days"]))
+    return " · ".join(parts)
 
 
 def template_elements(template, d, show_store=True):
@@ -98,27 +115,27 @@ def template_elements(template, d, show_store=True):
     elif template == "celular_50x38":
         imei = d.get("imei") or ""
         title = " ".join(x for x in [d.get("brand"), d.get("model")] if x) or name
-        top = 1.2
+        # tienda / modelo / características / condición y garantía / precio / código del IMEI
         if store:
-            text(1.5, top, w - 3, 2.2, store)
-            top += 2.6
-        text(1.5, top, w - 3, 3.2, title, lines=2)
-        text(1.5, top + 7.2, w - 3, 2.4, _spec_line(d) or (name if title != name else ""))
-        text(1.5, 13.8, w - 3, 7.0, price)
+            text(1.5, 1.0, w - 3, 2.0, store)
+        text(1.5, 3.3, w - 3, 3.3, title)
+        text(1.5, 7.0, w - 3, 2.5, _spec_line(d) or (name if title != name else ""))
+        text(1.5, 9.9, w - 3, 2.2, _status_line(d))
+        text(1.5, 12.6, w - 3, 7.0, price)
         if imei:
-            bc(2, 21.6, w - 4, 7.6, imei)
-            text(1.5, 29.8, w - 3, 2.3, f"IMEI: {imei}")
-            text(1.5, 32.8, w - 3, 1.9, code_text)
+            bc(2, 20.4, w - 4, 8.4, imei)  # al escanearlo en caja se vende ese equipo exacto
+            text(1.5, 29.4, w - 3, 2.4, f"IMEI: {imei}")
+            text(1.5, 32.5, w - 3, 1.9, code_text)
         else:
-            bc(2, 21.6, w - 4, 8.4, code)
-            text(1.5, 30.6, w - 3, 2.2, code_text)
+            bc(2, 20.4, w - 4, 9.0, code)
+            text(1.5, 30.2, w - 3, 2.2, code_text)
     elif template == "anaquel_76x51":
         top = 1.5
         if store:
             text(2, top, w - 4, 2.8, store)
             top += 3.4
         text(2, top, w - 4, 4.0, name, lines=2)
-        spec = " ".join(x for x in [d.get("brand"), d.get("model"), d.get("capacity"), d.get("color")] if x)
+        spec = " ".join(x for x in [d.get("brand"), d.get("model"), _ram(d), d.get("capacity"), d.get("color")] if x)
         text(2, top + 9.0, w - 4, 2.6, spec)
         text(2, 18.5, w - 4, 13.5, price)
         bc(8, 34.0, w - 16, 10.0, code)
@@ -304,6 +321,9 @@ def label_data_from_product(product, settings, imei=None):
         "model": product.get("model", ""),
         "color": product.get("color", ""),
         "capacity": product.get("capacity", ""),
+        "ram": product.get("ram", ""),
+        "condition": product.get("condition", ""),
+        "warranty_days": product.get("warranty_days", 0),
         "price": product.get("price", 0),
         "sku": product.get("sku", ""),
         "barcode": product.get("barcode") or product.get("sku", ""),

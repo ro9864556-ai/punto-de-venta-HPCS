@@ -231,6 +231,8 @@ MIGRATIONS = [
     ("sales", "customer_email", "TEXT DEFAULT ''"),
     ("sales", "sent_at", "TEXT"),
     ("products", "warranty_changes", "INTEGER NOT NULL DEFAULT 0"),
+    ("products", "ram", "TEXT DEFAULT ''"),
+    ("products", "condition", "TEXT DEFAULT ''"),
     ("sale_items", "warranty_changes", "INTEGER NOT NULL DEFAULT 0"),
 ]
 

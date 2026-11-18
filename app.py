@@ -392,7 +392,7 @@ def create_app(db_path=None):
     # ------------------------------------------------------------ productos
     PRODUCT_FIELDS = ["sku", "barcode", "name", "brand", "model", "color", "capacity", "category_id", "cost", "price",
                       "wholesale_price", "min_stock", "serialized", "track_stock", "warranty_days", "location", "notes",
-                      "ask_device", "warranty_changes"]
+                      "ask_device", "warranty_changes", "ram", "condition"]
 
     @app.get("/api/products")
     def api_products():
@@ -456,7 +456,7 @@ def create_app(db_path=None):
         if vals["serialized"]:
             vals["track_stock"] = 1
         vals["category_id"] = int(vals["category_id"]) if vals.get("category_id") not in (None, "", 0, "0") else None
-        for f in ("brand", "model", "color", "capacity", "location", "notes"):
+        for f in ("brand", "model", "color", "capacity", "location", "notes", "ram", "condition"):
             vals[f] = (vals.get(f) or "").strip()
         vals["sku"] = (vals.get("sku") or "").strip().upper() or generate_sku(c, vals["category_id"], vals["brand"])
         barcode = re.sub(r"\s", "", str(vals.get("barcode") or ""))

@@ -286,3 +286,26 @@ def test_device_only_with_warranty(client):
                                            "device_model": "iPhone 13", "device_imei": "351111111111111"}).get_json()["sale"]
     assert sale["device_imei"] == "" and sale["device_model"] == ""
     assert "EQUIPO DEL CLIENTE" not in client.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
+
+
+def test_phone_label_and_scan_to_sell(client):
+    """Ejemplo real: Samsung Galaxy A07 4GB/128GB verde, nuevo, 1 año, IMEI 350000000000000."""
+    phone = _product(client, name="Samsung Galaxy A07 4GB/128GB Verde", brand="Samsung", model="Galaxy A07", ram="4GB",
+                     capacity="128GB", color="Verde", condition="Nuevo", category_id=1, cost=2300, price=2899,
+                     serialized=1, warranty_days=365, initial_stock=0, imeis="350000000000000")
+    assert phone["stock"] == 1 and phone["ram"] == "4GB" and phone["condition"] == "Nuevo"
+    r = client.post("/api/labels/zpl", json={"template": "celular_50x38",
+                                             "items": [{"product_id": phone["id"], "all_imeis": True, "qty": 1}]}).get_json()
+    zpl = r["zpl"]
+    assert r["count"] == 1
+    for frag in ("Samsung Galaxy A07", "4GB RAM · 128GB · Verde", "NUEVO · Garantía 1 año", "$2,899", "IMEI: 350000000000000"):
+        assert frag in zpl, frag
+    assert "^BC" in zpl and ">;35000000000000>60" in zpl  # código de barras Code 128 con el IMEI
+    # al escanear la etiqueta en caja se encuentra ese equipo exacto
+    look = client.get("/api/lookup?code=350000000000000").get_json()
+    assert look["product"]["id"] == phone["id"] and look["imei"] == "350000000000000"
+    sale = client.post("/api/sales", json={"items": [{"product_id": phone["id"], "qty": 1, "imei": "350000000000000"}],
+                                           "payment_method": "efectivo", "received": 3000}).get_json()["sale"]
+    assert sale["items"][0]["imei"] == "350000000000000" and sale["items"][0]["warranty_days"] == 365
+    assert client.get(f"/api/products/{phone['id']}").get_json()["stock"] == 0
+    assert client.get("/api/lookup?code=350000000000000").status_code == 409  # ya vendido
