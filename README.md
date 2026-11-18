@@ -20,6 +20,28 @@ Los datos se guardan en `datos/punto_de_venta.db`. Haz respaldos desde
 > Para usarlo desde otra computadora o tablet de la red local inicia con `HOST=0.0.0.0`
 > (en Windows: `set HOST=0.0.0.0` antes de `python app.py`) y abre `http://IP-de-la-PC:5000`.
 
+## Usuarios
+
+Primer inicio: usuario **admin**, contraseña **admin** (el sistema pide cambiarla).
+Crea a tu equipo en **Configuración → Usuarios**:
+
+| Rol | Puede |
+|---|---|
+| **Administrador** | Todo: productos, precios, configuración, usuarios, cancelar ventas, respaldos. |
+| **Cajero** | Vender y cobrar a nombre de cualquier vendedor, etiquetas, inventario e IMEI, corte de caja. |
+| **Vendedor** | Hacer notas de venta a su nombre, buscar garantías. No ve costos, no cambia precios (sí puede dar descuento) y no cancela. |
+
+## Nota de venta
+
+Cada nota lleva: fecha, vendedor, cliente, teléfono (y email opcional), los artículos con su precio y
+garantía (con fecha de vencimiento), el **modelo y el IMEI del equipo del cliente** y el total.
+Los productos marcados con “Pedir modelo e IMEI del equipo del cliente” (micas, fundas, reparaciones)
+avisan si falta capturarlos. En **Ventas** se busca una garantía por IMEI, teléfono, nombre o folio en
+todas las fechas.
+
+Para cargar todos los tipos de micas usa **Productos → Alta rápida (varios)** → *Sugerir tipos de micas*,
+pon el precio y la garantía y guarda.
+
 ## Módulos
 
 | Módulo | Qué hace |
@@ -46,6 +68,15 @@ En **Configuración → Etiquetas Zebra** elige:
 
 Configura la **resolución** (203 o 300 dpi), oscuridad, velocidad y desplazamiento si la impresión
 sale corrida. Usa **Etiqueta de prueba** para verificar.
+
+### Configuración de esta tienda (Windows)
+Ya viene preconfigurado así (cámbialo en **Configuración** si hace falta):
+
+- **Etiquetas**: Zebra por **USB**. En *Configuración → Etiquetas Zebra* selecciona en “Nombre de la
+  Zebra USB” la impresora tal como aparece en *Panel de control → Dispositivos e impresoras*.
+- **Tickets**: térmica genérica USB llamada **`Hospital para celulares Shop`**, papel de 80 mm, comandos
+  ESC/POS. Si tu rollo es de 58 mm cámbialo en *Configuración → Tickets*. Imprime el **Ticket de prueba**:
+  si los acentos salen mal o la impresora no responde, elige “Navegador” como modo de impresión.
 
 ### Tickets
 - **Navegador**: funciona con cualquier impresora instalada (selecciónala en el diálogo de impresión,

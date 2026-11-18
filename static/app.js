@@ -8,7 +8,9 @@ const S = {
   rounding: {},
   cart: [],
   cartDiscount: 0,
-  customer: { name: "", phone: "" },
+  customer: { name: "", phone: "", email: "", model: "", imei: "", seller: "" },
+  me: null,
+  sellers: [],
   labelQueue: [],
   labelSel: 0,
   view: "vender",
@@ -22,6 +24,19 @@ const num = (v) => { const n = parseFloat(String(v ?? "").replace(/[,$\s]/g, "")
 const r2 = (v) => Math.round((v + Number.EPSILON) * 100) / 100;
 const money = (v) => (S.settings.currency_symbol || "$") + Number(v || 0).toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const today = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
+const WARRANTY_OPTS = [[0, "Sin garantía"], [7, "7 días"], [15, "15 días"], [30, "1 mes"], [90, "3 meses"], [180, "6 meses"], [365, "1 año"]];
+function warrantyLabel(days) {
+  days = Math.round(num(days));
+  if (days <= 0) return "Sin garantía";
+  if (days % 365 === 0) return `${days / 365} año${days > 365 ? "s" : ""}`;
+  if (days % 30 === 0) return `${days / 30} mes${days > 30 ? "es" : ""}`;
+  return `${days} día${days > 1 ? "s" : ""}`;
+}
+const warrantyOptions = (sel) => {
+  const opts = WARRANTY_OPTS.some(([d]) => d === Math.round(num(sel))) ? WARRANTY_OPTS : [...WARRANTY_OPTS, [Math.round(num(sel)), warrantyLabel(sel)]];
+  return opts.map(([d, t]) => `<option value="${d}" ${d === Math.round(num(sel)) ? "selected" : ""}>${t}</option>`).join("");
+};
+const can = (...roles) => S.me && roles.includes(S.me.role);
 const debounce = (fn, ms = 250) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
 async function api(method, url, body) {
@@ -29,6 +44,7 @@ async function api(method, url, body) {
   if (body instanceof FormData) opts.body = body;
   else if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
   const res = await fetch(url, opts);
+  if (res.status === 401 && !url.includes("/api/login")) { location.href = "/login"; throw new Error("Sesión expirada"); }
   const isJson = (res.headers.get("content-type") || "").includes("json");
   const data = isJson ? await res.json() : await res.text();
   if (!res.ok) throw new Error((data && data.error) || `Error ${res.status}`);
@@ -198,7 +214,16 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+const NAV_ROLES = { vender: ["admin", "cajero", "vendedor"], productos: ["admin", "cajero", "vendedor"], etiquetas: ["admin", "cajero"],
+  inventario: ["admin", "cajero"], ventas: ["admin", "cajero", "vendedor"], corte: ["admin", "cajero"], config: ["admin"] };
 async function loadBase() {
+  S.me = await GET("/api/me");
+  S.sellers = await GET("/api/sellers");
+  $$("#nav a").forEach((a) => a.classList.toggle("hidden", !NAV_ROLES[a.dataset.view].includes(S.me.role)));
+  $("#user-box").innerHTML = `<div><b>${esc(S.me.full_name)}</b> · ${esc(S.me.role_name)}</div>
+    <div class="row" style="margin-top:6px"><a id="u-pass" class="small">Cambiar contraseña</a><a id="u-out" class="small">Salir</a></div>`;
+  $("#u-pass").onclick = () => changePassword(false);
+  $("#u-out").onclick = async () => { await POST("/api/logout"); location.href = "/login"; };
   const s = await GET("/api/settings");
   S.settings = s.settings; S.templates = s.label_templates; S.rounding = s.rounding_modes;
   S.categories = await GET("/api/categories");
@@ -238,8 +263,16 @@ function initVender() {
       <div class="line muted small"><span id="t-tax-l">IVA incluido</span><span id="t-tax">$0.00</span></div>
       <div class="grand"><span>TOTAL</span><span id="t-total">$0.00</span></div>
       <div class="grid" style="gap:8px;margin-bottom:12px">
-        <input id="cust-name" placeholder="Cliente (opcional)">
-        <input id="cust-phone" placeholder="Teléfono / WhatsApp (opcional)">
+        <label class="f">Vendedor<select id="cust-seller"></select></label>
+        <input id="cust-name" placeholder="Nombre del cliente">
+        <input id="cust-phone" placeholder="Teléfono del cliente" inputmode="tel">
+        <input id="cust-email" placeholder="Email del cliente (opcional)" type="email">
+        <fieldset id="dev-box" style="margin:4px 0 0;padding:8px 10px 10px"><legend class="small">📱 Equipo del cliente (garantía)</legend>
+          <div class="grid" style="gap:8px">
+            <input id="cust-model" placeholder="Modelo, p. ej. iPhone 17 Pro Max" list="dl-models">
+            <input id="cust-imei" placeholder="IMEI del equipo (*#06#)" inputmode="numeric" class="mono">
+          </div></fieldset>
+        <datalist id="dl-models"></datalist>
       </div>
       <button class="success big-btn" id="btn-pay">💵 Cobrar <kbd style="border-color:#fff">F2</kbd></button>
       <div class="row" style="margin-top:8px">
@@ -250,10 +283,13 @@ function initVender() {
     </div>
   </div>`;
   loadCart();
-  $("#cust-name").value = S.customer.name || "";
-  $("#cust-phone").value = S.customer.phone || "";
-  $("#cust-name").oninput = (e) => { S.customer.name = e.target.value; saveCart(); };
-  $("#cust-phone").oninput = (e) => { S.customer.phone = e.target.value; saveCart(); };
+  const custFields = { name: "#cust-name", phone: "#cust-phone", email: "#cust-email", model: "#cust-model", imei: "#cust-imei", seller: "#cust-seller" };
+  fillSellers();
+  Object.entries(custFields).forEach(([k, sel]) => {
+    $(sel).value = S.customer[k] || $(sel).value || "";
+    $(sel).addEventListener(sel === "#cust-seller" ? "change" : "input", (e) => { S.customer[k] = e.target.value; saveCart(); });
+  });
+  GET("/api/device-models").then((list) => { $("#dl-models").innerHTML = list.map((x) => `<option value="${esc(x)}">`).join(""); }).catch(() => {});
   $("#t-disc").oninput = (e) => { S.cartDiscount = num(e.target.value); saveCart(); renderTotals(); };
   $("#btn-pay").onclick = checkout;
   $("#btn-clear").onclick = async () => { if (S.cart.length && await confirmBox("¿Vaciar el ticket actual?", "Vaciar", true)) { clearCart(); } };
@@ -264,9 +300,18 @@ function initVender() {
   renderCart();
 }
 
+function fillSellers() {
+  const sel = $("#cust-seller");
+  const current = S.customer.seller || String(S.me.id);
+  sel.innerHTML = S.sellers.map((u) => `<option value="${u.id}" ${String(u.id) === current ? "selected" : ""}>${esc(u.full_name)}</option>`).join("");
+  sel.disabled = S.me.role === "vendedor";
+  if (S.me.role === "vendedor") sel.value = String(S.me.id);
+}
+
 function clearCart() {
-  S.cart = []; S.cartDiscount = 0; S.customer = { name: "", phone: "" };
-  $("#t-disc").value = "0"; $("#cust-name").value = ""; $("#cust-phone").value = "";
+  S.cart = []; S.cartDiscount = 0; S.customer = { name: "", phone: "", email: "", model: "", imei: "", seller: S.customer.seller || "" };
+  $("#t-disc").value = "0";
+  ["#cust-name", "#cust-phone", "#cust-email", "#cust-model", "#cust-imei"].forEach((x) => { $(x).value = ""; });
   saveCart(); renderCart(); focusScan();
 }
 
@@ -278,11 +323,11 @@ async function addToCart(p, imei) {
   }
   if (imei) {
     if (S.cart.some((l) => l.imei === imei)) { beep(false); return toast(`El IMEI ${imei} ya está en el ticket`, "bad"); }
-    S.cart.push({ key: `${p.id}-${imei}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei, serialized: 1, stock: 1, track_stock: 1 });
+    S.cart.push({ key: `${p.id}-${imei}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei, serialized: 1, stock: 1, track_stock: 1, warranty: p.warranty_days, ask_device: 0 });
   } else {
     const line = S.cart.find((l) => l.product_id === p.id && !l.imei);
     if (line) line.qty += 1;
-    else S.cart.push({ key: `${p.id}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei: "", serialized: 0, stock: p.stock, track_stock: p.track_stock });
+    else S.cart.push({ key: `${p.id}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei: "", serialized: 0, stock: p.stock, track_stock: p.track_stock, warranty: p.warranty_days, ask_device: p.ask_device });
     const l = S.cart.find((x) => x.product_id === p.id && !x.imei);
     if (p.track_stock && l.qty > p.stock && S.settings.allow_negative_stock !== "1") toast(`Atención: solo hay ${Number(p.stock)} en existencia de ${p.name}`, "bad");
   }
@@ -346,22 +391,26 @@ function renderCart() {
     body.innerHTML = `<tr><td colspan="6" class="empty">🛒 Ticket vacío. Escanea un producto para comenzar.</td></tr>`;
   } else {
     body.innerHTML = S.cart.map((l, i) => `<tr data-i="${i}">
-      <td><div class="pname">${esc(l.name)}</div><div class="small muted mono">${esc(l.sku)}${l.imei ? ` · <span class="badge info">IMEI ${esc(l.imei)}</span>` : ""}</div></td>
-      <td class="num"><input data-f="price" value="${l.price}" style="width:96px"></td>
+      <td><div class="pname">${esc(l.name)}</div><div class="small muted mono">${esc(l.sku)}${l.imei ? ` · <span class="badge info">IMEI ${esc(l.imei)}</span>` : ""}</div>
+        <select data-f="warranty" class="small" style="width:auto;padding:2px 6px;margin-top:4px" title="Garantía">${warrantyOptions(l.warranty || 0)}</select></td>
+      <td class="num"><input data-f="price" value="${l.price}" style="width:96px" ${can("vendedor") ? 'disabled title="Solo administrador o cajero cambian precios"' : ""}></td>
       <td class="center"><span class="qty">${l.imei ? "1" : `<button class="sm icon-btn" data-a="dec">−</button><input data-f="qty" value="${l.qty}"><button class="sm icon-btn" data-a="inc">+</button>`}</span></td>
       <td class="num"><input data-f="discount" value="${l.discount || 0}" style="width:80px"></td>
       <td class="num"><b>${money(l.qty * l.price - num(l.discount))}</b></td>
       <td><button class="sm danger icon-btn" data-a="del" title="Quitar">✕</button></td></tr>`).join("");
   }
   renderTotals();
+  const needsDevice = S.cart.some((l) => l.ask_device || (l.warranty > 0 && !l.imei));
+  $("#dev-box")?.classList.toggle("needs", needsDevice);
 }
 
 document.addEventListener("change", (e) => {
-  const inp = e.target.closest("#cart-body input[data-f]");
+  const inp = e.target.closest("#cart-body input[data-f], #cart-body select[data-f]");
   if (!inp) return;
   const l = S.cart[+inp.closest("tr").dataset.i];
   const v = num(inp.value);
   if (inp.dataset.f === "qty") l.qty = Math.max(1, v);
+  else if (inp.dataset.f === "warranty") l.warranty = Math.round(v);
   else l[inp.dataset.f] = Math.max(0, v);
   saveCart(); renderCart();
 });
@@ -375,9 +424,14 @@ document.addEventListener("click", (e) => {
   saveCart(); renderCart();
 });
 
-function checkout() {
+async function checkout() {
   if (!S.cart.length) return toast("El ticket está vacío");
   if (topModal()) return;
+  const needsDevice = S.cart.some((l) => l.ask_device || (l.warranty > 0 && !l.imei));
+  if (needsDevice && (!S.customer.model || !S.customer.imei)) {
+    const ok = await confirmBox("Falta el <b>modelo</b> o el <b>IMEI</b> del equipo del cliente; se usan para hacer válida la garantía. ¿Cobrar de todos modos?", "Cobrar sin ellos");
+    if (!ok) { $(S.customer.model ? "#cust-imei" : "#cust-model").focus(); return; }
+  }
   const t = cartTotals();
   let method = "efectivo";
   modal({
@@ -423,7 +477,8 @@ function checkout() {
         if (busy) return; busy = true;
         $("#pay-ok", m).disabled = true;
         const payload = {
-          items: S.cart.map((l) => ({ product_id: l.product_id, qty: l.qty, unit_price: l.price, discount: num(l.discount), imei: l.imei })),
+          items: S.cart.map((l) => ({ product_id: l.product_id, qty: l.qty, unit_price: l.price, discount: num(l.discount), imei: l.imei, warranty_days: l.warranty || 0 })),
+          seller_id: $("#cust-seller").value, customer_email: S.customer.email, device_model: S.customer.model, device_imei: S.customer.imei,
           discount: t.disc, payment_method: method,
           received: method === "efectivo" ? num($("#pay-recv", m).value) : t.total,
           paid_cash: num($("#mx-cash", m).value), paid_card: num($("#mx-card", m).value), paid_transfer: num($("#mx-tr", m).value),
@@ -480,19 +535,21 @@ async function showSale(id) {
     body: `<div class="grid cols-2"><div>
         <table><tbody>
           <tr><td class="muted">Fecha</td><td>${esc(s.created_at)}</td></tr>
-          <tr><td class="muted">Cliente</td><td>${esc(s.customer_name || "—")} ${esc(s.customer_phone || "")}</td></tr>
+          <tr><td class="muted">Vendedor</td><td>${esc(s.seller_name || s.cashier || "—")}${s.cashier && s.cashier !== s.seller_name ? ` <span class="muted small">(cobró ${esc(s.cashier)})</span>` : ""}</td></tr>
+          <tr><td class="muted">Cliente</td><td>${esc(s.customer_name || "—")} ${esc(s.customer_phone || "")} ${esc(s.customer_email || "")}</td></tr>
+          ${s.device_model || s.device_imei ? `<tr><td class="muted">Equipo</td><td>${esc(s.device_model || "")} <span class="mono">${esc(s.device_imei || "")}</span></td></tr>` : ""}
           <tr><td class="muted">Pago</td><td>${esc(s.payment_method)}</td></tr>
           <tr><td class="muted">Total</td><td><b>${money(s.total)}</b></td></tr>
-          <tr><td class="muted">Utilidad</td><td>${money(s.total - s.cost_total)}</td></tr>
+          ${s.cost_total !== undefined ? `<tr><td class="muted">Utilidad</td><td>${money(s.total - s.cost_total)}</td></tr>` : ""}
           ${s.notes ? `<tr><td class="muted">Notas</td><td>${esc(s.notes)}</td></tr>` : ""}
         </tbody></table>
         <h3 style="margin:16px 0 6px">Artículos</h3>
         <table><thead><tr><th>Producto</th><th class="num">Cant.</th><th class="num">Importe</th></tr></thead><tbody>
-          ${s.items.map((i) => `<tr><td>${esc(i.name)}<div class="small muted mono">${esc(i.sku || "")} ${i.imei ? "· IMEI " + esc(i.imei) : ""}</div></td><td class="num">${i.qty}</td><td class="num">${money(i.total)}</td></tr>`).join("")}
+          ${s.items.map((i) => `<tr><td>${esc(i.name)}<div class="small muted mono">${esc(i.sku || "")} ${i.imei ? "· IMEI " + esc(i.imei) : ""}${i.warranty_days ? " · Garantía " + warrantyLabel(i.warranty_days) : ""}</div></td><td class="num">${i.qty}</td><td class="num">${money(i.total)}</td></tr>`).join("")}
         </tbody></table></div>
       <div><iframe class="ticket" src="/tickets/${s.id}"></iframe>
         <div class="row small" style="margin-top:6px">Descargar: <a href="/tickets/${s.id}?format=zpl">ZPL (Zebra)</a> · <a href="/tickets/${s.id}?format=escpos">ESC/POS</a> · <a href="/tickets/${s.id}?format=txt" target="_blank">Texto</a></div></div></div>`,
-    foot: `${s.status !== "cancelada" ? '<button class="danger" id="sv-cancel">Cancelar venta</button><span class="spacer"></span>' : ""}
+    foot: `${s.status !== "cancelada" && can("admin") ? '<button class="danger" id="sv-cancel">Cancelar venta</button><span class="spacer"></span>' : ""}
            <button id="sv-print">🖨 Reimprimir ticket</button><button data-close class="primary">Cerrar</button>`,
     onOpen: (m, close) => {
       $("#sv-print", m).onclick = () => printSale(s.id);
@@ -512,10 +569,11 @@ VIEWS.vender = () => { renderTotals(); focusScan(); };
 function initProductos() {
   $("#view-productos").innerHTML = `
     <div class="view-head"><h1>Productos</h1>
-      <button id="p-bulk">💲 Generador de precios</button>
-      <button id="p-import">⬆ Importar CSV</button>
-      <a class="btn" href="/api/products/export.csv">⬇ Exportar CSV</a>
-      <button class="primary" id="p-new">＋ Nuevo producto</button></div>
+      <button id="p-quick" class="admin-only">⚡ Alta rápida (varios)</button>
+      <button id="p-bulk" class="admin-only">💲 Generador de precios</button>
+      <button id="p-import" class="admin-only">⬆ Importar CSV</button>
+      <a class="btn admin-only" href="/api/products/export.csv">⬇ Exportar CSV</a>
+      <button class="primary admin-only" id="p-new">＋ Nuevo producto</button></div>
     <div class="row" style="margin-bottom:12px">
       <input id="p-q" placeholder="Buscar por nombre, marca, SKU, código o IMEI…" style="max-width:420px">
       <select id="p-cat" style="max-width:240px"></select>
@@ -523,10 +581,11 @@ function initProductos() {
       <span class="spacer"></span><span class="muted small" id="p-count"></span>
     </div>
     <div class="table-wrap"><table><thead><tr>
-      <th>SKU</th><th>Código</th><th>Producto</th><th>Categoría</th><th class="num">Costo</th><th class="num">Precio</th><th class="num">Margen</th><th class="num">Exist.</th><th></th>
+      <th>SKU</th><th>Código</th><th>Producto</th><th>Categoría</th><th class="num cost-col">Costo</th><th class="num">Precio</th><th class="num cost-col">Margen</th><th class="num">Garantía</th><th class="num">Exist.</th><th></th>
     </tr></thead><tbody id="p-body"></tbody></table></div>`;
   $("#p-new").onclick = () => productForm();
   $("#p-bulk").onclick = bulkPricing;
+  $("#p-quick").onclick = quickAdd;
   $("#p-import").onclick = importCsv;
   $("#p-q").oninput = debounce(loadProducts, 250);
   $("#p-cat").onchange = loadProducts;
@@ -555,15 +614,17 @@ async function loadProducts() {
       return `<tr data-id="${p.id}">
         <td class="mono small">${esc(p.sku)}</td><td class="mono small">${esc(p.barcode || "")}</td>
         <td><b>${esc(p.name)}</b>${p.serialized ? ' <span class="badge info">IMEI</span>' : ""}<div class="small muted">${esc([p.brand, p.model, p.capacity, p.color].filter(Boolean).join(" · "))}</div></td>
-        <td>${esc(p.category_name || "—")}</td><td class="num">${money(p.cost)}</td><td class="num"><b>${money(p.price)}</b></td>
-        <td class="num ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num">${st}</td>
-        <td><button class="sm" data-a="edit">Editar</button> <button class="sm" data-a="label">🏷️</button>
-          ${p.serialized ? '<button class="sm" data-a="imei">IMEI</button>' : ""} <button class="sm danger icon-btn" data-a="del" title="Eliminar">✕</button></td></tr>`;
-    }).join("") : `<tr><td colspan="9" class="empty">No hay productos. Da clic en “Nuevo producto” o importa un CSV.</td></tr>`;
+        <td>${esc(p.category_name || "—")}</td><td class="num cost-col">${money(p.cost)}</td><td class="num"><b>${money(p.price)}</b></td>
+        <td class="num cost-col ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num small">${p.warranty_days ? warrantyLabel(p.warranty_days) : "—"}</td><td class="num">${st}</td>
+        <td>${can("admin") ? '<button class="sm" data-a="edit">Editar</button> ' : ""}${can("admin", "cajero") ? '<button class="sm" data-a="label">🏷️</button> ' : ""}
+          ${p.serialized && can("admin", "cajero") ? '<button class="sm" data-a="imei">IMEI</button>' : ""} ${can("admin") ? '<button class="sm danger icon-btn" data-a="del" title="Eliminar">✕</button>' : ""}</td></tr>`;
+    }).join("") : `<tr><td colspan="10" class="empty">No hay productos. Da clic en “Nuevo producto” o importa un CSV.</td></tr>`;
   } catch (e) { fail(e); }
 }
 
 VIEWS.productos = () => {
+  $$(".admin-only", $("#view-productos")).forEach((x) => x.classList.toggle("hidden", !can("admin")));
+  $("#view-productos").classList.toggle("no-costs", can("vendedor"));
   const sel = $("#p-cat"), v = sel.value;
   sel.innerHTML = catOptions(v, "Todas las categorías");
   loadProducts();
@@ -571,7 +632,7 @@ VIEWS.productos = () => {
 
 async function productForm(id) {
   let p = { name: "", brand: "", model: "", color: "", capacity: "", category_id: "", sku: "", barcode: "", cost: "", price: "", wholesale_price: "",
-    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "" };
+    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "", ask_device: 0 };
   if (id) { try { p = await GET(`/api/products/${id}`); } catch (e) { return fail(e); } }
   const cat = S.categories.find((c) => String(c.id) === String(p.category_id));
   const isNew = !id;
@@ -606,7 +667,8 @@ async function productForm(id) {
           <label class="chk"><input type="checkbox" name="serialized" ${p.serialized ? "checked" : ""}> Maneja IMEI / número de serie</label>
           <label class="chk"><input type="checkbox" name="track_stock" ${p.track_stock ? "checked" : ""}> Controla existencia</label>
           <label class="f">Existencia mínima<input name="min_stock" inputmode="decimal" value="${p.min_stock}"></label>
-          <label class="f">Garantía (días)<input name="warranty_days" inputmode="numeric" value="${p.warranty_days}"></label>
+          <label class="f">Garantía<select name="warranty_days">${warrantyOptions(p.warranty_days)}</select></label>
+          <label class="chk span-2"><input type="checkbox" name="ask_device" ${p.ask_device ? "checked" : ""}> Pedir modelo e IMEI del equipo del cliente (micas, fundas, reparaciones)</label>
           ${isNew ? `<label class="f span-2" id="f-initial">Existencia inicial<input name="initial_stock" inputmode="decimal" value="0"></label>
           <label class="f span-all hidden" id="f-imeis">IMEIs iniciales (uno por renglón; escanéalos)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia actual: <b>${Number(p.stock)}</b> — ajústala en Inventario.</div>`}
           <label class="f span-all">Notas<input name="notes" value="${esc(p.notes)}"></label>
@@ -628,7 +690,7 @@ async function productForm(id) {
       toggleSerial();
       val("category_id").onchange = () => {
         const c = S.categories.find((x) => String(x.id) === val("category_id").value);
-        if (c) { $("#pg-markup", m).value = c.markup; if (isNew) { val("serialized").checked = !!c.serialized; toggleSerial(); val("track_stock").checked = c.prefix !== "SRV"; } }
+        if (c) { $("#pg-markup", m).value = c.markup; if (isNew) { val("serialized").checked = !!c.serialized; toggleSerial(); val("track_stock").checked = c.prefix !== "SRV"; val("ask_device").checked = !!c.ask_device; } }
         suggest();
       };
       let suggested = null;
@@ -661,6 +723,7 @@ async function productForm(id) {
         const data = Object.fromEntries(new FormData(f).entries());
         data.serialized = val("serialized").checked ? 1 : 0;
         data.track_stock = val("track_stock").checked ? 1 : 0;
+        data.ask_device = val("ask_device").checked ? 1 : 0;
         if (!data.name.trim()) return toast("Escribe el nombre del producto", "bad");
         if (!num(data.price) && !await confirmBox("El precio de venta está en $0. ¿Guardar así?")) return;
         try {
@@ -716,6 +779,66 @@ async function imeiManager(id) {
           try { await DEL(`/api/serials/${b.closest("tr").dataset.sid}`); close(); imeiManager(id); } catch (er) { fail(er); }
         }
       });
+    },
+  });
+}
+
+const MICA_TYPES = ["Mica de hidrogel HD", "Mica de hidrogel mate", "Mica de hidrogel privacidad", "Mica de hidrogel anti luz azul",
+  "Mica de hidrogel trasera", "Mica de hidrogel para smartwatch", "Mica cristal templado 9D", "Mica cristal templado privacidad",
+  "Mica cristal templado mate", "Mica cerámica flexible", "Protector de cámara", "Protector de cámara con anillo"];
+
+function quickAdd() {
+  const hid = S.categories.find((c) => c.prefix === "HID") || S.categories.find((c) => c.prefix === "MIC");
+  const row = (r = {}) => `<tr>
+    <td><input data-q="name" value="${esc(r.name || "")}" placeholder="Nombre" style="min-width:250px"></td>
+    <td><select data-q="category_id" style="width:150px">${catOptions(r.category_id ?? hid?.id ?? "")}</select></td>
+    <td><input data-q="brand" value="${esc(r.brand || "")}" placeholder="Marca" style="width:90px"></td>
+    <td><input data-q="cost" inputmode="decimal" style="width:80px" value="${r.cost ?? ""}"></td>
+    <td><input data-q="price" inputmode="decimal" style="width:80px" value="${r.price ?? ""}"></td>
+    <td><select data-q="warranty_days" style="width:120px">${warrantyOptions(r.warranty_days ?? 0)}</select></td>
+    <td class="center"><input type="checkbox" data-q="track_stock" ${r.track_stock ? "checked" : ""}></td>
+    <td><input data-q="initial_stock" inputmode="decimal" style="width:64px" value="${r.initial_stock ?? ""}"></td>
+    <td class="center"><input type="checkbox" data-q="ask_device" ${r.ask_device ?? 1 ? "checked" : ""}></td>
+    <td><button class="sm danger icon-btn" data-a="rm">✕</button></td></tr>`;
+  modal({
+    title: "⚡ Alta rápida de varios productos", size: "wide xl",
+    body: `<p class="small muted" style="margin-top:0">Ideal para cargar todos los tipos de micas. Las micas de hidrogel que se cortan en máquina normalmente <b>no</b> controlan existencia. SKU y código de barras se generan solos.</p>
+      <div class="row" style="margin-bottom:10px"><button id="qa-micas">✨ Sugerir tipos de micas</button>
+        <label class="f" style="flex-direction:row;align-items:center;gap:6px">Mismo precio para todas<input id="qa-price" inputmode="decimal" style="width:90px" placeholder="259"></label>
+        <label class="f" style="flex-direction:row;align-items:center;gap:6px">Garantía<select id="qa-war" style="width:130px">${warrantyOptions(180)}</select></label>
+        <button id="qa-apply" class="sm">Aplicar a todas</button></div>
+      <div class="table-wrap" style="max-height:52vh"><table><thead><tr><th>Producto</th><th>Categoría</th><th>Marca</th><th>Costo</th><th>Precio</th><th>Garantía</th><th title="Controla existencia">Inventario</th><th>Cant. inicial</th><th>Pide equipo</th><th></th></tr></thead>
+      <tbody id="qa-body">${row()}${row()}${row()}</tbody></table></div>
+      <button id="qa-add" style="margin-top:8px">＋ Agregar renglón</button><div id="qa-res" class="small" style="margin-top:8px"></div>`,
+    foot: `<button data-close>Cerrar</button><button class="primary" id="qa-save">Guardar productos</button>`,
+    onOpen: (m, close) => {
+      const body = $("#qa-body", m);
+      $("#qa-add", m).onclick = () => body.insertAdjacentHTML("beforeend", row());
+      $("#qa-micas", m).onclick = () => {
+        $$("tr", body).forEach((tr) => { if (!$('[data-q="name"]', tr).value.trim()) tr.remove(); });
+        const price = $("#qa-price", m).value, war = num($("#qa-war", m).value);
+        body.insertAdjacentHTML("beforeend", MICA_TYPES.map((name) => row({ name, price, warranty_days: war,
+          category_id: (name.includes("hidrogel") ? hid : S.categories.find((c) => c.prefix === "MIC"))?.id })).join(""));
+      };
+      $("#qa-apply", m).onclick = () => $$("tr", body).forEach((tr) => {
+        if ($("#qa-price", m).value) $('[data-q="price"]', tr).value = $("#qa-price", m).value;
+        $('[data-q="warranty_days"]', tr).innerHTML = warrantyOptions($("#qa-war", m).value);
+      });
+      body.addEventListener("click", (e) => { if (e.target.closest('[data-a="rm"]')) e.target.closest("tr").remove(); });
+      $("#qa-save", m).onclick = async () => {
+        const rows = $$("tr", body).map((tr) => Object.fromEntries($$("[data-q]", tr).map((i) => [i.dataset.q, i.type === "checkbox" ? (i.checked ? 1 : 0) : i.value])))
+          .filter((r) => r.name.trim());
+        if (!rows.length) return toast("Escribe al menos un producto", "bad");
+        const noPrice = rows.filter((r) => !num(r.price));
+        if (noPrice.length && !await confirmBox(`${noPrice.length} producto(s) sin precio. ¿Guardar así?`)) return;
+        try {
+          const r = await POST("/api/products/bulk", { rows });
+          toast(`${r.created.length} producto(s) creados`, "ok");
+          if (r.errors.length) $("#qa-res", m).innerHTML = `<div class="danger">${r.errors.map(esc).join("<br>")}</div>`;
+          else close();
+          loadProducts();
+        } catch (e) { fail(e); }
+      };
     },
   });
 }
@@ -997,12 +1120,14 @@ function initVentas() {
     <div class="view-head"><h1>Ventas y tickets</h1></div>
     <div class="row" style="margin-bottom:12px">
       <label class="f">Desde<input type="date" id="v-from"></label><label class="f">Hasta<input type="date" id="v-to"></label>
-      <label class="f" style="flex:1;max-width:380px">Buscar<input id="v-q" placeholder="Folio, cliente, teléfono, IMEI, producto…"></label>
+      <label class="f" style="flex:1;max-width:380px">Buscar (garantías)<input id="v-q" placeholder="Folio, cliente, teléfono, IMEI, modelo, producto…"></label>
+      <label class="chk small" style="align-self:flex-end;margin-bottom:10px"><input type="checkbox" id="v-all" checked> Buscar en todas las fechas</label>
       <span class="spacer"></span><div id="v-sum" class="muted"></div></div>
-    <div class="table-wrap"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Cliente</th><th class="num">Piezas</th><th>Pago</th><th class="num">Total</th><th>Estado</th><th></th></tr></thead><tbody id="v-body"></tbody></table></div>`;
+    <div class="table-wrap"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Vendedor</th><th>Cliente</th><th>Equipo</th><th class="num">Piezas</th><th>Pago</th><th class="num">Total</th><th>Estado</th><th></th></tr></thead><tbody id="v-body"></tbody></table></div>`;
   $("#v-from").value = today(); $("#v-to").value = today();
   ["v-from", "v-to"].forEach((i) => $("#" + i).onchange = VIEWS.ventas);
   $("#v-q").oninput = debounce(VIEWS.ventas, 250);
+  $("#v-all").onchange = VIEWS.ventas;
   $("#v-body").addEventListener("click", (e) => {
     const b = e.target.closest("[data-a]"); if (!b) return;
     const id = +b.closest("tr").dataset.id;
@@ -1012,14 +1137,14 @@ function initVentas() {
 }
 VIEWS.ventas = async () => {
   try {
-    const list = await GET(`/api/sales?from=${$("#v-from").value}&to=${$("#v-to").value}&q=${encodeURIComponent($("#v-q").value)}`);
+    const list = await GET(`/api/sales?from=${$("#v-from").value}&to=${$("#v-to").value}&q=${encodeURIComponent($("#v-q").value)}&all=${$("#v-all").checked ? 1 : 0}`);
     const ok = list.filter((s) => s.status === "completada");
     $("#v-sum").innerHTML = `${ok.length} venta(s) · <b>${money(ok.reduce((a, s) => a + s.total, 0))}</b>`;
-    $("#v-body").innerHTML = list.map((s) => `<tr data-id="${s.id}"><td class="mono"><a data-a="view">${esc(s.folio)}</a></td><td class="small">${esc(s.created_at)}</td>
-      <td>${esc(s.customer_name || "—")}<div class="small muted">${esc(s.customer_phone || "")}</div></td><td class="num">${Number(s.units || 0)}</td>
+    $("#v-body").innerHTML = list.map((s) => `<tr data-id="${s.id}"><td class="mono"><a data-a="view">${esc(s.folio)}</a></td><td class="small">${esc(s.created_at)}</td><td>${esc(s.seller_name || s.cashier || "—")}</td>
+      <td>${esc(s.customer_name || "—")}<div class="small muted">${esc(s.customer_phone || "")}</div></td><td class="small">${esc(s.device_model || "")}<div class="mono muted">${esc(s.device_imei || "")}</div></td><td class="num">${Number(s.units || 0)}</td>
       <td>${esc(s.payment_method)}</td><td class="num"><b>${money(s.total)}</b></td>
       <td>${s.status === "completada" ? '<span class="badge ok">Completada</span>' : '<span class="badge bad">Cancelada</span>'}</td>
-      <td><button class="sm" data-a="view">Ver</button> <button class="sm" data-a="print">🖨</button></td></tr>`).join("") || '<tr><td colspan="8" class="empty">Sin ventas en el periodo</td></tr>';
+      <td><button class="sm" data-a="view">Ver</button> <button class="sm" data-a="print">🖨</button></td></tr>`).join("") || '<tr><td colspan="10" class="empty">Sin ventas</td></tr>';
   } catch (e) { fail(e); }
 };
 
@@ -1040,6 +1165,7 @@ function initCorte() {
         <table style="margin-top:8px"><tbody id="c-cash"></tbody></table></div>
       <div class="card"><h2>Ventas por categoría</h2><table><thead><tr><th>Categoría</th><th class="num">Piezas</th><th class="num">Venta</th><th class="num">Utilidad</th></tr></thead><tbody id="c-cat"></tbody></table></div>
     </div>
+    <div class="card"><h2>Ventas por vendedor</h2><table><thead><tr><th>Vendedor</th><th class="num">Ventas</th><th class="num">Total</th><th class="num">Utilidad</th></tr></thead><tbody id="c-seller"></tbody></table></div>
     <div class="card"><h2>Productos más vendidos</h2><table><thead><tr><th>Producto</th><th>SKU</th><th class="num">Piezas</th><th class="num">Venta</th></tr></thead><tbody id="c-top"></tbody></table></div>`;
   $("#c-from").value = today(); $("#c-to").value = today();
   ["c-from", "c-to"].forEach((i) => $("#" + i).onchange = VIEWS.corte);
@@ -1075,6 +1201,7 @@ VIEWS.corte = async () => {
       row(`IVA incluido`, money(r.tax)) + row("Ventas canceladas", r.cancelled_count);
     $("#c-cash").innerHTML = cash.map((c) => `<tr><td class="small">${esc(c.created_at.slice(11, 16))}</td><td><span class="badge ${c.kind === "entrada" ? "ok" : "warn"}">${c.kind}</span></td><td>${esc(c.notes)}</td><td class="num">${money(c.amount)}</td></tr>`).join("");
     $("#c-cat").innerHTML = r.by_category.map((c) => `<tr><td>${esc(c.category)}</td><td class="num">${c.units}</td><td class="num">${money(c.total)}</td><td class="num">${money(c.profit)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
+    $("#c-seller").innerHTML = r.by_seller.map((v) => `<tr><td>${esc(v.seller)}</td><td class="num">${v.n}</td><td class="num">${money(v.total)}</td><td class="num">${money(v.profit)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
     $("#c-top").innerHTML = r.top_products.map((t) => `<tr><td>${esc(t.name)}</td><td class="mono small">${esc(t.sku || "")}</td><td class="num">${t.units}</td><td class="num">${money(t.total)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
   } catch (e) { fail(e); }
 };
@@ -1090,6 +1217,34 @@ function field(key, label, opts = {}) {
 }
 
 function initConfig() { /* se dibuja al entrar */ }
+
+async function loadUsers() {
+  let data;
+  try { data = await GET("/api/users"); } catch (e) { return fail(e); }
+  const roleSel = (r) => Object.entries(data.roles).map(([k, v]) => `<option value="${k}" ${k === r ? "selected" : ""}>${v}</option>`).join("");
+  const body = $("#usr-body");
+  body.innerHTML = data.users.map((u) => `<tr data-id="${u.id}"><td><input data-u="username" value="${esc(u.username)}" style="width:130px"></td>
+      <td><input data-u="full_name" value="${esc(u.full_name)}"></td><td><select data-u="role">${roleSel(u.role)}</select></td>
+      <td><input data-u="password" type="password" placeholder="(sin cambio)" style="width:140px"></td>
+      <td class="center"><input type="checkbox" data-u="active" ${u.active ? "checked" : ""}></td><td><button class="sm" data-a="save">Guardar</button></td></tr>`).join("") +
+    `<tr><td><input id="nu-user" placeholder="usuario" style="width:130px"></td><td><input id="nu-name" placeholder="Nombre completo"></td>
+      <td><select id="nu-role">${roleSel("vendedor")}</select></td><td><input id="nu-pass" type="password" placeholder="contraseña" style="width:140px"></td><td></td>
+      <td><button class="sm primary" id="nu-add">Agregar</button></td></tr>`;
+  body.onclick = async (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    try {
+      if (b.id === "nu-add") {
+        await POST("/api/users", { username: $("#nu-user").value, full_name: $("#nu-name").value, role: $("#nu-role").value, password: $("#nu-pass").value });
+        toast("Usuario creado", "ok");
+      } else {
+        const tr = b.closest("tr"), v = (k) => tr.querySelector(`[data-u="${k}"]`);
+        await PUT(`/api/users/${tr.dataset.id}`, { username: v("username").value, full_name: v("full_name").value, role: v("role").value, password: v("password").value, active: v("active").checked ? 1 : 0 });
+        toast("Usuario guardado", "ok");
+      }
+      S.sellers = await GET("/api/sellers"); fillSellers(); loadUsers();
+    } catch (er) { fail(er); }
+  };
+}
 VIEWS.config = async () => {
   await loadBase();
   const printers = await GET("/api/printers").then((r) => r.printers).catch(() => []);
@@ -1097,10 +1252,10 @@ VIEWS.config = async () => {
   const el = $("#view-config");
   el.innerHTML = `
     <div class="view-head"><h1>Configuración</h1><a class="btn" href="/api/backup">💾 Descargar respaldo</a><button class="primary" id="cfg-save">Guardar cambios</button></div>
-    <div class="tabs"><button data-t="tienda" class="on">Tienda</button><button data-t="tickets">Tickets</button><button data-t="zebra">Etiquetas Zebra</button><button data-t="precios">Precios e IVA</button><button data-t="cats">Categorías</button></div>
+    <div class="tabs"><button data-t="tienda" class="on">Tienda</button><button data-t="tickets">Tickets</button><button data-t="zebra">Etiquetas Zebra</button><button data-t="precios">Precios e IVA</button><button data-t="cats">Categorías</button><button data-t="users">👤 Usuarios</button></div>
     <div data-p="tienda" class="card"><div class="form-grid">
       ${field("store_name", "Nombre comercial", { span: 2 })}${field("store_legal_name", "Razón social", { span: 2 })}
-      ${field("store_rfc", "RFC")}${field("store_phone", "Teléfono")}${field("store_whatsapp", "WhatsApp")}${field("cashier_name", "Cajero / vendedor")}
+      ${field("store_rfc", "RFC")}${field("store_phone", "Teléfono")}${field("store_whatsapp", "WhatsApp")}
       ${field("store_address", "Dirección", { span: "all" })}</div></div>
     <div data-p="tickets" class="card hidden"><div class="form-grid">
       ${field("ticket_printer_mode", "Imprimir tickets en", { span: 2, options: { browser: "Navegador (cualquier impresora instalada)", network: "Impresora térmica en red (ESC/POS, puerto 9100)", local: "Impresora térmica USB instalada (ESC/POS crudo)", zebra: "Impresora Zebra (ZPL)" } })}
@@ -1134,13 +1289,17 @@ VIEWS.config = async () => {
       </div></div>
     <div data-p="cats" class="card hidden">
       <p class="small muted" style="margin-top:0">El <b>prefijo</b> forma el SKU (p. ej. FUN-SAM-0001). El <b>% de ganancia</b> se usa en el generador de precios.</p>
-      <table><thead><tr><th>Categoría</th><th>Prefijo SKU</th><th>Maneja IMEI</th><th>% ganancia</th><th class="num">Productos</th><th></th></tr></thead><tbody id="cat-body">
+      <table><thead><tr><th>Categoría</th><th>Prefijo SKU</th><th>Maneja IMEI</th><th>Pide equipo cliente</th><th>% ganancia</th><th class="num">Productos</th><th></th></tr></thead><tbody id="cat-body">
       ${S.categories.map((c) => `<tr data-id="${c.id}"><td><input data-c="name" value="${esc(c.name)}"></td><td><input data-c="prefix" value="${esc(c.prefix)}" class="mono" style="width:90px"></td>
-        <td class="center"><input type="checkbox" data-c="serialized" ${c.serialized ? "checked" : ""}></td><td><input data-c="markup" value="${c.markup}" style="width:90px"></td><td class="num">${c.products}</td>
+        <td class="center"><input type="checkbox" data-c="serialized" ${c.serialized ? "checked" : ""}></td><td class="center"><input type="checkbox" data-c="ask_device" ${c.ask_device ? "checked" : ""}></td><td><input data-c="markup" value="${c.markup}" style="width:90px"></td><td class="num">${c.products}</td>
         <td><button class="sm" data-a="save">Guardar</button> <button class="sm danger" data-a="del">✕</button></td></tr>`).join("")}
-      <tr><td><input id="nc-name" placeholder="Nueva categoría"></td><td><input id="nc-prefix" class="mono" placeholder="ABC" style="width:90px"></td><td class="center"><input type="checkbox" id="nc-ser"></td><td><input id="nc-markup" value="100" style="width:90px"></td><td></td><td><button class="sm primary" id="nc-add">Agregar</button></td></tr>
+      <tr><td><input id="nc-name" placeholder="Nueva categoría"></td><td><input id="nc-prefix" class="mono" placeholder="ABC" style="width:90px"></td><td class="center"><input type="checkbox" id="nc-ser"></td><td class="center"><input type="checkbox" id="nc-dev"></td><td><input id="nc-markup" value="100" style="width:90px"></td><td></td><td><button class="sm primary" id="nc-add">Agregar</button></td></tr>
       </tbody></table></div>
+    <div data-p="users" class="card hidden">
+      <p class="small muted" style="margin-top:0"><b>Administrador</b>: todo. <b>Cajero</b>: vender, cobrar a nombre de cualquier vendedor, etiquetas, inventario, corte de caja. <b>Vendedor</b>: generar notas de venta a su nombre y buscar garantías (no ve costos, no cambia precios, no cancela ventas).</p>
+      <table><thead><tr><th>Usuario</th><th>Nombre (sale en el ticket)</th><th>Rol</th><th>Nueva contraseña</th><th>Activo</th><th></th></tr></thead><tbody id="usr-body"></tbody></table></div>
     <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;
+  loadUsers();
   $$(".tabs button", el).forEach((b) => b.onclick = () => {
     $$(".tabs button", el).forEach((x) => x.classList.toggle("on", x === b));
     $$("[data-p]", el).forEach((p) => p.classList.toggle("hidden", p.dataset.p !== b.dataset.t));
@@ -1163,17 +1322,34 @@ VIEWS.config = async () => {
   $("#cat-body").addEventListener("click", async (e) => {
     const b = e.target.closest("button"); if (!b) return;
     if (b.id === "nc-add") {
-      try { await POST("/api/categories", { name: $("#nc-name").value, prefix: $("#nc-prefix").value, serialized: $("#nc-ser").checked, markup: $("#nc-markup").value }); toast("Categoría agregada", "ok"); VIEWS.config().then(() => $('[data-t="cats"]').click()); } catch (er) { fail(er); }
+      try { await POST("/api/categories", { name: $("#nc-name").value, prefix: $("#nc-prefix").value, serialized: $("#nc-ser").checked, ask_device: $("#nc-dev").checked, markup: $("#nc-markup").value }); toast("Categoría agregada", "ok"); VIEWS.config().then(() => $('[data-t="cats"]').click()); } catch (er) { fail(er); }
       return;
     }
     const tr = b.closest("tr"), id = tr.dataset.id;
     const v = (k) => tr.querySelector(`[data-c="${k}"]`);
     try {
-      if (b.dataset.a === "save") { await PUT(`/api/categories/${id}`, { name: v("name").value, prefix: v("prefix").value, serialized: v("serialized").checked, markup: v("markup").value }); toast("Categoría guardada", "ok"); await loadBase(); }
+      if (b.dataset.a === "save") { await PUT(`/api/categories/${id}`, { name: v("name").value, prefix: v("prefix").value, serialized: v("serialized").checked, ask_device: v("ask_device").checked, markup: v("markup").value }); toast("Categoría guardada", "ok"); await loadBase(); }
       if (b.dataset.a === "del" && await confirmBox("¿Eliminar la categoría?", "Eliminar", true)) { await DEL(`/api/categories/${id}`); VIEWS.config().then(() => $('[data-t="cats"]').click()); }
     } catch (er) { fail(er); }
   });
 };
+
+function changePassword(forced) {
+  modal({
+    title: forced ? "Crea tu contraseña" : "Cambiar contraseña", size: "narrow",
+    body: `${forced ? '<p class="small">Por seguridad cambia la contraseña inicial antes de continuar.</p>' : ""}
+      <div class="grid" style="gap:10px"><label class="f">Contraseña actual<input type="password" id="cp-cur" autofocus></label>
+      <label class="f">Contraseña nueva<input type="password" id="cp-new"></label><label class="f">Repite la nueva<input type="password" id="cp-new2"></label></div>`,
+    foot: `${forced ? "" : "<button data-close>Cancelar</button>"}<button class="primary" id="cp-ok">Guardar</button>`,
+    onOpen: (m, close) => {
+      if (forced) { m.querySelector(".close-x").remove(); m.closest(".modal-back").addEventListener("mousedown", (e) => e.stopImmediatePropagation(), true); m.close = () => {}; }
+      $("#cp-ok", m).onclick = async () => {
+        if ($("#cp-new", m).value !== $("#cp-new2", m).value) return toast("Las contraseñas no coinciden", "bad");
+        try { await POST("/api/me/password", { current: $("#cp-cur", m).value, new: $("#cp-new", m).value }); toast("Contraseña actualizada", "ok"); m.closest(".modal-back").remove(); focusScan(); } catch (e) { fail(e); }
+      };
+    },
+  });
+}
 
 /* ------------------------------------------------------------------ inicio */
 function tick() { $("#clock").textContent = new Date().toLocaleString("es-MX", { weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }); }
@@ -1183,4 +1359,5 @@ function tick() { $("#clock").textContent = new Date().toLocaleString("es-MX", {
   initVender(); initProductos(); initEtiquetas(); initInventario(); initVentas(); initCorte(); initConfig();
   tick(); setInterval(tick, 20000);
   go("vender");
+  if (S.me?.must_change) changePassword(true);
 })();

@@ -10,7 +10,24 @@ import html
 
 from .barcodes import code128_modules, svg_rects
 from .labels import DPMM, _code128_zpl_data, _zpl_escape, wrap_text
+from datetime import datetime, timedelta
+
+from .db import warranty_label
 from .pricing import money
+
+
+def _fecha(ts):
+    try:
+        return datetime.strptime(ts[:16], "%Y-%m-%d %H:%M").strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        return ts[:16]
+
+
+def _vence(ts, days):
+    try:
+        return (datetime.strptime(ts[:10], "%Y-%m-%d") + timedelta(days=int(days))).strftime("%d/%m/%Y")
+    except ValueError:
+        return ""
 
 PAYMENT_NAMES = {"efectivo": "Efectivo", "tarjeta": "Tarjeta", "transferencia": "Transferencia", "mixto": "Mixto"}
 
@@ -73,30 +90,42 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.text("*** VENTA CANCELADA ***", "C", bold=True)
     if reprint:
         t.text("** REIMPRESIÓN **", "C", bold=True)
-    t.cols("Folio:", sale["folio"], bold=True)
-    t.cols("Fecha:", sale["created_at"][:16])
-    if sale.get("cashier"):
-        t.cols("Atendió:", sale["cashier"])
-    if sale.get("customer_name"):
-        t.cols("Cliente:", sale["customer_name"])
+    t.cols("Nota / folio:", sale["folio"], bold=True)
+    t.cols("Fecha:", _fecha(sale["created_at"]))
+    seller = sale.get("seller_name") or sale.get("cashier") or ""
+    if seller:
+        t.cols("Vendedor:", seller)
+    if sale.get("cashier") and sale.get("cashier") != seller:
+        t.cols("Cobró:", sale["cashier"])
+    t.cols("Cliente:", sale.get("customer_name") or "Público en general")
     if sale.get("customer_phone"):
-        t.cols("Tel. cliente:", sale["customer_phone"])
+        t.cols("Teléfono:", sale["customer_phone"])
+    if sale.get("customer_email"):
+        t.cols("Email:", sale["customer_email"])
     t.sep()
     units = 0
     for it in items:
         qty = float(it["qty"])
         units += qty
-        qty_txt = f"{qty:g}"
-        t.text(it["name"])
-        t.cols(f"  {qty_txt} x {m(it['unit_price'])}", m(qty * float(it["unit_price"])))
+        t.text(it["name"], bold=True)
+        if qty == 1:
+            t.cols("  Precio", m(it["unit_price"]))
+        else:
+            t.cols(f"  {qty:g} x {m(it['unit_price'])}", m(qty * float(it["unit_price"])))
         if float(it.get("discount") or 0):
             t.cols("  Descuento", "-" + m(it["discount"]))
         if it.get("imei"):
             t.text(f"  IMEI/Serie: {it['imei']}")
-        if it.get("sku"):
-            t.text(f"  SKU: {it['sku']}")
-        if int(it.get("warranty_days") or 0):
-            t.text(f"  Garantía: {it['warranty_days']} días")
+        days = int(it.get("warranty_days") or 0)
+        if days:
+            t.text(f"  Garantía: {warranty_label(days)} (vence {_vence(sale['created_at'], days)})")
+    if sale.get("device_model") or sale.get("device_imei"):
+        t.sep()
+        t.text("EQUIPO DEL CLIENTE (GARANTÍA)", bold=True)
+        if sale.get("device_model"):
+            t.cols("Modelo:", sale["device_model"])
+        if sale.get("device_imei"):
+            t.cols("IMEI:", sale["device_imei"])
     t.sep()
     t.cols("Artículos:", f"{units:g}")
     items_total = sum(float(i["qty"]) * float(i["unit_price"]) for i in items)
@@ -122,7 +151,7 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.sep()
         t.text("Notas: " + sale["notes"])
     t.sep()
-    if any(int(i.get("warranty_days") or 0) or i.get("imei") for i in items) and (s.get("warranty_text") or "").strip():
+    if (any(int(i.get("warranty_days") or 0) or i.get("imei") for i in items) or sale.get("device_imei")) and (s.get("warranty_text") or "").strip():
         t.text(s["warranty_text"].strip(), "C")
         t.feed()
     if (s.get("ticket_footer") or "").strip():
@@ -164,6 +193,11 @@ def build_cut_ticket(report, s):
     t.cols("IVA incluido:", m(report["tax"]))
     t.cols("Costo de lo vendido:", m(report["cost"]))
     t.cols("Utilidad bruta:", m(report["profit"]), bold=True)
+    if report.get("by_seller"):
+        t.sep()
+        t.text("POR VENDEDOR", bold=True)
+        for row in report["by_seller"]:
+            t.cols(f"{row['seller']} ({row['n']})", m(row["total"]))
     if report.get("by_category"):
         t.sep()
         t.text("POR CATEGORÍA", bold=True)

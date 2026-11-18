@@ -115,7 +115,7 @@ CREATE INDEX IF NOT EXISTS idx_moves_product ON inventory_moves(product_id);
 """
 
 DEFAULT_SETTINGS = {
-    "store_name": "Mi Tienda de Celulares",
+    "store_name": "Hospital para Celulares Shop",
     "store_legal_name": "",
     "store_rfc": "",
     "store_address": "",
@@ -130,13 +130,13 @@ DEFAULT_SETTINGS = {
     "ticket_footer": "¡Gracias por su compra!",
     "warranty_text": "Garantía sujeta a revisión. No cubre daños por humedad, golpes o mal uso. Presentar este ticket.",
     "ticket_width": "80",
-    "ticket_printer_mode": "browser",
+    "ticket_printer_mode": "local",
     "ticket_printer_host": "",
     "ticket_printer_port": "9100",
-    "ticket_printer_name": "",
+    "ticket_printer_name": "Hospital para celulares Shop",
     "ticket_open_drawer": "0",
     "ticket_copies": "1",
-    "label_printer_mode": "download",
+    "label_printer_mode": "local",
     "label_printer_host": "",
     "label_printer_port": "9100",
     "label_printer_name": "",
@@ -160,6 +160,7 @@ DEFAULT_CATEGORIES = [
     ("Celulares", "CEL", 1, 25),
     ("Fundas", "FUN", 0, 150),
     ("Micas y protectores", "MIC", 0, 200),
+    ("Micas de hidrogel", "HID", 0, 300),
     ("Cargadores", "CAR", 0, 100),
     ("Cables", "CAB", 0, 120),
     ("Audífonos", "AUD", 0, 100),
@@ -196,16 +197,72 @@ def connect(path):
 def init_db(path):
     conn = connect(path)
     conn.executescript(SCHEMA)
+    migrate(conn)
     for key, value in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value))
     if conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 0:
         conn.executemany("INSERT INTO categories(name, prefix, serialized, markup) VALUES (?,?,?,?)", DEFAULT_CATEGORIES)
+        conn.execute("UPDATE categories SET ask_device=1 WHERE prefix IN ('MIC', 'HID', 'FUN', 'REF', 'SRV')")
+    if not conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+        from werkzeug.security import generate_password_hash
+        conn.execute("INSERT INTO users(username, full_name, role, password_hash, must_change, created_at) VALUES (?,?,?,?,1,?)",
+                     ("admin", "Administrador", "admin", generate_password_hash("admin"), now()))
+    if not conn.execute("SELECT value FROM settings WHERE key='secret_key'").fetchone():
+        import secrets
+        conn.execute("INSERT INTO settings(key, value) VALUES ('secret_key', ?)", (secrets.token_hex(32),))
     conn.commit()
     conn.close()
 
 
+ROLES = {"admin": "Administrador", "cajero": "Cajero", "vendedor": "Vendedor"}
+
+MIGRATIONS = [
+    # tabla, columna, definición
+    ("categories", "ask_device", "INTEGER NOT NULL DEFAULT 0"),
+    ("products", "ask_device", "INTEGER NOT NULL DEFAULT 0"),
+    ("sales", "user_id", "INTEGER"),
+    ("sales", "seller_id", "INTEGER"),
+    ("sales", "seller_name", "TEXT DEFAULT ''"),
+    ("sales", "device_model", "TEXT DEFAULT ''"),
+    ("sales", "device_imei", "TEXT DEFAULT ''"),
+    ("sales", "customer_email", "TEXT DEFAULT ''"),
+]
+
+
+def migrate(conn):
+    """Agrega tablas/columnas nuevas a bases de datos creadas con versiones anteriores."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        full_name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        must_change INTEGER NOT NULL DEFAULT 0,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL)""")
+    for table, column, ddl in MIGRATIONS:
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_device_imei ON sales(device_imei)")
+
+
 def get_settings(conn):
-    return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+    return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings") if r["key"] != "secret_key"}
+
+
+def warranty_label(days):
+    """180 → '6 meses', 365 → '1 año', 15 → '15 días'."""
+    days = int(days or 0)
+    if days <= 0:
+        return "Sin garantía"
+    if days % 365 == 0:
+        n = days // 365
+        return f"{n} año" + ("s" if n > 1 else "")
+    if days % 30 == 0:
+        n = days // 30
+        return f"{n} mes" + ("es" if n > 1 else "")
+    return f"{days} día" + ("s" if days > 1 else "")
 
 
 def row_to_dict(row):

@@ -9,9 +9,20 @@ from pos.pricing import round_price, suggest_price
 
 
 @pytest.fixture()
-def client(tmp_path):
-    app = create_app(str(tmp_path / "test.db"))
-    return app.test_client()
+def app(tmp_path):
+    return create_app(str(tmp_path / "test.db"))
+
+
+def login(app, user="admin", pwd="admin"):
+    c = app.test_client()
+    r = c.post("/api/login", json={"username": user, "password": pwd})
+    assert r.status_code == 200, r.get_json()
+    return c
+
+
+@pytest.fixture()
+def client(app):
+    return login(app)
 
 
 def test_round_price():
@@ -139,3 +150,67 @@ def test_bulk_pricing_and_csv(client):
     assert r["created"] == 1 and not r["errors"]
     found = client.get("/api/products?q=Cable").get_json()[0]
     assert found["sku"].startswith("CAB-") and found["stock"] == 12
+
+
+def test_requires_login(app):
+    anon = app.test_client()
+    assert anon.get("/api/products").status_code == 401
+    assert anon.get("/").status_code == 302
+    assert anon.get("/login").status_code == 200
+    assert anon.post("/api/login", json={"username": "admin", "password": "mal"}).status_code == 401
+
+
+def test_roles_and_vendedor_rules(app, client):
+    assert client.post("/api/users", json={"username": "luis", "full_name": "Luis Vendedor", "role": "vendedor", "password": "1234"}).status_code == 201
+    assert client.post("/api/users", json={"username": "caja", "full_name": "Caja 1", "role": "cajero", "password": "1234"}).status_code == 201
+    mica = _product(client, name="Mica de hidrogel HD", category_id=3, cost=40, price=259, track_stock=0,
+                    warranty_days=180, ask_device=1)
+    vend = login(app, "luis", "1234")
+    caja = login(app, "caja", "1234")
+    # permisos
+    assert vend.post("/api/products", json={"name": "x"}).status_code == 403
+    assert caja.post("/api/products", json={"name": "x"}).status_code == 403
+    assert vend.get("/api/reports/summary").status_code == 403
+    assert caja.get("/api/reports/summary").status_code == 200
+    assert vend.get("/api/users").status_code == 403
+    assert "cost" not in vend.get(f"/api/products/{mica['id']}").get_json()
+    # el vendedor no cambia precios, pero sí puede descontar
+    r = vend.post("/api/sales", json={"items": [{"product_id": mica["id"], "qty": 1, "unit_price": 100}], "payment_method": "efectivo", "received": 300})
+    assert r.status_code == 400
+    r = vend.post("/api/sales", json={
+        "items": [{"product_id": mica["id"], "qty": 1, "discount": 9}], "payment_method": "efectivo", "received": 300,
+        "customer_name": "María López", "customer_phone": "5512345678",
+        "device_model": "iPhone 17 Pro Max", "device_imei": "35 123456 789012 3", "seller_id": 1})
+    assert r.status_code == 201, r.get_json()
+    sale = r.get_json()["sale"]
+    assert sale["seller_name"] == "Luis Vendedor"  # un vendedor no puede vender a nombre de otro
+    assert sale["device_imei"] == "351234567890123" and "cost_total" not in sale
+    text = vend.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
+    for frag in ("Vendedor:", "Luis Vendedor", "María López", "5512345678", "Mica de hidrogel HD",
+                 "Garantía: 6 meses", "iPhone 17 Pro Max", "351234567890123", "TOTAL $250.00"):
+        assert frag in text, frag
+    # el cajero cobra a nombre de un vendedor
+    r = caja.post("/api/sales", json={"items": [{"product_id": mica["id"], "qty": 1}], "payment_method": "tarjeta", "seller_id": 2})
+    assert r.get_json()["sale"]["seller_name"] == "Luis Vendedor"
+    # búsqueda de garantía por IMEI en todas las fechas
+    found = vend.get("/api/sales?q=351234567890123&all=1&from=2000-01-01&to=2000-01-02").get_json()
+    assert [s["id"] for s in found] == [sale["id"]]
+    rep = client.get("/api/reports/summary").get_json()
+    assert rep["by_seller"][0]["seller"] == "Luis Vendedor" and rep["by_seller"][0]["n"] == 2
+    # cancelar solo admin
+    assert caja.post(f"/api/sales/{sale['id']}/cancel", json={}).status_code == 403
+
+
+def test_last_admin_and_password(app, client):
+    assert client.put("/api/users/1", json={"username": "admin", "full_name": "A", "role": "cajero"}).status_code == 400
+    assert client.post("/api/me/password", json={"current": "admin", "new": "nueva123"}).status_code == 200
+    login(app, "admin", "nueva123")
+
+
+def test_bulk_create_micas(client):
+    rows = [{"name": "Mica de hidrogel HD", "category_id": 3, "price": 259, "warranty_days": 180, "track_stock": 0, "ask_device": 1},
+            {"name": "Mica de hidrogel mate", "category_id": 3, "price": 259, "warranty_days": 180, "track_stock": 0},
+            {"name": ""}]
+    r = client.post("/api/products/bulk", json={"rows": rows}).get_json()
+    assert len(r["created"]) == 2 and not r["errors"]
+    assert r["created"][0]["sku"].startswith("MIC-")

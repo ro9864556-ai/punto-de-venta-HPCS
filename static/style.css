@@ -197,8 +197,13 @@ iframe.ticket { width: 100%; height: 480px; border: 1px solid var(--line); borde
   .sidebar { width: auto; flex: none; }
   nav { flex-direction: row; overflow-x: auto; }
   nav a { white-space: nowrap; }
-  nav a kbd, .sidebar-foot, .brand small { display: none; }
+  nav a kbd, #clock, .brand small { display: none; }
   .view { padding: 14px 16px 30px; }
   .cols-2, .cols-3, .cols-4, .form-grid { grid-template-columns: 1fr; }
   label.f.span-2 { grid-column: auto; }
 }
+
+.no-costs .cost-col { display: none; }
+#dev-box.needs { border-color: var(--accent); background: var(--accent-soft); }
+.sidebar-foot a { color: #93c5fd; }
+.modal.xl { max-width: 1180px; }

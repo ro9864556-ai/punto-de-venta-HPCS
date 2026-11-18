@@ -9,9 +9,10 @@ import re
 import sys
 import threading
 import webbrowser
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
-from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
+from flask import Flask, Response, g, jsonify, redirect, render_template, request, send_file, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from pos import db as dbm
 from pos import labels, printing, tickets
@@ -28,6 +29,10 @@ def create_app(db_path=None):
     app.config["JSON_SORT_KEYS"] = False
     app.json.ensure_ascii = False
     dbm.init_db(app.config["DB_PATH"])
+    _c = dbm.connect(app.config["DB_PATH"])
+    app.secret_key = _c.execute("SELECT value FROM settings WHERE key='secret_key'").fetchone()[0]
+    _c.close()
+    app.permanent_session_lifetime = timedelta(hours=14)
 
     # ------------------------------------------------------------ utilidades
     def conn():
@@ -89,6 +94,175 @@ def create_app(db_path=None):
         n = c.execute("SELECT COUNT(*) FROM serials WHERE product_id=? AND status='disponible'", (product_id,)).fetchone()[0]
         c.execute("UPDATE products SET stock=?, updated_at=? WHERE id=?", (n, dbm.now(), product_id))
 
+    # ------------------------------------------------------------ usuarios y permisos
+    # Lo que no aparece aquí lo puede usar cualquier usuario con sesión iniciada.
+    ADMIN_ONLY = {
+        "api_put_settings", "api_printers", "api_print_test", "api_category_create", "api_category_update",
+        "api_category_delete", "api_product_create", "api_product_update", "api_product_delete", "api_products_bulk_create",
+        "api_next_sku", "api_new_barcode", "api_pricing_suggest", "api_pricing_bulk", "api_delete_serial",
+        "api_cancel_sale", "api_export_csv", "api_import_csv", "api_csv_template", "api_backup",
+        "api_users", "api_user_create", "api_user_update",
+    }
+    STAFF_ONLY = {  # administrador y cajero
+        "api_add_serials", "api_inventory_adjust", "api_inventory_moves", "api_cash_create", "api_cash_list",
+        "api_report", "corte_page", "api_corte_print", "api_dashboard", "api_label_preview", "api_label_zpl",
+    }
+    PUBLIC = {"login_page", "api_login", "static"}
+
+    def current_user():
+        if "user" not in g:
+            g.user = None
+            uid = session.get("uid")
+            if uid:
+                row = conn().execute("SELECT id, username, full_name, role, must_change, active FROM users WHERE id=?",
+                                     (uid,)).fetchone()
+                if row and row["active"]:
+                    g.user = dict(row)
+        return g.user
+
+    def is_vendedor():
+        u = current_user()
+        return bool(u and u["role"] == "vendedor")
+
+    @app.before_request
+    def check_access():
+        if request.endpoint in PUBLIC or request.endpoint is None:
+            return None
+        user = current_user()
+        wants_json = request.path.startswith("/api/")
+        if not user:
+            if wants_json:
+                return jsonify({"error": "Inicia sesión"}), 401
+            return redirect("/login")
+        role = user["role"]
+        if (request.endpoint in ADMIN_ONLY and role != "admin") or \
+           (request.endpoint in STAFF_ONLY and role not in ("admin", "cajero")):
+            msg = f"Tu usuario ({dbm.ROLES.get(role, role)}) no tiene permiso para esta acción."
+            return (jsonify({"error": msg}), 403) if wants_json else (msg, 403)
+        return None
+
+    def strip_costs(obj):
+        """Los vendedores no ven costos ni utilidades."""
+        if is_vendedor():
+            items = obj if isinstance(obj, list) else [obj]
+            for it in items:
+                for k in ("cost", "cost_total", "unit_cost"):
+                    it.pop(k, None)
+                for sub in it.get("items", []) or []:
+                    sub.pop("unit_cost", None)
+        return obj
+
+    @app.get("/login")
+    def login_page():
+        users = conn().execute("SELECT username, must_change FROM users").fetchall()
+        first = len(users) == 1 and users[0]["username"] == "admin" and users[0]["must_change"] == 1
+        return render_template("login.html", store=settings().get("store_name", ""), first_run=first)
+
+    @app.post("/api/login")
+    def api_login():
+        d = body()
+        row = conn().execute("SELECT * FROM users WHERE username=? AND active=1", ((d.get("username") or "").strip(),)).fetchone()
+        if not row or not check_password_hash(row["password_hash"], d.get("password") or ""):
+            raise ApiError("Usuario o contraseña incorrectos", 401)
+        session.clear()
+        session.permanent = True
+        session["uid"] = row["id"]
+        return jsonify({"ok": True})
+
+    @app.post("/api/logout")
+    def api_logout():
+        session.clear()
+        return jsonify({"ok": True})
+
+    @app.get("/api/me")
+    def api_me():
+        u = dict(current_user())
+        u["role_name"] = dbm.ROLES.get(u["role"], u["role"])
+        return jsonify(u)
+
+    @app.post("/api/me/password")
+    def api_change_password():
+        d = body()
+        u = current_user()
+        row = conn().execute("SELECT password_hash FROM users WHERE id=?", (u["id"],)).fetchone()
+        if not check_password_hash(row["password_hash"], d.get("current") or ""):
+            raise ApiError("La contraseña actual no es correcta")
+        new = d.get("new") or ""
+        if len(new) < 4:
+            raise ApiError("La contraseña nueva debe tener al menos 4 caracteres")
+        conn().execute("UPDATE users SET password_hash=?, must_change=0 WHERE id=?", (generate_password_hash(new), u["id"]))
+        conn().commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/sellers")
+    def api_sellers():
+        rows = conn().execute("SELECT id, full_name, role FROM users WHERE active=1 ORDER BY full_name").fetchall()
+        return jsonify(dbm.rows_to_list(rows))
+
+    @app.get("/api/device-models")
+    def api_device_models():
+        """Modelos de equipos capturados antes, para autocompletar."""
+        rows = conn().execute("""SELECT device_model, COUNT(*) n FROM sales WHERE device_model<>'' GROUP BY device_model
+                                 ORDER BY n DESC LIMIT 300""").fetchall()
+        known = [r["device_model"] for r in rows]
+        base = ["iPhone 17 Pro Max", "iPhone 17 Pro", "iPhone 17", "iPhone Air", "iPhone 16 Pro Max", "iPhone 16 Pro", "iPhone 16",
+                "iPhone 15 Pro Max", "iPhone 15", "iPhone 14", "iPhone 13", "iPhone 12", "iPhone 11", "Samsung Galaxy S25 Ultra",
+                "Samsung Galaxy S24", "Samsung Galaxy A56", "Samsung Galaxy A36", "Samsung Galaxy A16", "Samsung Galaxy A15",
+                "Xiaomi Redmi Note 14", "Xiaomi Redmi 14C", "Motorola Moto G85", "Motorola Moto G35", "Motorola Moto E15"]
+        return jsonify(known + [m for m in base if m not in known])
+
+    @app.get("/api/users")
+    def api_users():
+        rows = conn().execute("SELECT id, username, full_name, role, active, must_change, created_at FROM users ORDER BY role, full_name").fetchall()
+        return jsonify({"users": dbm.rows_to_list(rows), "roles": dbm.ROLES})
+
+    def _user_values(d, require_password):
+        username = re.sub(r"\s", "", d.get("username") or "").lower()
+        full_name = (d.get("full_name") or "").strip()
+        role = d.get("role")
+        if not username or not full_name:
+            raise ApiError("Usuario y nombre son obligatorios")
+        if role not in dbm.ROLES:
+            raise ApiError("Rol inválido")
+        pwd = d.get("password") or ""
+        if (require_password or pwd) and len(pwd) < 4:
+            raise ApiError("La contraseña debe tener al menos 4 caracteres")
+        return username, full_name, role, pwd
+
+    def _check_last_admin(uid, role, active):
+        if role == "admin" and active:
+            return
+        others = conn().execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (uid,)).fetchone()[0]
+        if not others:
+            raise ApiError("Debe quedar al menos un administrador activo")
+
+    @app.post("/api/users")
+    def api_user_create():
+        username, full_name, role, pwd = _user_values(body(), True)
+        try:
+            cur = conn().execute("INSERT INTO users(username, full_name, role, password_hash, created_at) VALUES (?,?,?,?,?)",
+                                 (username, full_name, role, generate_password_hash(pwd), dbm.now()))
+            conn().commit()
+        except Exception:
+            raise ApiError(f"El usuario '{username}' ya existe")
+        return jsonify({"id": cur.lastrowid}), 201
+
+    @app.put("/api/users/<int:uid>")
+    def api_user_update(uid):
+        d = body()
+        username, full_name, role, pwd = _user_values(d, False)
+        active = 0 if d.get("active") in (0, False, "0") else 1
+        _check_last_admin(uid, role, active)
+        c = conn()
+        try:
+            c.execute("UPDATE users SET username=?, full_name=?, role=?, active=? WHERE id=?", (username, full_name, role, active, uid))
+        except Exception:
+            raise ApiError(f"El usuario '{username}' ya existe")
+        if pwd:
+            c.execute("UPDATE users SET password_hash=?, must_change=1 WHERE id=?", (generate_password_hash(pwd), uid))
+        c.commit()
+        return jsonify({"ok": True})
+
     # ------------------------------------------------------------ páginas
     @app.route("/")
     def index():
@@ -145,8 +319,8 @@ def create_app(db_path=None):
             raise ApiError("Nombre y prefijo son obligatorios")
         try:
             c = conn()
-            cur = c.execute("INSERT INTO categories(name, prefix, serialized, markup) VALUES (?,?,?,?)",
-                            (name, prefix, 1 if d.get("serialized") else 0, num(d.get("markup"), 100)))
+            cur = c.execute("INSERT INTO categories(name, prefix, serialized, markup, ask_device) VALUES (?,?,?,?,?)",
+                            (name, prefix, 1 if d.get("serialized") else 0, num(d.get("markup"), 100), 1 if d.get("ask_device") else 0))
             c.commit()
         except Exception as exc:  # sqlite3.IntegrityError
             raise ApiError(f"La categoría o el prefijo ya existe ({exc})")
@@ -157,9 +331,9 @@ def create_app(db_path=None):
         d = body()
         c = conn()
         try:
-            c.execute("UPDATE categories SET name=?, prefix=?, serialized=?, markup=? WHERE id=?",
+            c.execute("UPDATE categories SET name=?, prefix=?, serialized=?, markup=?, ask_device=? WHERE id=?",
                       (d.get("name", "").strip(), re.sub(r"[^A-Z0-9]", "", d.get("prefix", "").upper())[:5],
-                       1 if d.get("serialized") else 0, num(d.get("markup"), 100), cid))
+                       1 if d.get("serialized") else 0, num(d.get("markup"), 100), 1 if d.get("ask_device") else 0, cid))
             c.commit()
         except Exception as exc:
             raise ApiError(f"No se pudo guardar: {exc}")
@@ -176,7 +350,8 @@ def create_app(db_path=None):
 
     # ------------------------------------------------------------ productos
     PRODUCT_FIELDS = ["sku", "barcode", "name", "brand", "model", "color", "capacity", "category_id", "cost", "price",
-                      "wholesale_price", "min_stock", "serialized", "track_stock", "warranty_days", "location", "notes"]
+                      "wholesale_price", "min_stock", "serialized", "track_stock", "warranty_days", "location", "notes",
+                      "ask_device"]
 
     @app.get("/api/products")
     def api_products():
@@ -199,7 +374,7 @@ def create_app(db_path=None):
                 params += [like] * 7
         sql.append("ORDER BY p.name LIMIT ?")
         params.append(int(request.args.get("limit", 500)))
-        return jsonify(dbm.rows_to_list(conn().execute(" ".join(sql), params).fetchall()))
+        return jsonify(strip_costs(dbm.rows_to_list(conn().execute(" ".join(sql), params).fetchall())))
 
     @app.get("/api/products/<int:pid>")
     def api_product(pid):
@@ -207,7 +382,7 @@ def create_app(db_path=None):
         p["serials"] = dbm.rows_to_list(conn().execute(
             "SELECT s.*, sa.folio FROM serials s LEFT JOIN sales sa ON sa.id=s.sale_id WHERE s.product_id=? ORDER BY s.status, s.id DESC",
             (pid,)).fetchall())
-        return jsonify(p)
+        return jsonify(strip_costs(p))
 
     @app.get("/api/products/next-sku")
     def api_next_sku():
@@ -235,6 +410,7 @@ def create_app(db_path=None):
         vals["warranty_days"] = int(num(vals.get("warranty_days"), 0))
         vals["serialized"] = 1 if vals.get("serialized") in (1, True, "1", "true", "on") else 0
         vals["track_stock"] = 0 if vals.get("track_stock") in (0, False, "0", "false") else 1
+        vals["ask_device"] = 1 if vals.get("ask_device") in (1, True, "1", "true", "on") else 0
         if vals["serialized"]:
             vals["track_stock"] = 1
         vals["category_id"] = int(vals["category_id"]) if vals.get("category_id") not in (None, "", 0, "0") else None
@@ -275,6 +451,33 @@ def create_app(db_path=None):
         c.commit()
         return jsonify(get_product(pid)), 201
 
+    @app.post("/api/products/bulk")
+    def api_products_bulk_create():
+        """Alta rápida de varios productos (p. ej. todos los tipos de micas)."""
+        rows = body().get("rows") or []
+        c = conn()
+        created, errors = [], []
+        ts = dbm.now()
+        for n, row in enumerate(rows, start=1):
+            if not (row.get("name") or "").strip():
+                continue
+            try:
+                vals = _product_values(row, c)
+                _check_unique(c, vals)
+                cols = list(vals.keys())
+                pid = c.execute(f"INSERT INTO products({', '.join(cols)}, stock, created_at, updated_at) "
+                                f"VALUES ({', '.join('?' * len(cols))}, 0, ?, ?)", [vals[k] for k in cols] + [ts, ts]).lastrowid
+                initial = num(row.get("initial_stock"), 0)
+                if initial and vals["track_stock"] and not vals["serialized"]:
+                    c.execute("UPDATE products SET stock=? WHERE id=?", (initial, pid))
+                    c.execute("INSERT INTO inventory_moves(product_id, qty, kind, notes, created_at) VALUES (?,?,?,?,?)",
+                              (pid, initial, "entrada", "Inventario inicial", ts))
+                created.append({"id": pid, "sku": vals["sku"], "name": vals["name"]})
+            except ApiError as exc:
+                errors.append(f"Renglón {n} ({row.get('name')}): {exc}")
+        c.commit()
+        return jsonify({"created": created, "errors": errors})
+
     @app.put("/api/products/<int:pid>")
     def api_product_update(pid):
         existing = get_product(pid)
@@ -312,16 +515,16 @@ def create_app(db_path=None):
         c = conn()
         row = c.execute("SELECT id FROM products WHERE active=1 AND (barcode=? OR UPPER(sku)=UPPER(?))", (code, code)).fetchone()
         if row:
-            return jsonify({"product": get_product(row["id"]), "imei": None})
+            return jsonify({"product": strip_costs(get_product(row["id"])), "imei": None})
         if len(code) == 12 and code.isdigit():  # UPC leído como EAN con 0 inicial o viceversa
             row = c.execute("SELECT id FROM products WHERE active=1 AND barcode IN (?, ?)", ("0" + code, code.lstrip("0"))).fetchone()
             if row:
-                return jsonify({"product": get_product(row["id"]), "imei": None})
+                return jsonify({"product": strip_costs(get_product(row["id"])), "imei": None})
         serial = c.execute("SELECT * FROM serials WHERE imei=? OR imei2=?", (code, code)).fetchone()
         if serial:
             if serial["status"] != "disponible":
                 raise ApiError(f"El IMEI {code} ya fue vendido.", 409)
-            return jsonify({"product": get_product(serial["product_id"]), "imei": serial["imei"]})
+            return jsonify({"product": strip_costs(get_product(serial["product_id"])), "imei": serial["imei"]})
         raise ApiError(f"No se encontró ningún producto con el código {code}", 404)
 
     # ------------------------------------------------------------ precios
@@ -477,7 +680,10 @@ def create_app(db_path=None):
             if qty <= 0:
                 raise ApiError(f"Cantidad inválida para {p['name']}")
             price = num(it.get("unit_price"), p["price"]) if it.get("unit_price") not in (None, "") else float(p["price"])
+            if is_vendedor() and abs(price - float(p["price"])) > 0.004:
+                raise ApiError(f"Los vendedores no pueden cambiar el precio de {p['name']}; usa descuento o pide autorización.")
             discount = num(it.get("discount"), 0)
+            warranty = int(num(it.get("warranty_days"), p["warranty_days"])) if it.get("warranty_days") not in (None, "") else int(p["warranty_days"])
             imei = (it.get("imei") or "").strip()
             if p["serialized"]:
                 if not imei:
@@ -492,7 +698,8 @@ def create_app(db_path=None):
             if line_total < 0:
                 raise ApiError(f"El descuento de {p['name']} es mayor que el importe")
             qty_by_product[p["id"]] = qty_by_product.get(p["id"], 0) + qty
-            lines.append({"p": p, "qty": qty, "price": r2(price), "discount": r2(discount), "total": line_total, "imei": imei})
+            lines.append({"p": p, "qty": qty, "price": r2(price), "discount": r2(discount), "total": line_total, "imei": imei,
+                          "warranty": max(0, warranty)})
         if not allow_negative:
             for pid, qty in qty_by_product.items():
                 p = get_product(pid)
@@ -538,14 +745,24 @@ def create_app(db_path=None):
             raise ApiError("Forma de pago inválida")
 
         cost_total = r2(sum(l["qty"] * float(l["p"]["cost"]) for l in lines))
+        user = current_user()
+        seller_id = user["id"]
+        if d.get("seller_id") and not is_vendedor():
+            seller_id = int(d["seller_id"])
+        seller = c.execute("SELECT id, full_name FROM users WHERE id=? AND active=1", (seller_id,)).fetchone()
+        if not seller:
+            raise ApiError("Vendedor inválido")
         ts = dbm.now()
         cur = c.execute(
             """INSERT INTO sales(folio, created_at, subtotal, discount, tax, total, cost_total, payment_method,
-                   paid_cash, paid_card, paid_transfer, received, change, customer_name, customer_phone, cashier, notes)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   paid_cash, paid_card, paid_transfer, received, change, customer_name, customer_phone, cashier, notes,
+                   user_id, seller_id, seller_name, device_model, device_imei, customer_email)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (f"TMP-{ts}-{os.getpid()}", ts, subtotal, discount, tax, total, cost_total, method, paid_cash, paid_card,
              paid_transfer, received, change, (d.get("customer_name") or "").strip(), (d.get("customer_phone") or "").strip(),
-             (d.get("cashier") or s.get("cashier_name") or "").strip(), (d.get("notes") or "").strip()))
+             user["full_name"], (d.get("notes") or "").strip(), user["id"], seller["id"], seller["full_name"],
+             (d.get("device_model") or "").strip(), re.sub(r"\s", "", d.get("device_imei") or ""),
+             (d.get("customer_email") or "").strip()))
         sale_id = cur.lastrowid
         folio = f"{s.get('folio_prefix', 'V-')}{sale_id:06d}"
         c.execute("UPDATE sales SET folio=? WHERE id=?", (folio, sale_id))
@@ -554,7 +771,7 @@ def create_app(db_path=None):
             c.execute("""INSERT INTO sale_items(sale_id, product_id, sku, name, qty, unit_price, unit_cost, discount, total, imei, warranty_days)
                          VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                       (sale_id, p["id"], p["sku"], p["name"], l["qty"], l["price"], p["cost"], l["discount"], l["total"],
-                       l["imei"], p["warranty_days"]))
+                       l["imei"], l["warranty"]))
             if p["serialized"]:
                 c.execute("UPDATE serials SET status='vendido', sale_id=? WHERE product_id=? AND imei=?", (sale_id, p["id"], l["imei"]))
                 sync_serial_stock(c, p["id"])
@@ -566,7 +783,7 @@ def create_app(db_path=None):
                           (p["id"], -l["qty"], "venta", folio, ts))
         c.commit()
         sale = _sale(sale_id)
-        result = {"sale": sale}
+        result = {"sale": strip_costs(dict(sale))}
         if d.get("print", True):
             try:
                 result["print"] = _print_sale(sale, s)
@@ -586,19 +803,30 @@ def create_app(db_path=None):
     @app.get("/api/sales")
     def api_sales():
         d_from, d_to = date_range()
-        sql = "SELECT s.*, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) AS units FROM sales s WHERE date(s.created_at) BETWEEN ? AND ?"
-        params = [d_from, d_to]
         q = (request.args.get("q") or "").strip()
+        sql = "SELECT s.*, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) AS units FROM sales s WHERE 1=1"
+        params = []
+        if not (q and request.args.get("all") == "1"):
+            sql += " AND date(s.created_at) BETWEEN ? AND ?"
+            params += [d_from, d_to]
         if q:
-            sql += """ AND (s.folio LIKE ? OR s.customer_name LIKE ? OR s.customer_phone LIKE ?
+            # búsqueda de garantías: folio, cliente, teléfono, IMEI del equipo del cliente o del equipo vendido
+            sql += """ AND (s.folio LIKE ? OR s.customer_name LIKE ? OR s.customer_phone LIKE ? OR s.device_imei LIKE ?
+                       OR s.device_model LIKE ? OR s.seller_name LIKE ?
                        OR s.id IN (SELECT sale_id FROM sale_items WHERE name LIKE ? OR imei LIKE ? OR sku LIKE ?))"""
-            params += [f"%{q}%"] * 6
+            params += [f"%{q}%"] * 9
+        elif is_vendedor():
+            sql += " AND s.seller_id=?"
+            params.append(current_user()["id"])
+        if request.args.get("seller"):
+            sql += " AND s.seller_id=?"
+            params.append(request.args["seller"])
         sql += " ORDER BY s.id DESC LIMIT 1000"
-        return jsonify(dbm.rows_to_list(conn().execute(sql, params).fetchall()))
+        return jsonify(strip_costs(dbm.rows_to_list(conn().execute(sql, params).fetchall())))
 
     @app.get("/api/sales/<int:sale_id>")
     def api_sale(sale_id):
-        return jsonify(_sale(sale_id))
+        return jsonify(strip_costs(_sale(sale_id)))
 
     @app.post("/api/sales/<int:sale_id>/cancel")
     def api_cancel_sale(sale_id):
@@ -716,8 +944,13 @@ def create_app(db_path=None):
         by_day = c.execute("""SELECT date(created_at) day, COUNT(*) n, SUM(total) total FROM sales
                               WHERE status='completada' AND date(created_at) BETWEEN ? AND ? GROUP BY 1 ORDER BY 1""",
                            (d_from, d_to)).fetchall()
+        by_seller = c.execute("""SELECT COALESCE(NULLIF(seller_name,''), cashier, 'Sin vendedor') seller, COUNT(*) n, SUM(total) total,
+                                        SUM(total - cost_total) profit
+                                 FROM sales WHERE status='completada' AND date(created_at) BETWEEN ? AND ?
+                                 GROUP BY 1 ORDER BY total DESC""", (d_from, d_to)).fetchall()
         total = r2(agg["total"])
         return {
+            "by_seller": [{**dict(r), "total": r2(r["total"] or 0), "profit": r2(r["profit"] or 0)} for r in by_seller],
             "from": d_from, "to": d_to, "generated_at": dbm.now(),
             "sales_count": agg["n"], "cancelled_count": cancelled, "units": float(line_disc[1]),
             "total": total, "cash": r2(agg["cash"]), "card": r2(agg["card"]), "transfer": r2(agg["transfer"]),
