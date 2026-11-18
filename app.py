@@ -106,6 +106,7 @@ def create_app(db_path=None):
     STAFF_ONLY = {  # administrador y cajero
         "api_add_serials", "api_inventory_adjust", "api_inventory_moves", "api_cash_create", "api_cash_list",
         "api_report", "corte_page", "api_corte_print", "api_dashboard", "api_label_preview", "api_label_zpl",
+        "api_create_claim", "api_print_claim",
     }
     PUBLIC = {"login_page", "api_login", "static", "logo_png"}
     ADMIN_ONLY.add("api_upload_logo")
@@ -391,7 +392,7 @@ def create_app(db_path=None):
     # ------------------------------------------------------------ productos
     PRODUCT_FIELDS = ["sku", "barcode", "name", "brand", "model", "color", "capacity", "category_id", "cost", "price",
                       "wholesale_price", "min_stock", "serialized", "track_stock", "warranty_days", "location", "notes",
-                      "ask_device"]
+                      "ask_device", "warranty_changes"]
 
     @app.get("/api/products")
     def api_products():
@@ -448,6 +449,7 @@ def create_app(db_path=None):
         for f in ("cost", "price", "wholesale_price", "min_stock"):
             vals[f] = num(vals.get(f), 0)
         vals["warranty_days"] = int(num(vals.get("warranty_days"), 0))
+        vals["warranty_changes"] = max(0, min(20, int(num(vals.get("warranty_changes"), 0))))
         vals["serialized"] = 1 if vals.get("serialized") in (1, True, "1", "true", "on") else 0
         vals["track_stock"] = 0 if vals.get("track_stock") in (0, False, "0", "false") else 1
         vals["ask_device"] = 1 if vals.get("ask_device") in (1, True, "1", "true", "on") else 0
@@ -703,14 +705,12 @@ def create_app(db_path=None):
         return jsonify(dbm.rows_to_list(conn().execute(sql, params).fetchall()))
 
     # ------------------------------------------------------------ ventas
-    @app.post("/api/sales")
-    def api_create_sale():
-        d = body()
+    def _sale_lines(d, c, check_stock=True):
+        """Valida los artículos y calcula totales. No modifica la base de datos."""
         s = settings()
         items_in = d.get("items") or []
         if not items_in:
             raise ApiError("El ticket está vacío")
-        c = conn()
         allow_negative = s.get("allow_negative_stock", "0") == "1"
         lines, used_imeis = [], set()
         qty_by_product = {}
@@ -724,6 +724,7 @@ def create_app(db_path=None):
                 raise ApiError(f"Los vendedores no pueden cambiar el precio de {p['name']}; usa descuento o pide autorización.")
             discount = num(it.get("discount"), 0)
             warranty = int(num(it.get("warranty_days"), p["warranty_days"])) if it.get("warranty_days") not in (None, "") else int(p["warranty_days"])
+            changes = int(num(it.get("warranty_changes"), p["warranty_changes"])) if it.get("warranty_changes") not in (None, "") else int(p["warranty_changes"])
             imei = (it.get("imei") or "").strip()
             if p["serialized"]:
                 if not imei:
@@ -739,13 +740,12 @@ def create_app(db_path=None):
                 raise ApiError(f"El descuento de {p['name']} es mayor que el importe")
             qty_by_product[p["id"]] = qty_by_product.get(p["id"], 0) + qty
             lines.append({"p": p, "qty": qty, "price": r2(price), "discount": r2(discount), "total": line_total, "imei": imei,
-                          "warranty": max(0, warranty)})
-        if not allow_negative:
+                          "warranty": max(0, warranty), "changes": max(0, min(changes, 20))})
+        if check_stock and not allow_negative:
             for pid, qty in qty_by_product.items():
                 p = get_product(pid)
                 if p["track_stock"] and not p["serialized"] and float(p["stock"]) < qty:
                     raise ApiError(f"Sin existencia suficiente de {p['name']} (hay {float(p['stock']):g})")
-
         subtotal = r2(sum(l["total"] for l in lines))
         discount = r2(num(d.get("discount"), 0))
         if discount > subtotal:
@@ -758,6 +758,105 @@ def create_app(db_path=None):
             base = subtotal - discount
             tax = r2(base * rate)
             total = r2(base + tax)
+        cost_total = r2(sum(l["qty"] * float(l["p"]["cost"]) for l in lines))
+        return {"lines": lines, "subtotal": subtotal, "discount": discount, "tax": tax, "total": total, "cost_total": cost_total}
+
+    def _resolve_seller(d, default_id):
+        seller_id = default_id
+        if d.get("seller_id") and not is_vendedor():
+            seller_id = int(d["seller_id"])
+        seller = conn().execute("SELECT id, full_name FROM users WHERE id=? AND active=1", (seller_id,)).fetchone()
+        if not seller:
+            raise ApiError("Vendedor inválido")
+        return seller
+
+    def _customer_fields(d):
+        return ((d.get("customer_name") or "").strip(), (d.get("customer_phone") or "").strip(),
+                (d.get("customer_email") or "").strip(), (d.get("device_model") or "").strip(),
+                re.sub(r"\s", "", d.get("device_imei") or ""), (d.get("notes") or "").strip())
+
+    def _insert_items(c, sale_id, lines):
+        c.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
+        for l in lines:
+            p = l["p"]
+            c.execute("""INSERT INTO sale_items(sale_id, product_id, sku, name, qty, unit_price, unit_cost, discount, total, imei,
+                                                warranty_days, warranty_changes)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (sale_id, p["id"], p["sku"], p["name"], l["qty"], l["price"], p["cost"], l["discount"], l["total"],
+                       l["imei"], l["warranty"], l["changes"]))
+
+    def _new_sale_row(c, status):
+        s = settings()
+        ts = dbm.now()
+        cur = c.execute("INSERT INTO sales(folio, created_at, subtotal, total, payment_method, status) VALUES (?,?,0,0,'',?)",
+                        (f"TMP-{ts}-{os.getpid()}-{id(c)}", ts, status))
+        sale_id = cur.lastrowid
+        c.execute("UPDATE sales SET folio=? WHERE id=?", (f"{s.get('folio_prefix', 'V-')}{sale_id:06d}", sale_id))
+        return sale_id
+
+    @app.post("/api/sales/pending")
+    def api_create_pending():
+        """El vendedor arma la nota y la manda a caja; el cajero la cobra después."""
+        d = body()
+        c = conn()
+        calc = _sale_lines(d, c, check_stock=False)
+        user = current_user()
+        seller = _resolve_seller(d, user["id"])
+        name, phone, email, model, dimei, notes = _customer_fields(d)
+        sale_id = int(d.get("pending_id") or 0)
+        if sale_id:  # actualizar una nota pendiente propia
+            row = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente'", (sale_id,)).fetchone()
+            if not row or (is_vendedor() and row["seller_id"] != user["id"]):
+                raise ApiError("Nota pendiente no encontrada", 404)
+        else:
+            sale_id = _new_sale_row(c, "pendiente")
+        c.execute("""UPDATE sales SET subtotal=?, discount=?, tax=?, total=?, cost_total=?, customer_name=?, customer_phone=?,
+                     customer_email=?, device_model=?, device_imei=?, notes=?, seller_id=?, seller_name=?, user_id=?, sent_at=?
+                     WHERE id=?""",
+                  (calc["subtotal"], calc["discount"], calc["tax"], calc["total"], calc["cost_total"], name, phone, email, model,
+                   dimei, notes, seller["id"], seller["full_name"], user["id"], dbm.now(), sale_id))
+        _insert_items(c, sale_id, calc["lines"])
+        c.commit()
+        return jsonify({"sale": strip_costs(_sale(sale_id))}), 201
+
+    @app.get("/api/sales/pending")
+    def api_list_pending():
+        sql = """SELECT s.id, s.folio, s.sent_at, s.total, s.customer_name, s.customer_phone, s.seller_id, s.seller_name,
+                        s.device_model, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) units
+                 FROM sales s WHERE s.status='pendiente'"""
+        params = []
+        if is_vendedor():
+            sql += " AND s.seller_id=?"
+            params.append(current_user()["id"])
+        return jsonify(dbm.rows_to_list(conn().execute(sql + " ORDER BY s.id", params).fetchall()))
+
+    @app.delete("/api/sales/pending/<int:sale_id>")
+    def api_discard_pending(sale_id):
+        c = conn()
+        row = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente'", (sale_id,)).fetchone()
+        if not row or (is_vendedor() and row["seller_id"] != current_user()["id"]):
+            raise ApiError("Nota pendiente no encontrada", 404)
+        c.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
+        c.execute("UPDATE sales SET status='descartada', cancelled_at=? WHERE id=?", (dbm.now(), sale_id))
+        c.commit()
+        return jsonify({"ok": True})
+
+    @app.post("/api/sales")
+    def api_create_sale():
+        """Cobra una venta (nueva o una nota pendiente con pending_id)."""
+        d = body()
+        s = settings()
+        if is_vendedor() and s.get("seller_can_charge", "0") != "1":
+            raise ApiError("Los vendedores no cobran: usa “Enviar a caja” y el cajero cobra la nota.", 403)
+        c = conn()
+        pending = None
+        if d.get("pending_id"):
+            pending = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente'", (int(d["pending_id"]),)).fetchone()
+            if not pending:
+                raise ApiError("Esa nota ya fue cobrada o descartada")
+        calc = _sale_lines(d, c)
+        total = calc["total"]
+        lines = calc["lines"]
 
         method = d.get("payment_method", "efectivo")
         paid_cash = paid_card = paid_transfer = 0.0
@@ -784,34 +883,22 @@ def create_app(db_path=None):
         else:
             raise ApiError("Forma de pago inválida")
 
-        cost_total = r2(sum(l["qty"] * float(l["p"]["cost"]) for l in lines))
         user = current_user()
-        seller_id = user["id"]
-        if d.get("seller_id") and not is_vendedor():
-            seller_id = int(d["seller_id"])
-        seller = c.execute("SELECT id, full_name FROM users WHERE id=? AND active=1", (seller_id,)).fetchone()
-        if not seller:
-            raise ApiError("Vendedor inválido")
+        seller = _resolve_seller(d, pending["seller_id"] if pending else user["id"])
+        name, phone, email, model, dimei, notes = _customer_fields(d)
         ts = dbm.now()
-        cur = c.execute(
-            """INSERT INTO sales(folio, created_at, subtotal, discount, tax, total, cost_total, payment_method,
-                   paid_cash, paid_card, paid_transfer, received, change, customer_name, customer_phone, cashier, notes,
-                   user_id, seller_id, seller_name, device_model, device_imei, customer_email)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"TMP-{ts}-{os.getpid()}", ts, subtotal, discount, tax, total, cost_total, method, paid_cash, paid_card,
-             paid_transfer, received, change, (d.get("customer_name") or "").strip(), (d.get("customer_phone") or "").strip(),
-             user["full_name"], (d.get("notes") or "").strip(), user["id"], seller["id"], seller["full_name"],
-             (d.get("device_model") or "").strip(), re.sub(r"\s", "", d.get("device_imei") or ""),
-             (d.get("customer_email") or "").strip()))
-        sale_id = cur.lastrowid
-        folio = f"{s.get('folio_prefix', 'V-')}{sale_id:06d}"
-        c.execute("UPDATE sales SET folio=? WHERE id=?", (folio, sale_id))
+        sale_id = pending["id"] if pending else _new_sale_row(c, "completada")
+        c.execute("""UPDATE sales SET created_at=?, subtotal=?, discount=?, tax=?, total=?, cost_total=?, payment_method=?,
+                        paid_cash=?, paid_card=?, paid_transfer=?, received=?, change=?, customer_name=?, customer_phone=?,
+                        customer_email=?, device_model=?, device_imei=?, notes=?, cashier=?, user_id=?, seller_id=?,
+                        seller_name=?, status='completada' WHERE id=?""",
+                  (ts, calc["subtotal"], calc["discount"], calc["tax"], total, calc["cost_total"], method, paid_cash, paid_card,
+                   paid_transfer, received, change, name, phone, email, model, dimei, notes, user["full_name"], user["id"],
+                   seller["id"], seller["full_name"], sale_id))
+        folio = c.execute("SELECT folio FROM sales WHERE id=?", (sale_id,)).fetchone()["folio"]
+        _insert_items(c, sale_id, lines)
         for l in lines:
             p = l["p"]
-            c.execute("""INSERT INTO sale_items(sale_id, product_id, sku, name, qty, unit_price, unit_cost, discount, total, imei, warranty_days)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                      (sale_id, p["id"], p["sku"], p["name"], l["qty"], l["price"], p["cost"], l["discount"], l["total"],
-                       l["imei"], l["warranty"]))
             if p["serialized"]:
                 c.execute("UPDATE serials SET status='vendido', sale_id=? WHERE product_id=? AND imei=?", (sale_id, p["id"], l["imei"]))
                 sync_serial_stock(c, p["id"])
@@ -844,7 +931,7 @@ def create_app(db_path=None):
     def api_sales():
         d_from, d_to = date_range()
         q = (request.args.get("q") or "").strip()
-        sql = "SELECT s.*, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) AS units FROM sales s WHERE 1=1"
+        sql = "SELECT s.*, (SELECT SUM(qty) FROM sale_items WHERE sale_id=s.id) AS units FROM sales s WHERE s.status<>'descartada'"
         params = []
         if not (q and request.args.get("all") == "1"):
             sql += " AND date(s.created_at) BETWEEN ? AND ?"
@@ -871,8 +958,8 @@ def create_app(db_path=None):
     @app.post("/api/sales/<int:sale_id>/cancel")
     def api_cancel_sale(sale_id):
         sale = _sale(sale_id)
-        if sale["status"] == "cancelada":
-            raise ApiError("La venta ya está cancelada")
+        if sale["status"] != "completada":
+            raise ApiError("Solo se pueden cancelar ventas cobradas")
         c = conn()
         ts = dbm.now()
         reason = (body().get("reason") or "").strip()
@@ -937,6 +1024,125 @@ def create_app(db_path=None):
             return Response(tickets.to_escpos(t, logo_path=logo_file()), mimetype="application/octet-stream",
                             headers={"Content-Disposition": f"attachment; filename=ticket_{sale['folio']}.bin"})
         return tickets.to_html(t, s.get("ticket_width", "80"), f"Ticket {sale['folio']}", autoprint=request.args.get("print") == "1")
+
+    # ------------------------------------------------------------ garantías y cambios
+    def _warranty_items(sale_ids):
+        if not sale_ids:
+            return []
+        marks = ",".join("?" * len(sale_ids))
+        rows = conn().execute(f"""SELECT i.*, s.folio, s.created_at sale_date, s.customer_name, s.customer_phone, s.device_model,
+                                         s.device_imei, s.seller_name, s.status sale_status
+                                  FROM sale_items i JOIN sales s ON s.id=i.sale_id
+                                  WHERE i.sale_id IN ({marks}) AND (i.warranty_days>0 OR i.warranty_changes>0)
+                                  ORDER BY s.id DESC, i.id""", sale_ids).fetchall()
+        today = date.today()
+        out = []
+        for r in rows:
+            it = dict(r)
+            start = datetime.strptime(it["sale_date"][:10], "%Y-%m-%d").date()
+            expires = start + timedelta(days=int(it["warranty_days"] or 0))
+            claims = dbm.rows_to_list(conn().execute(
+                "SELECT * FROM warranty_claims WHERE sale_item_id=? ORDER BY number", (it["id"],)).fetchall())
+            used = len(claims)
+            it.update({
+                "expires": expires.isoformat(),
+                "days_left": (expires - today).days,
+                "valid": it["sale_status"] == "completada" and expires >= today,
+                "warranty_label": dbm.warranty_label(it["warranty_days"]),
+                "changes_used": used,
+                "changes_left": max(0, int(it["warranty_changes"] or 0) - used),
+                "claims": claims,
+            })
+            it.pop("unit_cost", None)
+            out.append(it)
+        return out
+
+    @app.get("/api/warranty")
+    def api_warranty_search():
+        """Busca garantías por folio (código del ticket), IMEI, teléfono o nombre del cliente."""
+        q = (request.args.get("q") or "").strip()
+        if len(q) < 3:
+            raise ApiError("Escribe al menos 3 caracteres o escanea el ticket")
+        c = conn()
+        exact = c.execute("SELECT id FROM sales WHERE UPPER(folio)=UPPER(?) AND status IN ('completada','cancelada')", (q,)).fetchone()
+        if exact:
+            ids = [exact["id"]]
+        else:
+            like = f"%{q}%"
+            digits = re.sub(r"\D", "", q)
+            rows = c.execute("""SELECT DISTINCT s.id FROM sales s LEFT JOIN sale_items i ON i.sale_id=s.id
+                                WHERE s.status IN ('completada','cancelada') AND (s.device_imei LIKE ? OR i.imei LIKE ?
+                                   OR s.customer_name LIKE ? OR s.folio LIKE ?
+                                   OR (? <> '' AND REPLACE(REPLACE(s.customer_phone,' ',''),'-','') LIKE ?))
+                                ORDER BY s.id DESC LIMIT 60""",
+                             (like, like, like, like, digits, f"%{digits}%")).fetchall()
+            ids = [r["id"] for r in rows]
+        return jsonify(_warranty_items(ids))
+
+    @app.post("/api/warranty/claims")
+    def api_create_claim():
+        """Registra un cambio por garantía (p. ej. mica nueva) y descuenta la pieza del inventario."""
+        d = body()
+        c = conn()
+        item_id = int(d.get("sale_item_id") or 0)
+        row = c.execute("SELECT sale_id FROM sale_items WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            raise ApiError("Artículo no encontrado", 404)
+        it = next(x for x in _warranty_items([row["sale_id"]]) if x["id"] == item_id)
+        user = current_user()
+        force = bool(d.get("force")) and user["role"] == "admin"
+        if it["sale_status"] != "completada":
+            raise ApiError("La venta fue cancelada; no tiene garantía")
+        problems = []
+        if not it["valid"]:
+            problems.append(f"la garantía venció el {it['expires']}")
+        if it["changes_left"] <= 0:
+            problems.append("ya no le quedan cambios" if it["warranty_changes"] else "este artículo no incluye cambios")
+        if problems and not force:
+            raise ApiError("No se puede registrar el cambio: " + " y ".join(problems) +
+                           (". Un administrador puede autorizarlo." if user["role"] != "admin" else ". Marca “Autorizar de todos modos”."))
+        ts = dbm.now()
+        took = 0
+        p = c.execute("SELECT * FROM products WHERE id=?", (it["product_id"],)).fetchone() if it["product_id"] else None
+        if p and p["track_stock"] and not p["serialized"] and d.get("take_stock", True):
+            c.execute("UPDATE products SET stock=stock-1, updated_at=? WHERE id=?", (ts, p["id"]))
+            c.execute("INSERT INTO inventory_moves(product_id, qty, kind, reference, notes, created_at) VALUES (?,?,?,?,?,?)",
+                      (p["id"], -1, "garantía", it["folio"], f"Cambio {it['changes_used'] + 1}", ts))
+            took = 1
+        cur = c.execute("""INSERT INTO warranty_claims(sale_id, sale_item_id, number, product_id, took_stock, forced, user_id,
+                                                       user_name, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (it["sale_id"], item_id, it["changes_used"] + 1, it["product_id"], took, 1 if problems else 0,
+                         user["id"], user["full_name"], (d.get("notes") or "").strip(), ts))
+        c.commit()
+        claim_id = cur.lastrowid
+        result = {"claim_id": claim_id, "item": next(x for x in _warranty_items([it["sale_id"]]) if x["id"] == item_id)}
+        if d.get("print", True):
+            try:
+                result["print"] = _print_claim(claim_id)
+            except printing.PrintError as exc:
+                result["print_error"] = str(exc)
+        return jsonify(result), 201
+
+    def _claim_ticket(claim_id):
+        claim = conn().execute("SELECT * FROM warranty_claims WHERE id=?", (claim_id,)).fetchone()
+        if not claim:
+            raise ApiError("Cambio no encontrado", 404)
+        claim = dict(claim)
+        item = next(x for x in _warranty_items([claim["sale_id"]]) if x["id"] == claim["sale_item_id"])
+        return tickets.build_claim_ticket(claim, item, settings())
+
+    def _print_claim(claim_id):
+        return _dispatch_ticket(_claim_ticket(claim_id), settings(), "Comprobante de cambio").get_json()
+
+    @app.post("/api/warranty/claims/<int:claim_id>/print")
+    def api_print_claim(claim_id):
+        return jsonify(_print_claim(claim_id))
+
+    @app.get("/tickets/cambio/<int:claim_id>")
+    def claim_page(claim_id):
+        s = settings()
+        return tickets.to_html(_claim_ticket(claim_id), s.get("ticket_width", "80"), "Cambio por garantía",
+                               autoprint=request.args.get("print") == "1")
 
     # ------------------------------------------------------------ caja y reportes
     @app.post("/api/cash")

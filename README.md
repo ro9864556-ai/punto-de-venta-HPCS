@@ -37,6 +37,27 @@ El logo de **Hospital para Celulares Shop** aparece en el inicio de sesión, el 
 nota y corte de caja. En la impresora térmica y en la Zebra se imprime en blanco y negro (vista previa
 en **Configuración → Tienda → Logo**). Desde ahí se puede subir otro logo o desactivar su impresión.
 
+## Flujo de venta: vendedor → caja
+
+1. El **vendedor** escanea los productos, captura cliente, teléfono, modelo e IMEI del equipo y presiona
+   **Enviar a caja (F2)**. La nota queda *pendiente de cobro* (no cuenta en el corte ni descuenta inventario).
+2. El **cajero** ve el aviso **Notas por cobrar** (con contador en el menú), da clic en **Cobrar**, puede
+   ajustar la nota y cobra con F2. Se imprime la nota con el nombre del vendedor y de quien cobró.
+3. El cajero también puede hacer notas y cobrarlas directamente. Si quieres que los vendedores también
+   cobren, actívalo en **Configuración → Usuarios**.
+
+## Garantías y cambios (F3)
+
+Cada producto define su **garantía** (p. ej. 1 año) y cuántos **cambios** incluye (p. ej. 3 para una mica
+de cristal). En la nota se imprime “Incluye 3 cambios” y un recuadro **Control de cambios** con renglones
+de fecha y firma como respaldo en papel.
+
+Cuando el cliente regresa: **Garantías** → escanea el código del ticket o escribe el IMEI (*#06#) o el
+teléfono. El sistema muestra si la garantía sigue vigente, cuántos cambios lleva (● ● ○) y el historial.
+**Registrar cambio** descuenta la mica del inventario e imprime un comprobante “Cambio 2 de 3 · Cambios
+restantes: 1” con firma del cliente. Sin cambios disponibles o con la garantía vencida solo un
+administrador puede autorizar un cambio extra.
+
 ## Nota de venta
 
 Cada nota lleva: fecha, vendedor, cliente, teléfono (y email opcional), los artículos con su precio y

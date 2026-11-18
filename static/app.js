@@ -11,6 +11,9 @@ const S = {
   customer: { name: "", phone: "", email: "", model: "", imei: "", seller: "" },
   me: null,
   sellers: [],
+  pendingId: null,      // nota pendiente que el cajero está cobrando
+  pendingFolio: "",
+  pendingNotes: "",
   labelQueue: [],
   labelSel: 0,
   view: "vender",
@@ -37,6 +40,8 @@ const warrantyOptions = (sel) => {
   return opts.map(([d, t]) => `<option value="${d}" ${d === Math.round(num(sel)) ? "selected" : ""}>${t}</option>`).join("");
 };
 const can = (...roles) => S.me && roles.includes(S.me.role);
+const sellerOnly = () => can("vendedor") && S.settings.seller_can_charge !== "1";
+const changesOptions = (sel) => [0, 1, 2, 3, 4, 5, 6].map((n) => `<option value="${n}" ${n === Math.round(num(sel)) ? "selected" : ""}>${n ? n + (n > 1 ? " cambios" : " cambio") : "Sin cambios"}</option>`).join("");
 const debounce = (fn, ms = 250) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
 async function api(method, url, body) {
@@ -208,13 +213,14 @@ $$("#nav a").forEach((a) => a.addEventListener("click", () => go(a.dataset.view)
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { const m = topModal(); if (m) { e.preventDefault(); m.close(); } return; }
   if (e.key === "F1") { e.preventDefault(); go("vender"); }
+  if (e.key === "F3") { e.preventDefault(); go("garantias"); }
   if (S.view === "vender" && !topModal()) {
     if (e.key === "F2") { e.preventDefault(); checkout(); }
     if (e.key === "F4") { e.preventDefault(); focusScan(); }
   }
 });
 
-const NAV_ROLES = { vender: ["admin", "cajero", "vendedor"], productos: ["admin", "cajero", "vendedor"], etiquetas: ["admin", "cajero"],
+const NAV_ROLES = { vender: ["admin", "cajero", "vendedor"], productos: ["admin", "cajero", "vendedor"], garantias: ["admin", "cajero", "vendedor"], etiquetas: ["admin", "cajero"],
   inventario: ["admin", "cajero"], ventas: ["admin", "cajero", "vendedor"], corte: ["admin", "cajero"], config: ["admin"] };
 async function loadBase() {
   S.me = await GET("/api/me");
@@ -236,8 +242,8 @@ const roundingOptions = (selected) => Object.entries(S.rounding).map(([k, v]) =>
 const templateOptions = (selected) => Object.entries(S.templates).map(([k, v]) => `<option value="${k}" ${k === selected ? "selected" : ""}>${esc(v.name)}</option>`).join("");
 
 /* ================================================================== VENDER */
-function saveCart() { try { localStorage.setItem("pos-cart", JSON.stringify({ cart: S.cart, d: S.cartDiscount, c: S.customer })); } catch (_) { /* */ } }
-function loadCart() { try { const v = JSON.parse(localStorage.getItem("pos-cart") || "null"); if (v) { S.cart = v.cart || []; S.cartDiscount = v.d || 0; S.customer = v.c || { name: "", phone: "" }; } } catch (_) { /* */ } }
+function saveCart() { try { localStorage.setItem("pos-cart", JSON.stringify({ cart: S.cart, d: S.cartDiscount, c: S.customer, p: S.pendingId, pf: S.pendingFolio, pn: S.pendingNotes })); } catch (_) { /* */ } }
+function loadCart() { try { const v = JSON.parse(localStorage.getItem("pos-cart") || "null"); if (v) { S.cart = v.cart || []; S.cartDiscount = v.d || 0; S.customer = v.c || { name: "", phone: "" }; S.pendingId = v.p || null; S.pendingFolio = v.pf || ""; S.pendingNotes = v.pn || ""; } } catch (_) { /* */ } }
 const focusScan = () => setTimeout(() => $("#scan")?.focus(), 20);
 
 function initVender() {
@@ -248,6 +254,8 @@ function initVender() {
       <div class="search-box"><span class="scan-ico">🔎</span>
         <input id="scan" class="scan" autocomplete="off" placeholder="Escanea código de barras / IMEI, o escribe para buscar  (F4)">
       </div>
+      <div id="pend-box" class="card pend-box hidden"></div>
+      <div id="pend-banner" class="pend-banner hidden"></div>
       <div class="card cart" style="padding:0">
         <div class="table-wrap" style="max-height:calc(100vh - 190px);border:0">
           <table><thead><tr><th>Producto</th><th class="num">Precio</th><th class="center">Cant.</th><th class="num">Desc. $</th><th class="num">Importe</th><th></th></tr></thead>
@@ -274,6 +282,7 @@ function initVender() {
           </div></fieldset>
         <datalist id="dl-models"></datalist>
       </div>
+      <button class="primary big-btn hidden" id="btn-send">📨 Enviar a caja <kbd style="border-color:#fff">F2</kbd></button>
       <button class="success big-btn" id="btn-pay">💵 Cobrar <kbd style="border-color:#fff">F2</kbd></button>
       <div class="row" style="margin-top:8px">
         <button class="danger" id="btn-clear" style="flex:1">Vaciar ticket</button>
@@ -292,6 +301,17 @@ function initVender() {
   GET("/api/device-models").then((list) => { $("#dl-models").innerHTML = list.map((x) => `<option value="${esc(x)}">`).join(""); }).catch(() => {});
   $("#t-disc").oninput = (e) => { S.cartDiscount = num(e.target.value); saveCart(); renderTotals(); };
   $("#btn-pay").onclick = checkout;
+  $("#btn-send").onclick = sendToCaja;
+  $("#pend-box").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-pa]"); if (!b) return;
+    const id = +b.dataset.id;
+    if (b.dataset.pa === "load") return loadPending(id);
+    if (b.dataset.pa === "drop" && await confirmBox(`¿Descartar la nota ${esc(b.dataset.folio)}? El cliente ya no la podrá pagar.`, "Descartar", true)) {
+      try { await DEL(`/api/sales/pending/${id}`); if (S.pendingId === id) releasePending(); refreshPending(); toast("Nota descartada", "ok"); } catch (er) { fail(er); }
+    }
+  });
+  setInterval(() => { if (S.view === "vender") refreshPending(); }, 8000);
+  refreshPending();
   $("#btn-clear").onclick = async () => { if (S.cart.length && await confirmBox("¿Vaciar el ticket actual?", "Vaciar", true)) { clearCart(); } };
   $("#btn-last").onclick = async () => {
     try { const list = await GET(`/api/sales?from=2000-01-01&to=2999-12-31`); if (!list.length) return toast("Aún no hay ventas"); showSale(list[0].id); } catch (e) { fail(e); }
@@ -308,10 +328,87 @@ function fillSellers() {
   if (S.me.role === "vendedor") sel.value = String(S.me.id);
 }
 
+function releasePending() { S.pendingId = null; S.pendingFolio = ""; S.pendingNotes = ""; saveCart(); renderPendingBanner(); }
+
+function renderPendingBanner() {
+  const el = $("#pend-banner"); if (!el) return;
+  el.classList.toggle("hidden", !S.pendingId);
+  el.innerHTML = S.pendingId ? `🧾 Cobrando la nota <b class="mono">${esc(S.pendingFolio)}</b>. Puedes ajustarla antes de cobrar. <button class="sm" id="pend-release">Soltar nota</button>` : "";
+  const b = $("#pend-release"); if (b) b.onclick = () => { clearCart(); toast("La nota sigue pendiente en caja"); };
+  $("#btn-clear").textContent = S.pendingId ? "Soltar nota" : "Vaciar ticket";
+}
+
+async function refreshPending() {
+  const box = $("#pend-box"); if (!box || !S.me) return;
+  let list;
+  try { list = await GET("/api/sales/pending"); } catch (_) { return; }
+  const staff = !sellerOnly();
+  const navBadge = $('#nav a[data-view="vender"] .nav-badge');
+  if (navBadge) { navBadge.textContent = list.length; navBadge.classList.toggle("hidden", !staff || !list.length); }
+  if (!list.length) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  box.classList.remove("hidden");
+  const ago = (ts) => { const m = Math.max(0, Math.round((Date.now() - new Date(ts.replace(" ", "T")).getTime()) / 60000)); return m < 1 ? "ahora" : m < 60 ? `hace ${m} min` : `hace ${Math.round(m / 60)} h`; };
+  box.innerHTML = `<div class="row" style="margin-bottom:8px"><h3 style="margin:0">${staff ? "🔔 Notas por cobrar" : "📨 Mis notas enviadas a caja"}</h3><span class="badge warn">${list.length}</span></div>
+    <div class="pend-list">${list.map((p) => `<div class="pend ${p.id === S.pendingId ? "on" : ""}">
+      <div class="grow"><b class="mono">${esc(p.folio)}</b> · ${esc(p.customer_name || "Sin nombre")}<div class="small muted">${esc(p.seller_name)} · ${Number(p.units || 0)} pza · ${ago(p.sent_at || "")}</div></div>
+      <b>${money(p.total)}</b>
+      ${staff ? `<button class="sm success" data-pa="load" data-id="${p.id}">Cobrar</button>` : ""}
+      <button class="sm danger icon-btn" data-pa="drop" data-id="${p.id}" data-folio="${esc(p.folio)}" title="Descartar">✕</button></div>`).join("")}</div>`;
+}
+
+async function loadPending(id) {
+  if (S.cart.length && S.pendingId !== id && !await confirmBox("Hay artículos en el ticket actual. ¿Reemplazarlos con la nota pendiente?", "Reemplazar")) return;
+  let sale;
+  try { sale = await GET(`/api/sales/${id}`); } catch (e) { return fail(e); }
+  if (sale.status !== "pendiente") { refreshPending(); return toast("Esa nota ya no está pendiente", "bad"); }
+  S.cart = sale.items.map((i) => ({ key: `${i.product_id}-${i.imei || ""}`, product_id: i.product_id, name: i.name, sku: i.sku, price: i.unit_price, qty: i.qty,
+    discount: i.discount, imei: i.imei || "", serialized: i.imei ? 1 : 0, stock: Infinity, track_stock: 0, warranty: i.warranty_days, changes: i.warranty_changes, ask_device: 0 }));
+  S.cartDiscount = sale.discount || 0;
+  S.customer = { name: sale.customer_name || "", phone: sale.customer_phone || "", email: sale.customer_email || "", model: sale.device_model || "",
+    imei: sale.device_imei || "", seller: String(sale.seller_id || "") };
+  S.pendingId = sale.id; S.pendingFolio = sale.folio; S.pendingNotes = sale.notes || "";
+  $("#t-disc").value = S.cartDiscount;
+  [["name", "#cust-name"], ["phone", "#cust-phone"], ["email", "#cust-email"], ["model", "#cust-model"], ["imei", "#cust-imei"]].forEach(([k, sel]) => { $(sel).value = S.customer[k]; });
+  fillSellers();
+  saveCart(); renderCart(); renderPendingBanner(); refreshPending();
+  toast(`Nota ${sale.folio} cargada. Revisa y cobra (F2).`, "ok");
+}
+
+async function sendToCaja() {
+  if (!S.cart.length) return toast("El ticket está vacío");
+  if (topModal()) return;
+  const needsDevice = S.cart.some((l) => l.ask_device || ((l.warranty > 0 || l.changes > 0) && !l.imei));
+  if (needsDevice && (!S.customer.model || !S.customer.imei)) {
+    const ok = await confirmBox("Falta el <b>modelo</b> o el <b>IMEI</b> del equipo del cliente; se usan para la garantía y los cambios. ¿Enviar de todos modos?", "Enviar así");
+    if (!ok) { $(S.customer.model ? "#cust-imei" : "#cust-model").focus(); return; }
+  }
+  const t = cartTotals();
+  try {
+    const r = await POST("/api/sales/pending", { ...salePayloadBase(), discount: t.disc, pending_id: S.pendingId || undefined });
+    clearCart();
+    refreshPending();
+    modal({ title: "📨 Nota enviada a caja", size: "narrow",
+      body: `<div class="center"><div class="muted">Folio</div><h1 class="mono">${esc(r.sale.folio)}</h1><div class="muted" style="margin-top:10px">Total a pagar en caja</div><h1>${money(r.sale.total)}</h1>
+        <p class="small muted">Pasa al cliente a caja. El cajero verá la nota en “Notas por cobrar”.</p></div>`,
+      foot: `<button class="primary" data-close autofocus>Nueva venta (Esc)</button>` });
+  } catch (e) { fail(e); }
+}
+
+function salePayloadBase() {
+  return {
+    items: S.cart.map((l) => ({ product_id: l.product_id, qty: l.qty, unit_price: l.price, discount: num(l.discount), imei: l.imei, warranty_days: l.warranty || 0, warranty_changes: l.changes || 0 })),
+    seller_id: $("#cust-seller").value, customer_name: S.customer.name, customer_phone: S.customer.phone, customer_email: S.customer.email,
+    device_model: S.customer.model, device_imei: S.customer.imei,
+  };
+}
+
 function clearCart() {
+  S.pendingId = null; S.pendingFolio = ""; S.pendingNotes = "";
   S.cart = []; S.cartDiscount = 0; S.customer = { name: "", phone: "", email: "", model: "", imei: "", seller: S.customer.seller || "" };
   $("#t-disc").value = "0";
   ["#cust-name", "#cust-phone", "#cust-email", "#cust-model", "#cust-imei"].forEach((x) => { $(x).value = ""; });
+  fillSellers();
+  renderPendingBanner();
   saveCart(); renderCart(); focusScan();
 }
 
@@ -323,11 +420,11 @@ async function addToCart(p, imei) {
   }
   if (imei) {
     if (S.cart.some((l) => l.imei === imei)) { beep(false); return toast(`El IMEI ${imei} ya está en el ticket`, "bad"); }
-    S.cart.push({ key: `${p.id}-${imei}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei, serialized: 1, stock: 1, track_stock: 1, warranty: p.warranty_days, ask_device: 0 });
+    S.cart.push({ key: `${p.id}-${imei}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei, serialized: 1, stock: 1, track_stock: 1, warranty: p.warranty_days, changes: p.warranty_changes || 0, ask_device: 0 });
   } else {
     const line = S.cart.find((l) => l.product_id === p.id && !l.imei);
     if (line) line.qty += 1;
-    else S.cart.push({ key: `${p.id}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei: "", serialized: 0, stock: p.stock, track_stock: p.track_stock, warranty: p.warranty_days, ask_device: p.ask_device });
+    else S.cart.push({ key: `${p.id}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei: "", serialized: 0, stock: p.stock, track_stock: p.track_stock, warranty: p.warranty_days, changes: p.warranty_changes || 0, ask_device: p.ask_device });
     const l = S.cart.find((x) => x.product_id === p.id && !x.imei);
     if (p.track_stock && l.qty > p.stock && S.settings.allow_negative_stock !== "1") toast(`Atención: solo hay ${Number(p.stock)} en existencia de ${p.name}`, "bad");
   }
@@ -383,6 +480,9 @@ function renderTotals() {
   $("#t-tax").textContent = money(t.tax);
   $("#t-total").textContent = money(t.total);
   $("#btn-pay").disabled = !S.cart.length;
+  $("#btn-send").disabled = !S.cart.length;
+  $("#btn-send").classList.toggle("hidden", !can("vendedor"));
+  $("#btn-pay").classList.toggle("hidden", sellerOnly());
 }
 
 function renderCart() {
@@ -392,7 +492,8 @@ function renderCart() {
   } else {
     body.innerHTML = S.cart.map((l, i) => `<tr data-i="${i}">
       <td><div class="pname">${esc(l.name)}</div><div class="small muted mono">${esc(l.sku)}${l.imei ? ` · <span class="badge info">IMEI ${esc(l.imei)}</span>` : ""}</div>
-        <select data-f="warranty" class="small" style="width:auto;padding:2px 6px;margin-top:4px" title="Garantía">${warrantyOptions(l.warranty || 0)}</select></td>
+        <div class="row" style="gap:4px;margin-top:4px"><select data-f="warranty" class="small" style="width:auto;padding:2px 6px" title="Garantía">${warrantyOptions(l.warranty || 0)}</select>
+        <select data-f="changes" class="small" style="width:auto;padding:2px 6px" title="Cambios incluidos">${changesOptions(l.changes || 0)}</select></div></td>
       <td class="num"><input data-f="price" value="${l.price}" style="width:96px" ${can("vendedor") ? 'disabled title="Solo administrador o cajero cambian precios"' : ""}></td>
       <td class="center"><span class="qty">${l.imei ? "1" : `<button class="sm icon-btn" data-a="dec">−</button><input data-f="qty" value="${l.qty}"><button class="sm icon-btn" data-a="inc">+</button>`}</span></td>
       <td class="num"><input data-f="discount" value="${l.discount || 0}" style="width:80px"></td>
@@ -400,7 +501,7 @@ function renderCart() {
       <td><button class="sm danger icon-btn" data-a="del" title="Quitar">✕</button></td></tr>`).join("");
   }
   renderTotals();
-  const needsDevice = S.cart.some((l) => l.ask_device || (l.warranty > 0 && !l.imei));
+  const needsDevice = S.cart.some((l) => l.ask_device || ((l.warranty > 0 || l.changes > 0) && !l.imei));
   $("#dev-box")?.classList.toggle("needs", needsDevice);
 }
 
@@ -411,6 +512,7 @@ document.addEventListener("change", (e) => {
   const v = num(inp.value);
   if (inp.dataset.f === "qty") l.qty = Math.max(1, v);
   else if (inp.dataset.f === "warranty") l.warranty = Math.round(v);
+  else if (inp.dataset.f === "changes") l.changes = Math.round(v);
   else l[inp.dataset.f] = Math.max(0, v);
   saveCart(); renderCart();
 });
@@ -425,11 +527,12 @@ document.addEventListener("click", (e) => {
 });
 
 async function checkout() {
+  if (sellerOnly()) return sendToCaja();
   if (!S.cart.length) return toast("El ticket está vacío");
   if (topModal()) return;
-  const needsDevice = S.cart.some((l) => l.ask_device || (l.warranty > 0 && !l.imei));
+  const needsDevice = S.cart.some((l) => l.ask_device || ((l.warranty > 0 || l.changes > 0) && !l.imei));
   if (needsDevice && (!S.customer.model || !S.customer.imei)) {
-    const ok = await confirmBox("Falta el <b>modelo</b> o el <b>IMEI</b> del equipo del cliente; se usan para hacer válida la garantía. ¿Cobrar de todos modos?", "Cobrar sin ellos");
+    const ok = await confirmBox("Falta el <b>modelo</b> o el <b>IMEI</b> del equipo del cliente; se usan para hacer válida la garantía y los cambios. ¿Cobrar de todos modos?", "Cobrar sin ellos");
     if (!ok) { $(S.customer.model ? "#cust-imei" : "#cust-model").focus(); return; }
   }
   const t = cartTotals();
@@ -449,7 +552,7 @@ async function checkout() {
         <label class="f">Transferencia<input id="mx-tr" inputmode="decimal" value="0"></label>
       </div>
       <div class="change-box" id="chg"><span>Cambio</span><b id="chg-v">$0.00</b></div>
-      <label class="f" style="margin-top:12px">Notas del ticket (opcional)<input id="pay-notes" placeholder="p. ej. apartado, garantía extendida…"></label>
+      <label class="f" style="margin-top:12px">Notas del ticket (opcional)<input id="pay-notes" value="${esc(S.pendingNotes)}" placeholder="p. ej. apartado, garantía extendida…"></label>
       <label class="chk small" style="margin-top:10px"><input type="checkbox" id="pay-print" checked> Imprimir ticket</label>`,
     foot: `<button data-close>Cancelar</button><button class="success" id="pay-ok">✔ Confirmar venta (Enter)</button>`,
     onOpen: (m, close) => {
@@ -477,12 +580,11 @@ async function checkout() {
         if (busy) return; busy = true;
         $("#pay-ok", m).disabled = true;
         const payload = {
-          items: S.cart.map((l) => ({ product_id: l.product_id, qty: l.qty, unit_price: l.price, discount: num(l.discount), imei: l.imei, warranty_days: l.warranty || 0 })),
-          seller_id: $("#cust-seller").value, customer_email: S.customer.email, device_model: S.customer.model, device_imei: S.customer.imei,
+          ...salePayloadBase(), pending_id: S.pendingId || undefined,
           discount: t.disc, payment_method: method,
           received: method === "efectivo" ? num($("#pay-recv", m).value) : t.total,
           paid_cash: num($("#mx-cash", m).value), paid_card: num($("#mx-card", m).value), paid_transfer: num($("#mx-tr", m).value),
-          customer_name: S.customer.name, customer_phone: S.customer.phone, notes: $("#pay-notes", m).value,
+          notes: $("#pay-notes", m).value,
           print: $("#pay-print", m).checked,
         };
         const browserPrint = payload.print && S.settings.ticket_printer_mode === "browser";
@@ -491,6 +593,7 @@ async function checkout() {
           const r = await POST("/api/sales", payload);
           close();
           clearCart();
+          refreshPending();
           if (win) win.location = `/tickets/${r.sale.id}?print=1`;
           if (r.print_error) toast(`Venta guardada, pero no se imprimió: ${r.print_error}`, "bad");
           else if (r.print?.message) toast(r.print.message, "ok");
@@ -545,7 +648,7 @@ async function showSale(id) {
         </tbody></table>
         <h3 style="margin:16px 0 6px">Artículos</h3>
         <table><thead><tr><th>Producto</th><th class="num">Cant.</th><th class="num">Importe</th></tr></thead><tbody>
-          ${s.items.map((i) => `<tr><td>${esc(i.name)}<div class="small muted mono">${esc(i.sku || "")} ${i.imei ? "· IMEI " + esc(i.imei) : ""}${i.warranty_days ? " · Garantía " + warrantyLabel(i.warranty_days) : ""}</div></td><td class="num">${i.qty}</td><td class="num">${money(i.total)}</td></tr>`).join("")}
+          ${s.items.map((i) => `<tr><td>${esc(i.name)}<div class="small muted mono">${esc(i.sku || "")} ${i.imei ? "· IMEI " + esc(i.imei) : ""}${i.warranty_days ? " · Garantía " + warrantyLabel(i.warranty_days) : ""}${i.warranty_changes ? ` · ${i.warranty_changes} cambios` : ""}</div></td><td class="num">${i.qty}</td><td class="num">${money(i.total)}</td></tr>`).join("")}
         </tbody></table></div>
       <div><iframe class="ticket" src="/tickets/${s.id}"></iframe>
         <div class="row small" style="margin-top:6px">Descargar: <a href="/tickets/${s.id}?format=zpl">ZPL (Zebra)</a> · <a href="/tickets/${s.id}?format=escpos">ESC/POS</a> · <a href="/tickets/${s.id}?format=txt" target="_blank">Texto</a></div></div></div>`,
@@ -563,7 +666,7 @@ async function showSale(id) {
   });
 }
 
-VIEWS.vender = () => { renderTotals(); focusScan(); };
+VIEWS.vender = () => { renderTotals(); renderPendingBanner(); refreshPending(); focusScan(); };
 
 /* ================================================================== PRODUCTOS */
 function initProductos() {
@@ -615,7 +718,7 @@ async function loadProducts() {
         <td class="mono small">${esc(p.sku)}</td><td class="mono small">${esc(p.barcode || "")}</td>
         <td><b>${esc(p.name)}</b>${p.serialized ? ' <span class="badge info">IMEI</span>' : ""}<div class="small muted">${esc([p.brand, p.model, p.capacity, p.color].filter(Boolean).join(" · "))}</div></td>
         <td>${esc(p.category_name || "—")}</td><td class="num cost-col">${money(p.cost)}</td><td class="num"><b>${money(p.price)}</b></td>
-        <td class="num cost-col ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num small">${p.warranty_days ? warrantyLabel(p.warranty_days) : "—"}</td><td class="num">${st}</td>
+        <td class="num cost-col ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num small">${p.warranty_days ? warrantyLabel(p.warranty_days) : "—"}${p.warranty_changes ? `<div class="muted">${p.warranty_changes} cambio${p.warranty_changes > 1 ? "s" : ""}</div>` : ""}</td><td class="num">${st}</td>
         <td>${can("admin") ? '<button class="sm" data-a="edit">Editar</button> ' : ""}${can("admin", "cajero") ? '<button class="sm" data-a="label">🏷️</button> ' : ""}
           ${p.serialized && can("admin", "cajero") ? '<button class="sm" data-a="imei">IMEI</button>' : ""} ${can("admin") ? '<button class="sm danger icon-btn" data-a="del" title="Eliminar">✕</button>' : ""}</td></tr>`;
     }).join("") : `<tr><td colspan="10" class="empty">No hay productos. Da clic en “Nuevo producto” o importa un CSV.</td></tr>`;
@@ -632,7 +735,7 @@ VIEWS.productos = () => {
 
 async function productForm(id) {
   let p = { name: "", brand: "", model: "", color: "", capacity: "", category_id: "", sku: "", barcode: "", cost: "", price: "", wholesale_price: "",
-    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "", ask_device: 0 };
+    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "", ask_device: 0, warranty_changes: 0 };
   if (id) { try { p = await GET(`/api/products/${id}`); } catch (e) { return fail(e); } }
   const cat = S.categories.find((c) => String(c.id) === String(p.category_id));
   const isNew = !id;
@@ -668,6 +771,7 @@ async function productForm(id) {
           <label class="chk"><input type="checkbox" name="track_stock" ${p.track_stock ? "checked" : ""}> Controla existencia</label>
           <label class="f">Existencia mínima<input name="min_stock" inputmode="decimal" value="${p.min_stock}"></label>
           <label class="f">Garantía<select name="warranty_days">${warrantyOptions(p.warranty_days)}</select></label>
+          <label class="f">Cambios incluidos<select name="warranty_changes">${changesOptions(p.warranty_changes || 0)}</select></label>
           <label class="chk span-2"><input type="checkbox" name="ask_device" ${p.ask_device ? "checked" : ""}> Pedir modelo e IMEI del equipo del cliente (micas, fundas, reparaciones)</label>
           ${isNew ? `<label class="f span-2" id="f-initial">Existencia inicial<input name="initial_stock" inputmode="decimal" value="0"></label>
           <label class="f span-all hidden" id="f-imeis">IMEIs iniciales (uno por renglón; escanéalos)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia actual: <b>${Number(p.stock)}</b> — ajústala en Inventario.</div>`}
@@ -796,6 +900,7 @@ function quickAdd() {
     <td><input data-q="cost" inputmode="decimal" style="width:80px" value="${r.cost ?? ""}"></td>
     <td><input data-q="price" inputmode="decimal" style="width:80px" value="${r.price ?? ""}"></td>
     <td><select data-q="warranty_days" style="width:120px">${warrantyOptions(r.warranty_days ?? 0)}</select></td>
+    <td><select data-q="warranty_changes" style="width:120px">${changesOptions(r.warranty_changes ?? 0)}</select></td>
     <td class="center"><input type="checkbox" data-q="track_stock" ${r.track_stock ? "checked" : ""}></td>
     <td><input data-q="initial_stock" inputmode="decimal" style="width:64px" value="${r.initial_stock ?? ""}"></td>
     <td class="center"><input type="checkbox" data-q="ask_device" ${r.ask_device ?? 1 ? "checked" : ""}></td>
@@ -806,8 +911,9 @@ function quickAdd() {
       <div class="row" style="margin-bottom:10px"><button id="qa-micas">✨ Sugerir tipos de micas</button>
         <label class="f" style="flex-direction:row;align-items:center;gap:6px">Mismo precio para todas<input id="qa-price" inputmode="decimal" style="width:90px" placeholder="259"></label>
         <label class="f" style="flex-direction:row;align-items:center;gap:6px">Garantía<select id="qa-war" style="width:130px">${warrantyOptions(180)}</select></label>
+        <label class="f" style="flex-direction:row;align-items:center;gap:6px">Cambios<select id="qa-chg" style="width:130px">${changesOptions(0)}</select></label>
         <button id="qa-apply" class="sm">Aplicar a todas</button></div>
-      <div class="table-wrap" style="max-height:52vh"><table><thead><tr><th>Producto</th><th>Categoría</th><th>Marca</th><th>Costo</th><th>Precio</th><th>Garantía</th><th title="Controla existencia">Inventario</th><th>Cant. inicial</th><th>Pide equipo</th><th></th></tr></thead>
+      <div class="table-wrap" style="max-height:52vh"><table><thead><tr><th>Producto</th><th>Categoría</th><th>Marca</th><th>Costo</th><th>Precio</th><th>Garantía</th><th>Cambios</th><th title="Controla existencia">Inventario</th><th>Cant. inicial</th><th>Pide equipo</th><th></th></tr></thead>
       <tbody id="qa-body">${row()}${row()}${row()}</tbody></table></div>
       <button id="qa-add" style="margin-top:8px">＋ Agregar renglón</button><div id="qa-res" class="small" style="margin-top:8px"></div>`,
     foot: `<button data-close>Cerrar</button><button class="primary" id="qa-save">Guardar productos</button>`,
@@ -817,12 +923,13 @@ function quickAdd() {
       $("#qa-micas", m).onclick = () => {
         $$("tr", body).forEach((tr) => { if (!$('[data-q="name"]', tr).value.trim()) tr.remove(); });
         const price = $("#qa-price", m).value, war = num($("#qa-war", m).value);
-        body.insertAdjacentHTML("beforeend", MICA_TYPES.map((name) => row({ name, price, warranty_days: war,
+        body.insertAdjacentHTML("beforeend", MICA_TYPES.map((name) => row({ name, price, warranty_days: war, warranty_changes: num($("#qa-chg", m).value),
           category_id: (name.includes("hidrogel") ? hid : S.categories.find((c) => c.prefix === "MIC"))?.id })).join(""));
       };
       $("#qa-apply", m).onclick = () => $$("tr", body).forEach((tr) => {
         if ($("#qa-price", m).value) $('[data-q="price"]', tr).value = $("#qa-price", m).value;
         $('[data-q="warranty_days"]', tr).innerHTML = warrantyOptions($("#qa-war", m).value);
+        $('[data-q="warranty_changes"]', tr).innerHTML = changesOptions($("#qa-chg", m).value);
       });
       body.addEventListener("click", (e) => { if (e.target.closest('[data-a="rm"]')) e.target.closest("tr").remove(); });
       $("#qa-save", m).onclick = async () => {
@@ -897,6 +1004,113 @@ function importCsv() {
     },
   });
 }
+
+/* ================================================================== GARANTÍAS */
+const fmtDate = (iso) => { if (!iso) return ""; const [y, m, d] = iso.slice(0, 10).split("-"); return `${d}/${m}/${y}`; };
+
+function initGarantias() {
+  $("#view-garantias").innerHTML = `
+    <div class="view-head"><h1>Garantías y cambios</h1></div>
+    <div class="search-box"><span class="scan-ico">🛡️</span>
+      <input id="w-q" class="scan" autocomplete="off" placeholder="Escanea el código del ticket, o escribe IMEI, teléfono o nombre del cliente"></div>
+    <p class="small muted" style="margin:8px 2px 0">El cliente no necesita traer el ticket: con el IMEI de su teléfono (*#06#) o su número se encuentra la garantía.</p>
+    <div id="w-list" class="w-list"></div>`;
+  const search = async () => {
+    const q = $("#w-q").value.trim();
+    if (q.length < 3) { $("#w-list").innerHTML = ""; return; }
+    try { renderWarranty(await GET(`/api/warranty?q=${encodeURIComponent(q)}`)); } catch (e) { fail(e); }
+  };
+  $("#w-q").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); search(); } });
+  $("#w-q").addEventListener("input", debounce(search, 400));
+  $("#w-list").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-w]"); if (!b) return;
+    if (b.dataset.w === "sale") showSale(+b.dataset.id);
+    if (b.dataset.w === "claim") registerChange(JSON.parse(b.closest(".w-card").dataset.item));
+    if (b.dataset.w === "print") printClaim(+b.dataset.id);
+  });
+  S.wSearch = search;
+}
+
+function renderWarranty(items) {
+  const box = $("#w-list");
+  if (!items.length) { box.innerHTML = '<div class="card empty">No se encontraron artículos con garantía. Revisa el IMEI o teléfono.</div>'; return; }
+  const staff = can("admin", "cajero");
+  box.innerHTML = items.map((it) => {
+    const status = it.sale_status !== "completada" ? '<span class="badge bad">Venta cancelada</span>'
+      : it.valid ? `<span class="badge ok">Vigente · vence ${fmtDate(it.expires)} (${it.days_left} días)</span>`
+      : `<span class="badge bad">Vencida el ${fmtDate(it.expires)}</span>`;
+    const total = it.warranty_changes;
+    const dots = total ? Array.from({ length: Math.max(total, it.changes_used) }, (_, i) =>
+      `<span class="${i < it.changes_used ? (i >= total ? "x" : "u") : ""}">${i + 1}</span>`).join("") : "";
+    const cls = !it.valid ? "expired" : total && !it.changes_left ? "used" : "";
+    const blocked = !it.valid || !it.changes_left;
+    const btn = staff ? (blocked
+      ? (can("admin") && it.sale_status === "completada" ? `<button class="danger" data-w="claim">Autorizar cambio extra</button>` : `<button disabled>Sin cambios disponibles</button>`)
+      : `<button class="primary" data-w="claim">🔄 Registrar cambio</button>`) : "";
+    return `<div class="w-card ${cls}" data-item='${esc(JSON.stringify(it))}'>
+      <div class="w-head"><h2>${esc(it.name)}</h2>${status}</div>
+      <div class="w-info">
+        <div><small>Nota</small><a data-w="sale" data-id="${it.sale_id}" class="mono">${esc(it.folio)}</a> · ${fmtDate(it.sale_date)}</div>
+        <div><small>Cliente</small>${esc(it.customer_name || "—")} ${it.customer_phone ? `· ${esc(it.customer_phone)}` : ""}</div>
+        <div><small>Equipo</small>${esc(it.device_model || "—")}<div class="mono small">${esc(it.device_imei || it.imei || "")}</div></div>
+        <div><small>Garantía</small>${esc(it.warranty_label)}${total ? ` · ${total} cambio${total > 1 ? "s" : ""}` : ""}</div>
+        <div><small>Vendedor</small>${esc(it.seller_name || "—")}</div>
+      </div>
+      <div class="w-changes">
+        ${total ? `<div class="dots">${dots}</div><b>${it.changes_used} de ${total} usados · ${it.changes_left ? `queda${it.changes_left > 1 ? "n" : ""} ${it.changes_left}` : "sin cambios restantes"}</b>`
+          : '<span class="muted">Garantía sin cambios incluidos</span>'}
+        <span class="spacer"></span>${btn}
+      </div>
+      ${it.claims.length ? `<div class="w-hist">${it.claims.map((c) => `<div><b>Cambio ${c.number}</b><span>${esc(c.created_at.slice(0, 16))}</span><span class="muted">${esc(c.user_name)}</span>
+        <span>${esc(c.notes || "")}</span>${c.forced ? '<span class="badge warn">autorizado</span>' : ""}<span class="spacer"></span>
+        <button class="sm" data-w="print" data-id="${c.id}" title="Reimprimir comprobante">🖨</button></div>`).join("")}</div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function registerChange(it) {
+  const problems = [];
+  if (!it.valid) problems.push(`la garantía venció el ${fmtDate(it.expires)}`);
+  if (!it.changes_left) problems.push(it.warranty_changes ? "ya usó todos sus cambios" : "este artículo no incluye cambios");
+  const next = it.changes_used + 1;
+  modal({
+    title: `🔄 Cambio ${next}${it.warranty_changes ? ` de ${it.warranty_changes}` : ""}`, size: "narrow",
+    body: `<p style="margin-top:0"><b>${esc(it.name)}</b><br><span class="small muted">${esc(it.device_model || "")} ${esc(it.device_imei || "")} · nota ${esc(it.folio)}</span></p>
+      ${problems.length ? `<div class="pend-banner" style="margin:0 0 12px">⚠️ No aplica: ${problems.join(" y ")}.</div>` : ""}
+      <div class="grid" style="gap:10px">
+        <label class="f">Motivo (opcional)<input id="cl-notes" autofocus placeholder="p. ej. se estrelló, burbujas, se despegó"></label>
+        <label class="chk"><input type="checkbox" id="cl-stock" checked> Descontar 1 pieza del inventario</label>
+        <label class="chk"><input type="checkbox" id="cl-print" checked> Imprimir comprobante para el cliente</label>
+        ${problems.length ? '<label class="chk danger"><input type="checkbox" id="cl-force"> Autorizar de todos modos (administrador)</label>' : ""}
+      </div>`,
+    foot: `<button data-close>Cancelar</button><button class="primary" id="cl-ok">Registrar cambio</button>`,
+    onOpen: (m, close) => {
+      $("#cl-ok", m).onclick = async () => {
+        const force = $("#cl-force", m)?.checked || false;
+        if (problems.length && !force) return toast("Marca “Autorizar de todos modos” para continuar", "bad");
+        const print = $("#cl-print", m).checked;
+        const browserPrint = print && S.settings.ticket_printer_mode === "browser";
+        const win = browserPrint ? window.open("about:blank", "ticket", "width=420,height=720") : null;
+        try {
+          const r = await POST("/api/warranty/claims", { sale_item_id: it.id, notes: $("#cl-notes", m).value, take_stock: $("#cl-stock", m).checked, force, print: print && !browserPrint });
+          close();
+          if (win) win.location = `/tickets/cambio/${r.claim_id}?print=1`;
+          if (r.print_error) toast(`Cambio registrado, pero no se imprimió: ${r.print_error}`, "bad");
+          const left = r.item.changes_left;
+          toast(`Cambio ${r.item.changes_used} registrado. ${r.item.warranty_changes ? `Le quedan ${left}.` : ""}`, "ok");
+          S.wSearch?.();
+        } catch (e) { if (win) win.close(); fail(e); }
+      };
+    },
+  });
+}
+
+async function printClaim(id) {
+  if (S.settings.ticket_printer_mode === "browser") return openTicketWindow(`/tickets/cambio/${id}?print=1`);
+  try { const r = await POST(`/api/warranty/claims/${id}/print`); toast(r.message || "Enviado", "ok"); } catch (e) { fail(e); }
+}
+
+VIEWS.garantias = () => setTimeout(() => $("#w-q").select(), 30);
 
 /* ================================================================== ETIQUETAS */
 function queueItem(item) {
@@ -1143,7 +1357,7 @@ VIEWS.ventas = async () => {
     $("#v-body").innerHTML = list.map((s) => `<tr data-id="${s.id}"><td class="mono"><a data-a="view">${esc(s.folio)}</a></td><td class="small">${esc(s.created_at)}</td><td>${esc(s.seller_name || s.cashier || "—")}</td>
       <td>${esc(s.customer_name || "—")}<div class="small muted">${esc(s.customer_phone || "")}</div></td><td class="small">${esc(s.device_model || "")}<div class="mono muted">${esc(s.device_imei || "")}</div></td><td class="num">${Number(s.units || 0)}</td>
       <td>${esc(s.payment_method)}</td><td class="num"><b>${money(s.total)}</b></td>
-      <td>${s.status === "completada" ? '<span class="badge ok">Completada</span>' : '<span class="badge bad">Cancelada</span>'}</td>
+      <td>${s.status === "completada" ? '<span class="badge ok">Completada</span>' : s.status === "pendiente" ? '<span class="badge warn">Por cobrar</span>' : '<span class="badge bad">Cancelada</span>'}</td>
       <td><button class="sm" data-a="view">Ver</button> <button class="sm" data-a="print">🖨</button></td></tr>`).join("") || '<tr><td colspan="10" class="empty">Sin ventas</td></tr>';
   } catch (e) { fail(e); }
 };
@@ -1274,6 +1488,7 @@ VIEWS.config = async () => {
       ${field("folio_prefix", "Prefijo de folio")}
       ${field("ticket_header", "Leyenda superior", { type: "area", span: 2 })}${field("ticket_footer", "Pie del ticket", { type: "area", span: 2 })}
       ${field("warranty_text", "Texto de garantía (se imprime cuando hay celulares o productos con garantía)", { type: "area", span: "all" })}
+      ${field("ticket_change_boxes", "Imprimir recuadro “Control de cambios” con renglones de fecha y firma", { type: "check", span: "all" })}
       </div><div class="row" style="margin-top:12px"><button id="t-test">🖨 Ticket de prueba</button><span class="small muted">Guarda antes de probar.</span></div></div>
     <div data-p="zebra" class="card hidden"><div class="form-grid">
       ${field("label_printer_mode", "Conexión de la Zebra", { span: 2, options: { download: "Descargar archivo .ZPL (enviar manualmente)", network: "Zebra en red (IP, puerto 9100)", local: "Zebra USB instalada en este equipo" } })}
@@ -1302,7 +1517,8 @@ VIEWS.config = async () => {
       <tr><td><input id="nc-name" placeholder="Nueva categoría"></td><td><input id="nc-prefix" class="mono" placeholder="ABC" style="width:90px"></td><td class="center"><input type="checkbox" id="nc-ser"></td><td class="center"><input type="checkbox" id="nc-dev"></td><td><input id="nc-markup" value="100" style="width:90px"></td><td></td><td><button class="sm primary" id="nc-add">Agregar</button></td></tr>
       </tbody></table></div>
     <div data-p="users" class="card hidden">
-      <p class="small muted" style="margin-top:0"><b>Administrador</b>: todo. <b>Cajero</b>: vender, cobrar a nombre de cualquier vendedor, etiquetas, inventario, corte de caja. <b>Vendedor</b>: generar notas de venta a su nombre y buscar garantías (no ve costos, no cambia precios, no cancela ventas).</p>
+      <p class="small muted" style="margin-top:0"><b>Administrador</b>: todo. <b>Cajero</b>: cobra las notas de los vendedores, hace notas, registra cambios por garantía, etiquetas, inventario, corte de caja. <b>Vendedor</b>: arma la venta y la envía a caja, consulta garantías (no ve costos, no cambia precios, no cancela ventas).</p>
+      <div style="margin-bottom:12px">${field("seller_can_charge", "Permitir que los vendedores también cobren (si no, solo envían la nota a caja)", { type: "check" })}</div>
       <table><thead><tr><th>Usuario</th><th>Nombre (sale en el ticket)</th><th>Rol</th><th>Nueva contraseña</th><th>Activo</th><th></th></tr></thead><tbody id="usr-body"></tbody></table></div>
     <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;
   loadUsers();
@@ -1368,7 +1584,7 @@ function tick() { $("#clock").textContent = new Date().toLocaleString("es-MX", {
 
 (async function start() {
   try { await loadBase(); } catch (e) { fail(e); }
-  initVender(); initProductos(); initEtiquetas(); initInventario(); initVentas(); initCorte(); initConfig();
+  initVender(); initProductos(); initGarantias(); initEtiquetas(); initInventario(); initVentas(); initCorte(); initConfig();
   tick(); setInterval(tick, 20000);
   go("vender");
   if (S.me?.must_change) changePassword(true);

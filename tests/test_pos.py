@@ -174,22 +174,41 @@ def test_roles_and_vendedor_rules(app, client):
     assert caja.get("/api/reports/summary").status_code == 200
     assert vend.get("/api/users").status_code == 403
     assert "cost" not in vend.get(f"/api/products/{mica['id']}").get_json()
-    # el vendedor no cambia precios, pero sí puede descontar
-    r = vend.post("/api/sales", json={"items": [{"product_id": mica["id"], "qty": 1, "unit_price": 100}], "payment_method": "efectivo", "received": 300})
+    # el vendedor no cobra: manda la nota a caja
+    r = vend.post("/api/sales", json={"items": [{"product_id": mica["id"], "qty": 1}], "payment_method": "efectivo", "received": 300})
+    assert r.status_code == 403
+    # no cambia precios, pero sí puede descontar
+    r = vend.post("/api/sales/pending", json={"items": [{"product_id": mica["id"], "qty": 1, "unit_price": 100}]})
     assert r.status_code == 400
-    r = vend.post("/api/sales", json={
-        "items": [{"product_id": mica["id"], "qty": 1, "discount": 9}], "payment_method": "efectivo", "received": 300,
+    r = vend.post("/api/sales/pending", json={
+        "items": [{"product_id": mica["id"], "qty": 1, "discount": 9}],
         "customer_name": "María López", "customer_phone": "5512345678",
         "device_model": "iPhone 17 Pro Max", "device_imei": "35 123456 789012 3", "seller_id": 1})
     assert r.status_code == 201, r.get_json()
+    pend = r.get_json()["sale"]
+    assert pend["status"] == "pendiente" and pend["seller_name"] == "Luis Vendedor"  # no puede usar a otro vendedor
+    assert [x["id"] for x in caja.get("/api/sales/pending").get_json()] == [pend["id"]]
+    assert client.get("/api/reports/summary").get_json()["sales_count"] == 0  # pendiente no cuenta
+    # el cajero cobra la nota pendiente (el vendedor se conserva)
+    r = caja.post("/api/sales", json={"pending_id": pend["id"], "items": [{"product_id": mica["id"], "qty": 1, "discount": 9}],
+                                      "payment_method": "efectivo", "received": 300, "customer_name": "María López",
+                                      "customer_phone": "5512345678", "device_model": "iPhone 17 Pro Max",
+                                      "device_imei": "351234567890123"})
+    assert r.status_code == 201, r.get_json()
     sale = r.get_json()["sale"]
-    assert sale["seller_name"] == "Luis Vendedor"  # un vendedor no puede vender a nombre de otro
-    assert sale["device_imei"] == "351234567890123" and "cost_total" not in sale
+    assert sale["id"] == pend["id"] and sale["folio"] == pend["folio"] and sale["status"] == "completada"
+    assert sale["seller_name"] == "Luis Vendedor" and sale["cashier"] == "Caja 1"
+    assert caja.get("/api/sales/pending").get_json() == []
+    assert caja.post("/api/sales", json={"pending_id": pend["id"], "items": [{"product_id": mica["id"]}], "payment_method": "tarjeta"}).status_code == 400
+    assert sale["device_imei"] == "351234567890123"
     text = vend.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
     for frag in ("Vendedor:", "Luis Vendedor", "María López", "5512345678", "Mica de hidrogel HD",
                  "Garantía: 6 meses", "iPhone 17 Pro Max", "351234567890123", "TOTAL $250.00"):
         assert frag in text, frag
-    # el cajero cobra a nombre de un vendedor
+    # el vendedor puede descartar su propia nota pendiente
+    p2 = vend.post("/api/sales/pending", json={"items": [{"product_id": mica["id"], "qty": 1}]}).get_json()["sale"]
+    assert vend.delete(f"/api/sales/pending/{p2['id']}").status_code == 200
+    # cajero cobra directo a nombre de un vendedor
     r = caja.post("/api/sales", json={"items": [{"product_id": mica["id"], "qty": 1}], "payment_method": "tarjeta", "seller_id": 2})
     assert r.get_json()["sale"]["seller_name"] == "Luis Vendedor"
     # búsqueda de garantía por IMEI en todas las fechas
@@ -199,6 +218,38 @@ def test_roles_and_vendedor_rules(app, client):
     assert rep["by_seller"][0]["seller"] == "Luis Vendedor" and rep["by_seller"][0]["n"] == 2
     # cancelar solo admin
     assert caja.post(f"/api/sales/{sale['id']}/cancel", json={}).status_code == 403
+
+
+def test_warranty_changes(app, client):
+    client.post("/api/users", json={"username": "caja", "full_name": "Caja 1", "role": "cajero", "password": "1234"})
+    client.post("/api/users", json={"username": "luis", "full_name": "Luis", "role": "vendedor", "password": "1234"})
+    mica = _product(client, name="Mica de cristal Samsung A07", category_id=3, cost=30, price=129, initial_stock=10,
+                    warranty_days=365, warranty_changes=3, ask_device=1)
+    caja = login(app, "caja", "1234")
+    sale = caja.post("/api/sales", json={"items": [{"product_id": mica["id"], "qty": 1}], "payment_method": "efectivo",
+                                         "received": 129, "customer_phone": "55 1111 2222", "device_model": "Samsung A07",
+                                         "device_imei": "359876543210987"}).get_json()["sale"]
+    assert sale["items"][0]["warranty_changes"] == 3
+    text = caja.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
+    assert "Incluye 3 cambios" in text and "CONTROL DE CAMBIOS" in text and text.count("Firma:") == 3
+    # búsqueda: por folio escaneado, IMEI y teléfono
+    for q in (sale["folio"], "359876543210987", "5511112222"):
+        res = caja.get(f"/api/warranty?q={q}").get_json()
+        assert len(res) == 1 and res[0]["changes_left"] == 3 and res[0]["valid"], q
+    item_id = res[0]["id"]
+    # el vendedor puede consultar pero no registrar
+    assert login(app, "luis", "1234").post("/api/warranty/claims", json={"sale_item_id": item_id}).status_code == 403
+    for n in (1, 2, 3):
+        r = caja.post("/api/warranty/claims", json={"sale_item_id": item_id, "notes": "se estrelló"}).get_json()
+        assert r["item"]["changes_used"] == n
+    assert r["item"]["changes_left"] == 0
+    assert client.get(f"/api/products/{mica['id']}").get_json()["stock"] == 10 - 1 - 3  # venta + 3 micas de cambio
+    claim_txt = caja.get(f"/tickets/cambio/{r['claim_id']}").get_data(as_text=True)
+    assert "Cambio 3 de 3" in claim_txt and "Cambios restantes: 0" in claim_txt
+    # sin cambios restantes: el cajero no puede; el admin puede autorizar
+    assert caja.post("/api/warranty/claims", json={"sale_item_id": item_id}).status_code == 400
+    r = client.post("/api/warranty/claims", json={"sale_item_id": item_id, "force": True})
+    assert r.status_code == 201 and r.get_json()["item"]["changes_used"] == 4
 
 
 def test_last_admin_and_password(app, client):

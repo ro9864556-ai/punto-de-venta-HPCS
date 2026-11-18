@@ -127,6 +127,9 @@ def build_sale_ticket(sale, items, s, reprint=False):
         days = int(it.get("warranty_days") or 0)
         if days:
             t.text(f"  Garantía: {warranty_label(days)} (vence {_vence(sale['created_at'], days)})")
+        changes = int(it.get("warranty_changes") or 0)
+        if changes:
+            t.text(f"  Incluye {changes} cambio{'s' if changes > 1 else ''} por garantía")
     if sale.get("device_model") or sale.get("device_imei"):
         t.sep()
         t.text("EQUIPO DEL CLIENTE (GARANTÍA)", bold=True)
@@ -134,6 +137,19 @@ def build_sale_ticket(sale, items, s, reprint=False):
             t.cols("Modelo:", sale["device_model"])
         if sale.get("device_imei"):
             t.cols("IMEI:", sale["device_imei"])
+    if s.get("ticket_change_boxes", "1") == "1":
+        with_changes = [i for i in items if int(i.get("warranty_changes") or 0)]
+        for it in with_changes:
+            t.sep()
+            t.text("CONTROL DE CAMBIOS", "C", bold=True)
+            t.text(it["name"], "C")
+            t.feed()
+            for n in range(1, int(it["warranty_changes"]) + 1):
+                if t.width >= 48:
+                    t.text(f"{n}) Fecha: ___/___/_____  Firma: _______________")
+                else:
+                    t.text(f"{n}) __/__/____ Firma: __________")
+                t.feed()
     t.sep()
     t.cols("Artículos:", f"{units:g}")
     items_total = sum(float(i["qty"]) * float(i["unit_price"]) for i in items)
@@ -166,6 +182,49 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.text(s["ticket_footer"].strip(), "C", bold=True)
     t.feed()
     t.barcode(sale["folio"])
+    t.feed(2)
+    return t
+
+
+def build_claim_ticket(claim, item, s):
+    """Comprobante que se entrega al cliente al hacerle un cambio por garantía."""
+    t = Ticket(chars_for_width(s.get("ticket_width", "80")))
+    _store_header(t, s)
+    t.sep("=")
+    t.text("CAMBIO POR GARANTÍA", "C", bold=True, big=True)
+    total = int(item.get("warranty_changes") or 0)
+    if total:
+        t.text(f"Cambio {claim['number']} de {total}", "C", bold=True)
+    if claim.get("forced"):
+        t.text("(autorizado por administrador)", "C")
+    t.sep()
+    t.cols("Fecha:", _fecha(claim["created_at"]))
+    t.cols("Atendió:", claim.get("user_name") or "")
+    t.cols("Nota original:", item["folio"], bold=True)
+    t.cols("Fecha de compra:", _fecha(item["sale_date"]))
+    t.cols("Cliente:", item.get("customer_name") or "Público en general")
+    if item.get("customer_phone"):
+        t.cols("Teléfono:", item["customer_phone"])
+    t.sep()
+    t.text(item["name"], bold=True)
+    if item.get("device_model"):
+        t.cols("Modelo:", item["device_model"])
+    if item.get("device_imei"):
+        t.cols("IMEI:", item["device_imei"])
+    t.cols("Garantía vigente hasta:", _fecha(item["expires"] + " 00:00")[:10])
+    if total:
+        left = max(0, total - claim["number"])
+        t.text(f"Cambios restantes: {left}", "R", bold=True, big=True)
+    if claim.get("notes"):
+        t.text("Motivo: " + claim["notes"])
+    t.sep()
+    t.feed()
+    t.text("Recibí de conformidad", "C")
+    t.feed(2)
+    t.text("_" * min(30, t.width), "C")
+    t.text("Firma del cliente", "C")
+    t.feed()
+    t.barcode(item["folio"])
     t.feed(2)
     return t
 

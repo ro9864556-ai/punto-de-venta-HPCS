@@ -137,6 +137,8 @@ DEFAULT_SETTINGS = {
     "ticket_open_drawer": "0",
     "ticket_copies": "1",
     "ticket_logo": "1",
+    "ticket_change_boxes": "1",
+    "seller_can_charge": "0",
     "label_printer_mode": "local",
     "label_printer_host": "",
     "label_printer_port": "9100",
@@ -227,6 +229,9 @@ MIGRATIONS = [
     ("sales", "device_model", "TEXT DEFAULT ''"),
     ("sales", "device_imei", "TEXT DEFAULT ''"),
     ("sales", "customer_email", "TEXT DEFAULT ''"),
+    ("sales", "sent_at", "TEXT"),
+    ("products", "warranty_changes", "INTEGER NOT NULL DEFAULT 0"),
+    ("sale_items", "warranty_changes", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -246,6 +251,19 @@ def migrate(conn):
         if column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_device_imei ON sales(device_imei)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS warranty_claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sale_id INTEGER NOT NULL REFERENCES sales(id),
+        sale_item_id INTEGER NOT NULL REFERENCES sale_items(id),
+        number INTEGER NOT NULL,
+        product_id INTEGER,
+        took_stock INTEGER NOT NULL DEFAULT 0,
+        forced INTEGER NOT NULL DEFAULT 0,
+        user_id INTEGER,
+        user_name TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        created_at TEXT NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_item ON warranty_claims(sale_item_id)")
 
 
 def get_settings(conn):
