@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Punto de Venta · Celulares</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='8' y='2' width='16' height='28' rx='4' fill='%232563eb'/><rect x='11' y='6' width='10' height='16' rx='1' fill='white'/></svg>">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><rect x="6" y="1.5" width="12" height="21" rx="3" fill="currentColor"/><rect x="8.2" y="4.5" width="7.6" height="12.5" rx="1" fill="#fff"/><circle cx="12" cy="19.6" r="1" fill="#fff"/></svg>
+      <div><strong id="brand-name">Punto de Venta</strong><small>Celulares y accesorios</small></div>
+    </div>
+    <nav id="nav">
+      <a data-view="vender" class="active"><span class="ico">🛒</span>Vender <kbd>F1</kbd></a>
+      <a data-view="productos"><span class="ico">📦</span>Productos</a>
+      <a data-view="etiquetas"><span class="ico">🏷️</span>Etiquetas Zebra</a>
+      <a data-view="inventario"><span class="ico">📥</span>Inventario e IMEI</a>
+      <a data-view="ventas"><span class="ico">🧾</span>Ventas y tickets</a>
+      <a data-view="corte"><span class="ico">💰</span>Corte y reportes</a>
+      <a data-view="config"><span class="ico">⚙️</span>Configuración</a>
+    </nav>
+    <div class="sidebar-foot"><span id="clock"></span></div>
+  </aside>
+
+  <main id="main">
+    <section id="view-vender" class="view active"></section>
+    <section id="view-productos" class="view"></section>
+    <section id="view-etiquetas" class="view"></section>
+    <section id="view-inventario" class="view"></section>
+    <section id="view-ventas" class="view"></section>
+    <section id="view-corte" class="view"></section>
+    <section id="view-config" class="view"></section>
+  </main>
+
+  <div id="modal-root"></div>
+  <div id="toasts"></div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

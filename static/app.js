@@ -1,0 +1,1186 @@
+/* Punto de venta — tienda de celulares y accesorios */
+"use strict";
+
+const S = {
+  settings: {},
+  categories: [],
+  templates: {},
+  rounding: {},
+  cart: [],
+  cartDiscount: 0,
+  customer: { name: "", phone: "" },
+  labelQueue: [],
+  labelSel: 0,
+  view: "vender",
+};
+
+/* ------------------------------------------------------------------ utilidades */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (v) => { const n = parseFloat(String(v ?? "").replace(/[,$\s]/g, "")); return Number.isFinite(n) ? n : 0; };
+const r2 = (v) => Math.round((v + Number.EPSILON) * 100) / 100;
+const money = (v) => (S.settings.currency_symbol || "$") + Number(v || 0).toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const today = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
+const debounce = (fn, ms = 250) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body instanceof FormData) opts.body = body;
+  else if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const res = await fetch(url, opts);
+  const isJson = (res.headers.get("content-type") || "").includes("json");
+  const data = isJson ? await res.json() : await res.text();
+  if (!res.ok) throw new Error((data && data.error) || `Error ${res.status}`);
+  return data;
+}
+const GET = (u) => api("GET", u);
+const POST = (u, b = {}) => api("POST", u, b);
+const PUT = (u, b = {}) => api("PUT", u, b);
+const DEL = (u) => api("DELETE", u);
+
+function toast(msg, kind = "") {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), kind === "bad" ? 6000 : 3200);
+}
+const fail = (e) => toast(e.message || String(e), "bad");
+
+function beep(ok = true) {
+  try {
+    const ctx = beep.ctx || (beep.ctx = new (window.AudioContext || window.webkitAudioContext)());
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = ok ? 1250 : 220; o.type = "square"; g.gain.value = 0.04;
+    o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + (ok ? 0.07 : 0.25));
+  } catch (_) { /* sin audio */ }
+}
+
+function download(filename, text, type = "text/plain") {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+function openTicketWindow(url) {
+  const w = window.open(url, "ticket", "width=420,height=720");
+  if (!w) toast("El navegador bloqueó la ventana del ticket. Permite ventanas emergentes para este sitio.", "bad");
+}
+
+/* ------------------------------------------------------------------ modales */
+function modal({ title, body, foot = "", size = "", onOpen }) {
+  const back = document.createElement("div");
+  back.className = "modal-back";
+  back.innerHTML = `<div class="modal ${size}" role="dialog" aria-modal="true">
+    <div class="modal-head"><h2>${title}</h2><button class="close-x" data-close aria-label="Cerrar">×</button></div>
+    <div class="modal-body">${body}</div>${foot ? `<div class="modal-foot">${foot}</div>` : ""}</div>`;
+  const close = () => { back.remove(); if (S.view === "vender") focusScan(); };
+  back.addEventListener("mousedown", (e) => { if (e.target === back) close(); });
+  back.addEventListener("click", (e) => { if (e.target.closest("[data-close]")) close(); });
+  $("#modal-root").appendChild(back);
+  const m = back.querySelector(".modal");
+  m.close = close;
+  if (onOpen) onOpen(m, close);
+  const first = m.querySelector("[autofocus]") || m.querySelector("input, select, textarea");
+  if (first) setTimeout(() => first.focus(), 30);
+  return m;
+}
+const topModal = () => { const all = $$(".modal-back"); return all.length ? all[all.length - 1].querySelector(".modal") : null; };
+
+function confirmBox(message, okText = "Aceptar", danger = false) {
+  return new Promise((resolve) => {
+    modal({
+      title: "Confirmar", size: "narrow", body: `<p>${message}</p>`,
+      foot: `<button data-close>Cancelar</button><button class="${danger ? "danger" : "primary"}" id="cf-ok">${okText}</button>`,
+      onOpen: (m, close) => {
+        $("#cf-ok", m).onclick = () => { close(); resolve(true); };
+        $$("[data-close]", m).forEach((b) => b.addEventListener("click", () => resolve(false)));
+        setTimeout(() => $("#cf-ok", m).focus(), 40);
+      },
+    });
+  });
+}
+
+function promptBox(title, label, value = "") {
+  return new Promise((resolve) => {
+    modal({
+      title, size: "narrow", body: `<label class="f">${label}<input id="pb-in" value="${esc(value)}" autofocus></label>`,
+      foot: `<button data-close>Cancelar</button><button class="primary" id="pb-ok">Aceptar</button>`,
+      onOpen: (m, close) => {
+        const done = () => { const v = $("#pb-in", m).value; close(); resolve(v); };
+        $("#pb-ok", m).onclick = done;
+        $("#pb-in", m).addEventListener("keydown", (e) => { if (e.key === "Enter") done(); });
+        $$("[data-close]", m).forEach((b) => b.addEventListener("click", () => resolve(null)));
+      },
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ buscador de productos reutilizable */
+function attachProductSearch(input, onPick, { lookupFirst = true, allowFreeEnter = false } = {}) {
+  const box = input.parentElement;
+  let dd = null, results = [], sel = 0;
+  const closeDd = () => { if (dd) { dd.remove(); dd = null; } };
+  const render = () => {
+    closeDd();
+    if (!results.length) return;
+    dd = document.createElement("div");
+    dd.className = "dropdown";
+    dd.innerHTML = results.map((p, i) => `<div class="opt ${i === sel ? "sel" : ""}" data-i="${i}">
+        <div class="grow"><div class="name">${esc(p.name)}</div>
+        <div class="small muted mono">${esc(p.sku)} · ${esc(p.barcode || "")}${p.category_name ? " · " + esc(p.category_name) : ""}</div></div>
+        <span class="badge ${p.track_stock && p.stock <= 0 ? "bad" : p.track_stock && p.stock <= p.min_stock ? "warn" : "ok"}">${p.track_stock ? "Exist. " + Number(p.stock) : "Servicio"}</span>
+        <b class="nowrap">${money(p.price)}</b></div>`).join("");
+    dd.addEventListener("mousedown", (e) => {
+      const o = e.target.closest(".opt"); if (!o) return;
+      e.preventDefault(); pick(results[+o.dataset.i], null);
+    });
+    box.appendChild(dd);
+  };
+  const pick = (p, imei) => { closeDd(); results = []; input.value = ""; onPick(p, imei); };
+  const search = debounce(async () => {
+    const q = input.value.trim();
+    if (q.length < 2) { results = []; closeDd(); return; }
+    try { results = await GET(`/api/products?limit=15&q=${encodeURIComponent(q)}`); sel = 0; render(); } catch (e) { fail(e); }
+  }, 200);
+  input.addEventListener("input", search);
+  input.addEventListener("blur", () => setTimeout(closeDd, 150));
+  input.addEventListener("keydown", async (e) => {
+    if (e.key === "ArrowDown" && results.length) { e.preventDefault(); sel = (sel + 1) % results.length; render(); }
+    else if (e.key === "ArrowUp" && results.length) { e.preventDefault(); sel = (sel - 1 + results.length) % results.length; render(); }
+    else if (e.key === "Escape") { closeDd(); }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      const code = input.value.trim();
+      if (!code) return;
+      if (dd && results[sel] && !lookupFirst) return pick(results[sel], null);
+      if (lookupFirst) {
+        try {
+          const r = await GET(`/api/lookup?code=${encodeURIComponent(code)}`);
+          beep(true);
+          return pick(r.product, r.imei);
+        } catch (err) {
+          if (dd && results[sel]) return pick(results[sel], null);
+          try {
+            const list = await GET(`/api/products?limit=15&q=${encodeURIComponent(code)}`);
+            if (list.length === 1) return pick(list[0], null);
+            if (list.length) { results = list; sel = 0; render(); return; }
+          } catch (_) { /* ignorar */ }
+          beep(false);
+          if (allowFreeEnter) return onPick(null, null, code);
+          fail(err);
+          input.select();
+        }
+      }
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ navegación */
+const VIEWS = {};
+function go(view) {
+  S.view = view;
+  $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === view));
+  $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${view}`));
+  VIEWS[view]?.();
+}
+$$("#nav a").forEach((a) => a.addEventListener("click", () => go(a.dataset.view)));
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { const m = topModal(); if (m) { e.preventDefault(); m.close(); } return; }
+  if (e.key === "F1") { e.preventDefault(); go("vender"); }
+  if (S.view === "vender" && !topModal()) {
+    if (e.key === "F2") { e.preventDefault(); checkout(); }
+    if (e.key === "F4") { e.preventDefault(); focusScan(); }
+  }
+});
+
+async function loadBase() {
+  const s = await GET("/api/settings");
+  S.settings = s.settings; S.templates = s.label_templates; S.rounding = s.rounding_modes;
+  S.categories = await GET("/api/categories");
+  $("#brand-name").textContent = S.settings.store_name || "Punto de Venta";
+  document.title = `${S.settings.store_name || "Punto de Venta"} · POS`;
+}
+const catOptions = (selected, blank = "Sin categoría") =>
+  `<option value="">${blank}</option>` + S.categories.map((c) => `<option value="${c.id}" ${String(c.id) === String(selected) ? "selected" : ""}>${esc(c.name)}</option>`).join("");
+const roundingOptions = (selected) => Object.entries(S.rounding).map(([k, v]) => `<option value="${k}" ${k === String(selected) ? "selected" : ""}>${esc(v)}</option>`).join("");
+const templateOptions = (selected) => Object.entries(S.templates).map(([k, v]) => `<option value="${k}" ${k === selected ? "selected" : ""}>${esc(v.name)}</option>`).join("");
+
+/* ================================================================== VENDER */
+function saveCart() { try { localStorage.setItem("pos-cart", JSON.stringify({ cart: S.cart, d: S.cartDiscount, c: S.customer })); } catch (_) { /* */ } }
+function loadCart() { try { const v = JSON.parse(localStorage.getItem("pos-cart") || "null"); if (v) { S.cart = v.cart || []; S.cartDiscount = v.d || 0; S.customer = v.c || { name: "", phone: "" }; } } catch (_) { /* */ } }
+const focusScan = () => setTimeout(() => $("#scan")?.focus(), 20);
+
+function initVender() {
+  const el = $("#view-vender");
+  el.innerHTML = `
+  <div class="pos">
+    <div>
+      <div class="search-box"><span class="scan-ico">🔎</span>
+        <input id="scan" class="scan" autocomplete="off" placeholder="Escanea código de barras / IMEI, o escribe para buscar  (F4)">
+      </div>
+      <div class="card cart" style="padding:0">
+        <div class="table-wrap" style="max-height:calc(100vh - 190px);border:0">
+          <table><thead><tr><th>Producto</th><th class="num">Precio</th><th class="center">Cant.</th><th class="num">Desc. $</th><th class="num">Importe</th><th></th></tr></thead>
+          <tbody id="cart-body"></tbody></table>
+        </div>
+      </div>
+    </div>
+    <div class="card totals">
+      <div class="line"><span>Artículos</span><b id="t-units">0</b></div>
+      <div class="line"><span>Importe</span><span id="t-sub">$0.00</span></div>
+      <div class="line"><span>Descuentos por producto</span><span id="t-ldisc">$0.00</span></div>
+      <div class="line"><span>Descuento general $</span><input id="t-disc" style="width:110px;text-align:right;padding:4px 8px" value="0"></div>
+      <div class="line muted small"><span id="t-tax-l">IVA incluido</span><span id="t-tax">$0.00</span></div>
+      <div class="grand"><span>TOTAL</span><span id="t-total">$0.00</span></div>
+      <div class="grid" style="gap:8px;margin-bottom:12px">
+        <input id="cust-name" placeholder="Cliente (opcional)">
+        <input id="cust-phone" placeholder="Teléfono / WhatsApp (opcional)">
+      </div>
+      <button class="success big-btn" id="btn-pay">💵 Cobrar <kbd style="border-color:#fff">F2</kbd></button>
+      <div class="row" style="margin-top:8px">
+        <button class="danger" id="btn-clear" style="flex:1">Vaciar ticket</button>
+        <button id="btn-last" style="flex:1">Último ticket</button>
+      </div>
+      <p class="small muted" style="margin:12px 0 0">Tip: con el lector de códigos escanea directo; Enter agrega. Los celulares se agregan escaneando su IMEI.</p>
+    </div>
+  </div>`;
+  loadCart();
+  $("#cust-name").value = S.customer.name || "";
+  $("#cust-phone").value = S.customer.phone || "";
+  $("#cust-name").oninput = (e) => { S.customer.name = e.target.value; saveCart(); };
+  $("#cust-phone").oninput = (e) => { S.customer.phone = e.target.value; saveCart(); };
+  $("#t-disc").oninput = (e) => { S.cartDiscount = num(e.target.value); saveCart(); renderTotals(); };
+  $("#btn-pay").onclick = checkout;
+  $("#btn-clear").onclick = async () => { if (S.cart.length && await confirmBox("¿Vaciar el ticket actual?", "Vaciar", true)) { clearCart(); } };
+  $("#btn-last").onclick = async () => {
+    try { const list = await GET(`/api/sales?from=2000-01-01&to=2999-12-31`); if (!list.length) return toast("Aún no hay ventas"); showSale(list[0].id); } catch (e) { fail(e); }
+  };
+  attachProductSearch($("#scan"), addToCart);
+  renderCart();
+}
+
+function clearCart() {
+  S.cart = []; S.cartDiscount = 0; S.customer = { name: "", phone: "" };
+  $("#t-disc").value = "0"; $("#cust-name").value = ""; $("#cust-phone").value = "";
+  saveCart(); renderCart(); focusScan();
+}
+
+async function addToCart(p, imei) {
+  if (!p) return;
+  if (p.serialized && !imei) {
+    imei = await pickImei(p);
+    if (!imei) return;
+  }
+  if (imei) {
+    if (S.cart.some((l) => l.imei === imei)) { beep(false); return toast(`El IMEI ${imei} ya está en el ticket`, "bad"); }
+    S.cart.push({ key: `${p.id}-${imei}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei, serialized: 1, stock: 1, track_stock: 1 });
+  } else {
+    const line = S.cart.find((l) => l.product_id === p.id && !l.imei);
+    if (line) line.qty += 1;
+    else S.cart.push({ key: `${p.id}`, product_id: p.id, name: p.name, sku: p.sku, price: p.price, qty: 1, discount: 0, imei: "", serialized: 0, stock: p.stock, track_stock: p.track_stock });
+    const l = S.cart.find((x) => x.product_id === p.id && !x.imei);
+    if (p.track_stock && l.qty > p.stock && S.settings.allow_negative_stock !== "1") toast(`Atención: solo hay ${Number(p.stock)} en existencia de ${p.name}`, "bad");
+  }
+  saveCart(); renderCart(); focusScan();
+}
+
+function pickImei(p) {
+  return new Promise(async (resolve) => {
+    let detail;
+    try { detail = await GET(`/api/products/${p.id}`); } catch (e) { fail(e); return resolve(null); }
+    const avail = detail.serials.filter((s) => s.status === "disponible" && !S.cart.some((l) => l.imei === s.imei));
+    if (!avail.length) { toast(`No hay equipos disponibles de ${p.name}. Registra IMEIs en Inventario.`, "bad"); return resolve(null); }
+    let done = false;
+    modal({
+      title: `Selecciona el IMEI — ${esc(p.name)}`, size: "narrow",
+      body: `<label class="f">Escanea el IMEI de la caja<input id="imei-in" autofocus placeholder="IMEI"></label>
+        <div class="table-wrap" style="margin-top:12px;max-height:300px"><table><tbody>
+        ${avail.map((s) => `<tr><td class="mono">${esc(s.imei)}</td><td class="right"><button class="sm primary" data-imei="${esc(s.imei)}">Elegir</button></td></tr>`).join("")}
+        </tbody></table></div>`,
+      onOpen: (m, close) => {
+        const choose = (v) => { done = true; close(); resolve(v); };
+        m.addEventListener("click", (e) => { const b = e.target.closest("[data-imei]"); if (b) choose(b.dataset.imei); });
+        $("#imei-in", m).addEventListener("keydown", (e) => {
+          if (e.key !== "Enter") return;
+          const v = e.target.value.trim();
+          if (avail.some((s) => s.imei === v)) choose(v); else { beep(false); toast("Ese IMEI no está disponible para este modelo", "bad"); e.target.select(); }
+        });
+        const obs = new MutationObserver(() => { if (!document.body.contains(m) && !done) { obs.disconnect(); resolve(null); } });
+        obs.observe($("#modal-root"), { childList: true });
+      },
+    });
+  });
+}
+
+function cartTotals() {
+  const gross = S.cart.reduce((a, l) => a + l.qty * l.price, 0);
+  const ldisc = S.cart.reduce((a, l) => a + num(l.discount), 0);
+  const sub = r2(gross - ldisc);
+  const disc = Math.min(num(S.cartDiscount), sub);
+  const rate = num(S.settings.tax_rate) / 100;
+  let total, tax;
+  if (S.settings.prices_include_tax !== "0") { total = r2(sub - disc); tax = rate ? r2(total - total / (1 + rate)) : 0; }
+  else { tax = r2((sub - disc) * rate); total = r2(sub - disc + tax); }
+  return { gross: r2(gross), ldisc: r2(ldisc), sub, disc, tax, total, units: S.cart.reduce((a, l) => a + l.qty, 0) };
+}
+
+function renderTotals() {
+  const t = cartTotals();
+  $("#t-units").textContent = t.units;
+  $("#t-sub").textContent = money(t.gross);
+  $("#t-ldisc").textContent = (t.ldisc ? "-" : "") + money(t.ldisc);
+  $("#t-tax-l").textContent = S.settings.prices_include_tax !== "0" ? `IVA incluido (${num(S.settings.tax_rate)}%)` : `IVA ${num(S.settings.tax_rate)}%`;
+  $("#t-tax").textContent = money(t.tax);
+  $("#t-total").textContent = money(t.total);
+  $("#btn-pay").disabled = !S.cart.length;
+}
+
+function renderCart() {
+  const body = $("#cart-body");
+  if (!S.cart.length) {
+    body.innerHTML = `<tr><td colspan="6" class="empty">🛒 Ticket vacío. Escanea un producto para comenzar.</td></tr>`;
+  } else {
+    body.innerHTML = S.cart.map((l, i) => `<tr data-i="${i}">
+      <td><div class="pname">${esc(l.name)}</div><div class="small muted mono">${esc(l.sku)}${l.imei ? ` · <span class="badge info">IMEI ${esc(l.imei)}</span>` : ""}</div></td>
+      <td class="num"><input data-f="price" value="${l.price}" style="width:96px"></td>
+      <td class="center"><span class="qty">${l.imei ? "1" : `<button class="sm icon-btn" data-a="dec">−</button><input data-f="qty" value="${l.qty}"><button class="sm icon-btn" data-a="inc">+</button>`}</span></td>
+      <td class="num"><input data-f="discount" value="${l.discount || 0}" style="width:80px"></td>
+      <td class="num"><b>${money(l.qty * l.price - num(l.discount))}</b></td>
+      <td><button class="sm danger icon-btn" data-a="del" title="Quitar">✕</button></td></tr>`).join("");
+  }
+  renderTotals();
+}
+
+document.addEventListener("change", (e) => {
+  const inp = e.target.closest("#cart-body input[data-f]");
+  if (!inp) return;
+  const l = S.cart[+inp.closest("tr").dataset.i];
+  const v = num(inp.value);
+  if (inp.dataset.f === "qty") l.qty = Math.max(1, v);
+  else l[inp.dataset.f] = Math.max(0, v);
+  saveCart(); renderCart();
+});
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("#cart-body [data-a]");
+  if (!b) return;
+  const i = +b.closest("tr").dataset.i;
+  if (b.dataset.a === "del") S.cart.splice(i, 1);
+  if (b.dataset.a === "inc") S.cart[i].qty += 1;
+  if (b.dataset.a === "dec") S.cart[i].qty = Math.max(1, S.cart[i].qty - 1);
+  saveCart(); renderCart();
+});
+
+function checkout() {
+  if (!S.cart.length) return toast("El ticket está vacío");
+  if (topModal()) return;
+  const t = cartTotals();
+  let method = "efectivo";
+  modal({
+    title: `Cobrar ${money(t.total)}`, size: "narrow",
+    body: `<div class="pay-methods">
+        <button data-m="efectivo" class="on">💵 Efectivo</button><button data-m="tarjeta">💳 Tarjeta</button>
+        <button data-m="transferencia">🏦 Transf.</button><button data-m="mixto">➗ Mixto</button></div>
+      <div id="pm-efectivo">
+        <label class="f">Recibido en efectivo<input id="pay-recv" inputmode="decimal" value="${t.total}" style="font-size:22px;font-weight:700;text-align:right"></label>
+        <div class="bills">${[t.total, 50, 100, 200, 500, 1000].map((b, i) => `<button class="sm" data-bill="${b}">${i === 0 ? "Exacto" : money(b).replace(".00", "")}</button>`).join("")}</div>
+      </div>
+      <div id="pm-mixto" class="hidden grid" style="gap:8px">
+        <label class="f">Efectivo<input id="mx-cash" inputmode="decimal" value="0"></label>
+        <label class="f">Tarjeta<input id="mx-card" inputmode="decimal" value="0"></label>
+        <label class="f">Transferencia<input id="mx-tr" inputmode="decimal" value="0"></label>
+      </div>
+      <div class="change-box" id="chg"><span>Cambio</span><b id="chg-v">$0.00</b></div>
+      <label class="f" style="margin-top:12px">Notas del ticket (opcional)<input id="pay-notes" placeholder="p. ej. apartado, garantía extendida…"></label>
+      <label class="chk small" style="margin-top:10px"><input type="checkbox" id="pay-print" checked> Imprimir ticket</label>`,
+    foot: `<button data-close>Cancelar</button><button class="success" id="pay-ok">✔ Confirmar venta (Enter)</button>`,
+    onOpen: (m, close) => {
+      const recalc = () => {
+        let paid = method === "efectivo" ? num($("#pay-recv", m).value) : method === "mixto" ? num($("#mx-cash", m).value) + num($("#mx-card", m).value) + num($("#mx-tr", m).value) : t.total;
+        const chg = r2(paid - t.total);
+        $("#chg", m).classList.toggle("bad", chg < 0);
+        $("#chg", m).firstElementChild.textContent = chg < 0 ? "Falta" : "Cambio";
+        $("#chg-v", m).textContent = money(Math.abs(chg));
+      };
+      $$("[data-m]", m).forEach((b) => b.onclick = () => {
+        method = b.dataset.m;
+        $$("[data-m]", m).forEach((x) => x.classList.toggle("on", x === b));
+        $("#pm-efectivo", m).classList.toggle("hidden", method !== "efectivo");
+        $("#pm-mixto", m).classList.toggle("hidden", method !== "mixto");
+        if (method === "efectivo") $("#pay-recv", m).select();
+        if (method === "mixto") $("#mx-cash", m).select();
+        recalc();
+      });
+      $$("[data-bill]", m).forEach((b) => b.onclick = () => { $("#pay-recv", m).value = b.dataset.bill; recalc(); });
+      m.addEventListener("input", recalc);
+      setTimeout(() => $("#pay-recv", m).select(), 50);
+      let busy = false;
+      const confirm = async () => {
+        if (busy) return; busy = true;
+        $("#pay-ok", m).disabled = true;
+        const payload = {
+          items: S.cart.map((l) => ({ product_id: l.product_id, qty: l.qty, unit_price: l.price, discount: num(l.discount), imei: l.imei })),
+          discount: t.disc, payment_method: method,
+          received: method === "efectivo" ? num($("#pay-recv", m).value) : t.total,
+          paid_cash: num($("#mx-cash", m).value), paid_card: num($("#mx-card", m).value), paid_transfer: num($("#mx-tr", m).value),
+          customer_name: S.customer.name, customer_phone: S.customer.phone, notes: $("#pay-notes", m).value,
+          print: $("#pay-print", m).checked,
+        };
+        const browserPrint = payload.print && S.settings.ticket_printer_mode === "browser";
+        const win = browserPrint ? window.open("about:blank", "ticket", "width=420,height=720") : null;
+        try {
+          const r = await POST("/api/sales", payload);
+          close();
+          clearCart();
+          if (win) win.location = `/tickets/${r.sale.id}?print=1`;
+          if (r.print_error) toast(`Venta guardada, pero no se imprimió: ${r.print_error}`, "bad");
+          else if (r.print?.message) toast(r.print.message, "ok");
+          saleDone(r.sale);
+        } catch (e) {
+          if (win) win.close();
+          fail(e); busy = false; $("#pay-ok", m).disabled = false;
+        }
+      };
+      $("#pay-ok", m).onclick = confirm;
+      m.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.id !== "pay-notes") { e.preventDefault(); confirm(); } });
+      recalc();
+    },
+  });
+}
+
+function saleDone(sale) {
+  modal({
+    title: "✅ Venta registrada", size: "narrow",
+    body: `<div class="center"><div class="muted">Folio</div><h1 class="mono">${esc(sale.folio)}</h1>
+      <div style="margin-top:12px" class="muted">Total</div><h1>${money(sale.total)}</h1>
+      ${sale.change > 0 ? `<div class="change-box" style="margin-top:14px"><span>Cambio</span><b>${money(sale.change)}</b></div>` : ""}</div>`,
+    foot: `<button id="sd-print">🖨 Reimprimir</button><button id="sd-view">Ver ticket</button><button class="primary" data-close autofocus>Nueva venta (Esc)</button>`,
+    onOpen: (m) => {
+      $("#sd-print", m).onclick = () => printSale(sale.id);
+      $("#sd-view", m).onclick = () => showSale(sale.id);
+      setTimeout(() => m.querySelector(".primary").focus(), 50);
+    },
+  });
+}
+
+async function printSale(id) {
+  if (S.settings.ticket_printer_mode === "browser") return openTicketWindow(`/tickets/${id}?print=1&reprint=1`);
+  try { const r = await POST(`/api/sales/${id}/print`); toast(r.message || "Ticket enviado", "ok"); } catch (e) { fail(e); }
+}
+
+async function showSale(id) {
+  let s;
+  try { s = await GET(`/api/sales/${id}`); } catch (e) { return fail(e); }
+  modal({
+    title: `Venta ${esc(s.folio)} ${s.status === "cancelada" ? '<span class="badge bad">Cancelada</span>' : ""}`, size: "wide",
+    body: `<div class="grid cols-2"><div>
+        <table><tbody>
+          <tr><td class="muted">Fecha</td><td>${esc(s.created_at)}</td></tr>
+          <tr><td class="muted">Cliente</td><td>${esc(s.customer_name || "—")} ${esc(s.customer_phone || "")}</td></tr>
+          <tr><td class="muted">Pago</td><td>${esc(s.payment_method)}</td></tr>
+          <tr><td class="muted">Total</td><td><b>${money(s.total)}</b></td></tr>
+          <tr><td class="muted">Utilidad</td><td>${money(s.total - s.cost_total)}</td></tr>
+          ${s.notes ? `<tr><td class="muted">Notas</td><td>${esc(s.notes)}</td></tr>` : ""}
+        </tbody></table>
+        <h3 style="margin:16px 0 6px">Artículos</h3>
+        <table><thead><tr><th>Producto</th><th class="num">Cant.</th><th class="num">Importe</th></tr></thead><tbody>
+          ${s.items.map((i) => `<tr><td>${esc(i.name)}<div class="small muted mono">${esc(i.sku || "")} ${i.imei ? "· IMEI " + esc(i.imei) : ""}</div></td><td class="num">${i.qty}</td><td class="num">${money(i.total)}</td></tr>`).join("")}
+        </tbody></table></div>
+      <div><iframe class="ticket" src="/tickets/${s.id}"></iframe>
+        <div class="row small" style="margin-top:6px">Descargar: <a href="/tickets/${s.id}?format=zpl">ZPL (Zebra)</a> · <a href="/tickets/${s.id}?format=escpos">ESC/POS</a> · <a href="/tickets/${s.id}?format=txt" target="_blank">Texto</a></div></div></div>`,
+    foot: `${s.status !== "cancelada" ? '<button class="danger" id="sv-cancel">Cancelar venta</button><span class="spacer"></span>' : ""}
+           <button id="sv-print">🖨 Reimprimir ticket</button><button data-close class="primary">Cerrar</button>`,
+    onOpen: (m, close) => {
+      $("#sv-print", m).onclick = () => printSale(s.id);
+      const c = $("#sv-cancel", m);
+      if (c) c.onclick = async () => {
+        const reason = await promptBox("Cancelar venta", "Motivo de la cancelación (regresa el producto al inventario)");
+        if (reason === null) return;
+        try { await POST(`/api/sales/${s.id}/cancel`, { reason }); toast("Venta cancelada; inventario restaurado", "ok"); close(); if (S.view === "ventas") VIEWS.ventas(); } catch (e) { fail(e); }
+      };
+    },
+  });
+}
+
+VIEWS.vender = () => { renderTotals(); focusScan(); };
+
+/* ================================================================== PRODUCTOS */
+function initProductos() {
+  $("#view-productos").innerHTML = `
+    <div class="view-head"><h1>Productos</h1>
+      <button id="p-bulk">💲 Generador de precios</button>
+      <button id="p-import">⬆ Importar CSV</button>
+      <a class="btn" href="/api/products/export.csv">⬇ Exportar CSV</a>
+      <button class="primary" id="p-new">＋ Nuevo producto</button></div>
+    <div class="row" style="margin-bottom:12px">
+      <input id="p-q" placeholder="Buscar por nombre, marca, SKU, código o IMEI…" style="max-width:420px">
+      <select id="p-cat" style="max-width:240px"></select>
+      <label class="chk"><input type="checkbox" id="p-low"> Solo existencia baja</label>
+      <span class="spacer"></span><span class="muted small" id="p-count"></span>
+    </div>
+    <div class="table-wrap"><table><thead><tr>
+      <th>SKU</th><th>Código</th><th>Producto</th><th>Categoría</th><th class="num">Costo</th><th class="num">Precio</th><th class="num">Margen</th><th class="num">Exist.</th><th></th>
+    </tr></thead><tbody id="p-body"></tbody></table></div>`;
+  $("#p-new").onclick = () => productForm();
+  $("#p-bulk").onclick = bulkPricing;
+  $("#p-import").onclick = importCsv;
+  $("#p-q").oninput = debounce(loadProducts, 250);
+  $("#p-cat").onchange = loadProducts;
+  $("#p-low").onchange = loadProducts;
+  $("#p-body").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-a]"); if (!b) return;
+    const id = +b.closest("tr").dataset.id;
+    if (b.dataset.a === "edit") productForm(id);
+    if (b.dataset.a === "label") { await addToLabelQueue(id); go("etiquetas"); }
+    if (b.dataset.a === "imei") imeiManager(id);
+    if (b.dataset.a === "del") {
+      if (!await confirmBox("¿Eliminar este producto? Si tiene ventas solo se desactiva.", "Eliminar", true)) return;
+      try { const r = await DEL(`/api/products/${id}`); toast(r.message, "ok"); loadProducts(); } catch (er) { fail(er); }
+    }
+  });
+}
+
+async function loadProducts() {
+  const q = $("#p-q").value.trim(), cat = $("#p-cat").value, low = $("#p-low").checked ? 1 : 0;
+  try {
+    const list = await GET(`/api/products?q=${encodeURIComponent(q)}&category=${cat}&low=${low}`);
+    $("#p-count").textContent = `${list.length} producto(s)`;
+    $("#p-body").innerHTML = list.length ? list.map((p) => {
+      const margin = p.price ? ((p.price - p.cost) / p.price) * 100 : 0;
+      const st = !p.track_stock ? '<span class="badge">N/A</span>' : `<span class="badge ${p.stock <= 0 ? "bad" : p.stock <= p.min_stock ? "warn" : "ok"}">${Number(p.stock)}</span>`;
+      return `<tr data-id="${p.id}">
+        <td class="mono small">${esc(p.sku)}</td><td class="mono small">${esc(p.barcode || "")}</td>
+        <td><b>${esc(p.name)}</b>${p.serialized ? ' <span class="badge info">IMEI</span>' : ""}<div class="small muted">${esc([p.brand, p.model, p.capacity, p.color].filter(Boolean).join(" · "))}</div></td>
+        <td>${esc(p.category_name || "—")}</td><td class="num">${money(p.cost)}</td><td class="num"><b>${money(p.price)}</b></td>
+        <td class="num ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num">${st}</td>
+        <td><button class="sm" data-a="edit">Editar</button> <button class="sm" data-a="label">🏷️</button>
+          ${p.serialized ? '<button class="sm" data-a="imei">IMEI</button>' : ""} <button class="sm danger icon-btn" data-a="del" title="Eliminar">✕</button></td></tr>`;
+    }).join("") : `<tr><td colspan="9" class="empty">No hay productos. Da clic en “Nuevo producto” o importa un CSV.</td></tr>`;
+  } catch (e) { fail(e); }
+}
+
+VIEWS.productos = () => {
+  const sel = $("#p-cat"), v = sel.value;
+  sel.innerHTML = catOptions(v, "Todas las categorías");
+  loadProducts();
+};
+
+async function productForm(id) {
+  let p = { name: "", brand: "", model: "", color: "", capacity: "", category_id: "", sku: "", barcode: "", cost: "", price: "", wholesale_price: "",
+    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "" };
+  if (id) { try { p = await GET(`/api/products/${id}`); } catch (e) { return fail(e); } }
+  const cat = S.categories.find((c) => String(c.id) === String(p.category_id));
+  const isNew = !id;
+  modal({
+    title: isNew ? "Nuevo producto" : `Editar: ${esc(p.name)}`, size: "wide",
+    body: `<form id="pf" class="form-grid" autocomplete="off">
+      <label class="f span-2">Nombre del producto *<input name="name" value="${esc(p.name)}" required autofocus placeholder="p. ej. Funda uso rudo Galaxy A15 negra"></label>
+      <label class="f">Categoría<select name="category_id">${catOptions(p.category_id)}</select></label>
+      <label class="f">Marca<input name="brand" value="${esc(p.brand)}" placeholder="Samsung, Apple, Xiaomi…" list="dl-brands"></label>
+      <label class="f">Modelo<input name="model" value="${esc(p.model)}" placeholder="Galaxy A15, iPhone 13…"></label>
+      <label class="f">Capacidad / medida<input name="capacity" value="${esc(p.capacity)}" placeholder="128GB, 20W, 1m…"></label>
+      <label class="f">Color<input name="color" value="${esc(p.color)}"></label>
+      <label class="f">Ubicación<input name="location" value="${esc(p.location)}" placeholder="Vitrina 2, bodega…"></label>
+      <label class="f span-2">SKU (vacío = automático)<div class="input-group"><input name="sku" value="${esc(p.sku)}" class="mono" placeholder="Se genera: CAT-MAR-0001"><button type="button" id="gen-sku">Generar</button></div></label>
+      <label class="f span-2">Código de barras (escanea el del fabricante o genera uno)<div class="input-group"><input name="barcode" value="${esc(p.barcode)}" class="mono" placeholder="Vacío = EAN-13 interno automático"><button type="button" id="gen-bc">Generar EAN-13</button></div></label>
+      <fieldset class="span-all price-gen" style="grid-column:1/-1"><legend>💲 Generador de precio</legend>
+        <div class="form-grid">
+          <label class="f">Costo de compra<input name="cost" inputmode="decimal" value="${p.cost}"></label>
+          <label class="f">% de ganancia sobre costo<input id="pg-markup" inputmode="decimal" value="${cat ? cat.markup : num(S.settings.default_markup)}"></label>
+          <label class="f">Redondeo<select id="pg-round">${roundingOptions(S.settings.price_rounding)}</select></label>
+          <label class="f">&nbsp;<label class="chk"><input type="checkbox" id="pg-tax" checked> El costo ya incluye IVA</label></label>
+        </div>
+        <div class="suggest"><span>Precio sugerido:</span><b id="pg-price">—</b><span class="muted small" id="pg-info"></span><span class="spacer"></span><button type="button" class="primary sm" id="pg-use">Usar este precio</button></div>
+        <div class="form-grid" style="margin-top:12px">
+          <label class="f">Precio de venta (público) *<input name="price" inputmode="decimal" value="${p.price}" style="font-weight:700;font-size:16px"></label>
+          <label class="f">Precio mayoreo<input name="wholesale_price" inputmode="decimal" value="${p.wholesale_price || ""}"></label>
+          <label class="f span-2">Margen real<div id="pg-real" style="padding:9px 0;font-weight:600">—</div></label>
+        </div>
+      </fieldset>
+      <fieldset style="grid-column:1/-1"><legend>📦 Inventario y garantía</legend>
+        <div class="form-grid">
+          <label class="chk"><input type="checkbox" name="serialized" ${p.serialized ? "checked" : ""}> Maneja IMEI / número de serie</label>
+          <label class="chk"><input type="checkbox" name="track_stock" ${p.track_stock ? "checked" : ""}> Controla existencia</label>
+          <label class="f">Existencia mínima<input name="min_stock" inputmode="decimal" value="${p.min_stock}"></label>
+          <label class="f">Garantía (días)<input name="warranty_days" inputmode="numeric" value="${p.warranty_days}"></label>
+          ${isNew ? `<label class="f span-2" id="f-initial">Existencia inicial<input name="initial_stock" inputmode="decimal" value="0"></label>
+          <label class="f span-all hidden" id="f-imeis">IMEIs iniciales (uno por renglón; escanéalos)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia actual: <b>${Number(p.stock)}</b> — ajústala en Inventario.</div>`}
+          <label class="f span-all">Notas<input name="notes" value="${esc(p.notes)}"></label>
+        </div>
+      </fieldset>
+      <datalist id="dl-brands">${["Samsung", "Apple", "Xiaomi", "Motorola", "Huawei", "Honor", "Oppo", "Realme", "ZTE", "Alcatel", "Nokia", "Vivo", "Infinix", "Tecno", "Genérico"].map((b) => `<option value="${b}">`).join("")}</datalist>
+      </form>`,
+    foot: `<button data-close>Cancelar</button>${isNew ? '<button id="pf-save-label">Guardar e imprimir etiqueta</button>' : ""}<button class="primary" id="pf-save">Guardar</button>`,
+    onOpen: (m, close) => {
+      const f = $("#pf", m);
+      const val = (n) => f.elements[n];
+      const toggleSerial = () => {
+        const ser = val("serialized").checked;
+        $("#f-initial", m)?.classList.toggle("hidden", ser);
+        $("#f-imeis", m)?.classList.toggle("hidden", !ser);
+        if (ser) val("track_stock").checked = true;
+      };
+      val("serialized").onchange = toggleSerial;
+      toggleSerial();
+      val("category_id").onchange = () => {
+        const c = S.categories.find((x) => String(x.id) === val("category_id").value);
+        if (c) { $("#pg-markup", m).value = c.markup; if (isNew) { val("serialized").checked = !!c.serialized; toggleSerial(); val("track_stock").checked = c.prefix !== "SRV"; } }
+        suggest();
+      };
+      let suggested = null;
+      const suggest = debounce(async () => {
+        const cost = num(val("cost").value);
+        if (!cost) { $("#pg-price", m).textContent = "—"; $("#pg-info", m).textContent = "Captura el costo"; suggested = null; realMargin(); return; }
+        try {
+          const r = await POST("/api/pricing/suggest", { cost, markup: num($("#pg-markup", m).value), rounding: $("#pg-round", m).value, cost_includes_tax: $("#pg-tax", m).checked });
+          suggested = r.price;
+          $("#pg-price", m).textContent = money(r.price);
+          $("#pg-info", m).textContent = `Ganancia ${money(r.profit)} · margen ${r.margin_percent}% del precio`;
+          if (!num(val("price").value)) val("price").value = r.price;
+        } catch (e) { fail(e); }
+        realMargin();
+      }, 200);
+      const realMargin = () => {
+        const cost = num(val("cost").value), price = num(val("price").value);
+        $("#pg-real", m).innerHTML = price ? `${money(price - cost)} de ganancia · <span class="${(price - cost) / price < 0.15 ? "danger" : ""}">${(((price - cost) / price) * 100).toFixed(1)}%</span> del precio` : "—";
+      };
+      ["cost"].forEach((n) => val(n).addEventListener("input", suggest));
+      ["pg-markup", "pg-round", "pg-tax"].forEach((idn) => $("#" + idn, m).addEventListener(idn === "pg-markup" ? "input" : "change", suggest));
+      val("price").addEventListener("input", realMargin);
+      $("#pg-use", m).onclick = () => { if (suggested) { val("price").value = suggested; realMargin(); } };
+      $("#gen-sku", m).onclick = async () => {
+        try { val("sku").value = (await GET(`/api/products/next-sku?category_id=${val("category_id").value}&brand=${encodeURIComponent(val("brand").value)}`)).sku; } catch (e) { fail(e); }
+      };
+      $("#gen-bc", m).onclick = async () => { try { val("barcode").value = (await GET("/api/products/new-barcode")).barcode; } catch (e) { fail(e); } };
+      suggest();
+      const save = async (thenLabel) => {
+        const data = Object.fromEntries(new FormData(f).entries());
+        data.serialized = val("serialized").checked ? 1 : 0;
+        data.track_stock = val("track_stock").checked ? 1 : 0;
+        if (!data.name.trim()) return toast("Escribe el nombre del producto", "bad");
+        if (!num(data.price) && !await confirmBox("El precio de venta está en $0. ¿Guardar así?")) return;
+        try {
+          const saved = isNew ? await POST("/api/products", data) : await PUT(`/api/products/${id}`, data);
+          toast(`Guardado: ${saved.sku}`, "ok");
+          close();
+          if (S.view === "productos") loadProducts();
+          if (thenLabel) {
+            const qty = saved.serialized ? 1 : Math.max(1, Number(saved.stock) || 1);
+            await addToLabelQueue(saved.id, qty, !!saved.serialized);
+            go("etiquetas");
+          }
+        } catch (e) { fail(e); }
+      };
+      $("#pf-save", m).onclick = () => save(false);
+      const sl = $("#pf-save-label", m); if (sl) sl.onclick = () => save(true);
+      f.addEventListener("submit", (e) => { e.preventDefault(); save(false); });
+    },
+  });
+}
+
+async function imeiManager(id) {
+  let p;
+  try { p = await GET(`/api/products/${id}`); } catch (e) { return fail(e); }
+  modal({
+    title: `IMEI — ${esc(p.name)}`, size: "wide",
+    body: `<div class="grid cols-2">
+      <div><label class="f">Agregar IMEIs (escanea uno por renglón)<textarea id="im-new" class="mono" style="min-height:180px" autofocus></textarea></label>
+        <div class="row" style="margin-top:8px"><button class="primary" id="im-add">Agregar al inventario</button>
+        <label class="chk small"><input type="checkbox" id="im-print" checked> Mandar a etiquetas</label></div></div>
+      <div><h3 style="margin-bottom:8px">Registrados (${p.serials.length}) — disponibles: ${p.serials.filter((s) => s.status === "disponible").length}</h3>
+        <div class="table-wrap" style="max-height:320px"><table><tbody>
+        ${p.serials.map((s) => `<tr data-sid="${s.id}"><td class="mono">${esc(s.imei)}</td>
+          <td>${s.status === "disponible" ? '<span class="badge ok">Disponible</span>' : `<span class="badge">Vendido ${esc(s.folio || "")}</span>`}</td>
+          <td class="right">${s.status === "disponible" ? `<button class="sm" data-a="lbl" data-imei="${esc(s.imei)}">🏷️</button> <button class="sm danger" data-a="del">✕</button>` : ""}</td></tr>`).join("") || '<tr><td class="empty">Sin IMEIs</td></tr>'}
+        </tbody></table></div></div></div>`,
+    foot: `<button data-close class="primary">Cerrar</button>`,
+    onOpen: (m, close) => {
+      $("#im-add", m).onclick = async () => {
+        try {
+          const r = await POST(`/api/products/${id}/serials`, { imeis: $("#im-new", m).value });
+          toast(`${r.added.length} IMEI agregado(s)${r.skipped.length ? `; repetidos: ${r.skipped.join(", ")}` : ""}`, r.skipped.length ? "bad" : "ok");
+          close();
+          if ($("#im-print", m).checked && r.added.length) { r.added.forEach((imei) => queueItem({ product_id: id, name: p.name, sku: p.sku, imei, qty: 1, serialized: 1 })); go("etiquetas"); }
+          else { imeiManager(id); if (S.view === "productos") loadProducts(); }
+        } catch (e) { fail(e); }
+      };
+      m.addEventListener("click", async (e) => {
+        const b = e.target.closest("[data-a]"); if (!b) return;
+        if (b.dataset.a === "lbl") { queueItem({ product_id: id, name: p.name, sku: p.sku, imei: b.dataset.imei, qty: 1, serialized: 1 }); close(); go("etiquetas"); }
+        if (b.dataset.a === "del") {
+          if (!await confirmBox("¿Dar de baja este IMEI del inventario?", "Dar de baja", true)) return;
+          try { await DEL(`/api/serials/${b.closest("tr").dataset.sid}`); close(); imeiManager(id); } catch (er) { fail(er); }
+        }
+      });
+    },
+  });
+}
+
+function bulkPricing() {
+  modal({
+    title: "💲 Generador de precios masivo", size: "wide",
+    body: `<div class="form-grid">
+      <label class="f">Categoría<select id="bp-cat">${catOptions("", "Todas")}</select></label>
+      <label class="f">Filtro (marca / nombre)<input id="bp-q" placeholder="opcional"></label>
+      <label class="f">Cálculo<select id="bp-mode"><option value="markup">% de ganancia sobre el costo</option><option value="percent_change">Subir/bajar % el precio actual</option></select></label>
+      <label class="f">Valor %<input id="bp-val" inputmode="decimal" value="${num(S.settings.default_markup)}"></label>
+      <label class="f span-2">Redondeo<select id="bp-round">${roundingOptions(S.settings.price_rounding)}</select></label>
+      <label class="chk span-2"><input type="checkbox" id="bp-tax" checked> El costo ya incluye IVA</label></div>
+      <div class="row" style="margin:14px 0 10px"><button id="bp-prev">Vista previa</button><span class="muted small" id="bp-info"></span></div>
+      <div class="table-wrap" style="max-height:340px"><table><thead><tr><th>SKU</th><th>Producto</th><th class="num">Costo</th><th class="num">Precio actual</th><th class="num">Precio nuevo</th></tr></thead><tbody id="bp-body"><tr><td colspan="5" class="empty">Ajusta los valores y da clic en Vista previa</td></tr></tbody></table></div>`,
+    foot: `<button data-close>Cerrar</button><button class="primary" id="bp-apply" disabled>Aplicar precios nuevos</button>`,
+    onOpen: (m, close) => {
+      $("#bp-cat", m).onchange = () => { const c = S.categories.find((x) => String(x.id) === $("#bp-cat", m).value); if (c && $("#bp-mode", m).value === "markup") $("#bp-val", m).value = c.markup; };
+      const payload = (apply) => ({ category_id: $("#bp-cat", m).value, q: $("#bp-q", m).value, mode: $("#bp-mode", m).value, value: num($("#bp-val", m).value), rounding: $("#bp-round", m).value, cost_includes_tax: $("#bp-tax", m).checked, apply });
+      $("#bp-prev", m).onclick = async () => {
+        try {
+          const r = await POST("/api/pricing/bulk", payload(false));
+          const changed = r.rows.filter((x) => x.new_price !== x.old_price).length;
+          $("#bp-info", m).textContent = `${r.rows.length} producto(s) con costo, ${changed} cambian de precio`;
+          $("#bp-body", m).innerHTML = r.rows.map((x) => `<tr><td class="mono small">${esc(x.sku)}</td><td>${esc(x.name)}</td><td class="num">${money(x.cost)}</td><td class="num">${money(x.old_price)}</td><td class="num"><b class="${x.new_price > x.old_price ? "" : "danger"}">${money(x.new_price)}</b></td></tr>`).join("") || '<tr><td colspan="5" class="empty">Sin productos con costo capturado</td></tr>';
+          $("#bp-apply", m).disabled = !changed;
+        } catch (e) { fail(e); }
+      };
+      $("#bp-apply", m).onclick = async () => {
+        if (!await confirmBox("¿Actualizar los precios mostrados?")) return;
+        try { const r = await POST("/api/pricing/bulk", payload(true)); toast(`${r.rows.length} precios actualizados`, "ok"); close(); loadProducts(); } catch (e) { fail(e); }
+      };
+    },
+  });
+}
+
+function importCsv() {
+  modal({
+    title: "Importar productos desde CSV / Excel", size: "narrow",
+    body: `<p class="small">Guarda tu hoja de Excel como <b>CSV</b>. Columnas reconocidas: <span class="mono small">sku, barcode, name, brand, model, color, capacity, category, cost, price, wholesale_price, stock, min_stock, serialized, track_stock, warranty_days, location, notes</span>. Si el SKU o código ya existe, se actualiza.</p>
+      <p><a href="/api/products/template.csv">⬇ Descargar plantilla de ejemplo</a></p>
+      <input type="file" id="csv-file" accept=".csv,text/csv"><div id="csv-res" class="small" style="margin-top:10px"></div>`,
+    foot: `<button data-close>Cerrar</button><button class="primary" id="csv-go">Importar</button>`,
+    onOpen: (m) => {
+      $("#csv-go", m).onclick = async () => {
+        const file = $("#csv-file", m).files[0];
+        if (!file) return toast("Selecciona un archivo", "bad");
+        const fd = new FormData(); fd.append("file", file);
+        try {
+          const r = await api("POST", "/api/products/import", fd);
+          $("#csv-res", m).innerHTML = `<b>${r.created}</b> creados, <b>${r.updated}</b> actualizados.${r.errors.length ? `<div class="danger">${r.errors.map(esc).join("<br>")}</div>` : ""}`;
+          await loadBase(); loadProducts();
+        } catch (e) { fail(e); }
+      };
+    },
+  });
+}
+
+/* ================================================================== ETIQUETAS */
+function queueItem(item) {
+  const exists = S.labelQueue.find((q) => q.product_id && q.product_id === item.product_id && (q.imei || "") === (item.imei || "") && !q.all_imeis);
+  if (exists && !item.imei) exists.qty += item.qty || 1;
+  else if (!exists) S.labelQueue.push({ qty: 1, ...item });
+  S.labelSel = S.labelQueue.indexOf(exists || S.labelQueue[S.labelQueue.length - 1]);
+  saveQueue();
+}
+async function addToLabelQueue(id, qty = 1, allImeis = false) {
+  try {
+    const p = await GET(`/api/products/${id}`);
+    queueItem({ product_id: p.id, name: p.name, sku: p.sku, qty, serialized: p.serialized, all_imeis: allImeis && p.serialized ? true : false, stock: p.stock });
+    toast(`Agregado a etiquetas: ${p.name}`, "ok");
+  } catch (e) { fail(e); }
+}
+const saveQueue = () => { try { localStorage.setItem("pos-labels", JSON.stringify(S.labelQueue)); } catch (_) { /* */ } };
+
+function initEtiquetas() {
+  try { S.labelQueue = JSON.parse(localStorage.getItem("pos-labels") || "[]"); } catch (_) { S.labelQueue = []; }
+  $("#view-etiquetas").innerHTML = `
+    <div class="view-head"><h1>Etiquetas Zebra</h1><span class="muted small" id="lb-printer"></span></div>
+    <div class="label-layout">
+      <div>
+        <div class="card">
+          <div class="search-box"><span class="scan-ico">🏷️</span><input id="lb-scan" class="scan" autocomplete="off" placeholder="Escanea o busca productos para etiquetar"></div>
+          <div class="row" style="margin-top:10px">
+            <button id="lb-custom">✏️ Etiqueta libre</button>
+            <button id="lb-low">Agregar productos con existencia</button>
+            <span class="spacer"></span>
+            <button class="danger" id="lb-clear">Vaciar lista</button>
+          </div>
+        </div>
+        <div class="table-wrap" style="margin-top:14px"><table><thead><tr><th>Etiqueta</th><th>Detalle</th><th class="center">Copias</th><th></th></tr></thead><tbody id="lb-body"></tbody></table></div>
+      </div>
+      <div class="card">
+        <label class="f">Plantilla / tamaño de etiqueta<select id="lb-tpl"></select></label>
+        <p class="small muted" id="lb-tpl-desc" style="margin:6px 0 12px"></p>
+        <div class="preview-box" id="lb-preview"><span class="muted">Agrega productos para ver la vista previa</span></div>
+        <div class="row" style="margin-top:12px"><b id="lb-total">0 etiquetas</b><span class="spacer"></span>
+          <button id="lb-dl">⬇ Descargar .ZPL</button><button class="primary" id="lb-print">🖨 Imprimir en Zebra</button></div>
+        <details style="margin-top:14px"><summary class="small muted" style="cursor:pointer">Ver código ZPL de la etiqueta seleccionada</summary>
+          <textarea class="zpl" id="lb-zpl" readonly style="margin-top:8px"></textarea>
+          <div class="row" style="margin-top:6px"><button class="sm" id="lb-copy">Copiar ZPL</button><a class="small" href="https://labelary.com/viewer.html" target="_blank" rel="noopener">Probar en Labelary ↗</a></div>
+        </details>
+      </div>
+    </div>`;
+  attachProductSearch($("#lb-scan"), (p, imei) => {
+    if (!p) return;
+    if (imei) queueItem({ product_id: p.id, name: p.name, sku: p.sku, imei, qty: 1, serialized: 1 });
+    else queueItem({ product_id: p.id, name: p.name, sku: p.sku, qty: 1, serialized: p.serialized, stock: p.stock });
+    renderQueue();
+  });
+  $("#lb-tpl").onchange = () => { S.labelTemplate = $("#lb-tpl").value; renderQueue(); };
+  $("#lb-clear").onclick = () => { S.labelQueue = []; saveQueue(); renderQueue(); };
+  $("#lb-custom").onclick = customLabel;
+  $("#lb-low").onclick = async () => {
+    try {
+      const list = (await GET("/api/products?limit=1000")).filter((p) => p.track_stock && p.stock > 0);
+      if (!await confirmBox(`Se agregarán ${list.length} productos con una etiqueta por pieza en existencia (los celulares, una por IMEI). ¿Continuar?`)) return;
+      list.forEach((p) => queueItem({ product_id: p.id, name: p.name, sku: p.sku, qty: p.serialized ? 1 : Number(p.stock), serialized: p.serialized, all_imeis: !!p.serialized, stock: p.stock }));
+      renderQueue();
+    } catch (e) { fail(e); }
+  };
+  $("#lb-body").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-i]"); if (!tr) return;
+    const i = +tr.dataset.i;
+    const b = e.target.closest("[data-a]");
+    if (b?.dataset.a === "del") { S.labelQueue.splice(i, 1); S.labelSel = Math.max(0, Math.min(S.labelSel, S.labelQueue.length - 1)); saveQueue(); return renderQueue(); }
+    if (e.target.matches("input")) return;
+    S.labelSel = i; renderQueue();
+  });
+  $("#lb-body").addEventListener("change", (e) => {
+    const tr = e.target.closest("tr[data-i]"); if (!tr) return;
+    const it = S.labelQueue[+tr.dataset.i];
+    if (e.target.dataset.f === "qty") it.qty = Math.max(0, Math.round(num(e.target.value)));
+    if (e.target.dataset.f === "all") { it.all_imeis = e.target.checked; }
+    saveQueue(); renderQueue();
+  });
+  $("#lb-dl").onclick = async () => {
+    try { const r = await POST("/api/labels/zpl", labelPayload()); download(`etiquetas_${today()}.zpl`, r.zpl); toast(`${r.count} etiqueta(s) en el archivo ZPL`, "ok"); } catch (e) { fail(e); }
+  };
+  $("#lb-print").onclick = async () => {
+    if (S.settings.label_printer_mode === "download") return $("#lb-dl").click();
+    try { const r = await POST("/api/labels/zpl", { ...labelPayload(), print: true }); toast(r.message, "ok"); } catch (e) { fail(e); }
+  };
+  $("#lb-copy").onclick = () => { navigator.clipboard?.writeText($("#lb-zpl").value); toast("ZPL copiado"); };
+}
+
+function labelPayload() {
+  return { template: $("#lb-tpl").value, items: S.labelQueue.map((q) => q.custom ? { custom: q.custom, qty: q.qty } : { product_id: q.product_id, qty: q.qty, imei: q.imei, all_imeis: q.all_imeis }) };
+}
+
+function customLabel() {
+  modal({
+    title: "Etiqueta libre", size: "narrow",
+    body: `<div class="grid" style="gap:10px">
+      <label class="f">Texto / nombre<input id="cl-name" autofocus placeholder="p. ej. OFERTA Mica 9D"></label>
+      <label class="f">Precio<input id="cl-price" inputmode="decimal" placeholder="opcional"></label>
+      <label class="f">Código de barras / texto del código<input id="cl-code" class="mono" placeholder="opcional"></label>
+      <label class="f">Copias<input id="cl-qty" inputmode="numeric" value="1"></label></div>`,
+    foot: `<button data-close>Cancelar</button><button class="primary" id="cl-ok">Agregar</button>`,
+    onOpen: (m, close) => {
+      $("#cl-ok", m).onclick = () => {
+        const custom = { name: $("#cl-name", m).value, price: $("#cl-price", m).value, barcode: $("#cl-code", m).value.trim() };
+        if (!custom.name && !custom.barcode) return toast("Escribe un texto o código", "bad");
+        S.labelQueue.push({ custom, name: custom.name || custom.barcode, qty: Math.max(1, Math.round(num($("#cl-qty", m).value))) });
+        S.labelSel = S.labelQueue.length - 1; saveQueue(); close(); renderQueue();
+      };
+    },
+  });
+}
+
+const refreshPreview = debounce(async () => {
+  const it = S.labelQueue[S.labelSel];
+  if (!it) { $("#lb-preview").innerHTML = '<span class="muted">Agrega productos para ver la vista previa</span>'; $("#lb-zpl").value = ""; return; }
+  try {
+    const item = it.custom ? { custom: it.custom, qty: 1 } : { product_id: it.product_id, imei: it.imei, all_imeis: it.all_imeis, qty: 1 };
+    const r = await POST("/api/labels/preview", { template: $("#lb-tpl").value, item });
+    $("#lb-preview").innerHTML = r.svg;
+    $("#lb-zpl").value = r.zpl;
+  } catch (e) { $("#lb-preview").innerHTML = `<span class="danger">${esc(e.message)}</span>`; }
+}, 120);
+
+function renderQueue() {
+  const body = $("#lb-body");
+  body.innerHTML = S.labelQueue.length ? S.labelQueue.map((q, i) => `<tr data-i="${i}" class="${i === S.labelSel ? "sel-row" : ""}" style="cursor:pointer">
+      <td><b>${esc(q.name)}</b><div class="small muted mono">${esc(q.custom ? "Etiqueta libre" : q.sku || "")}</div></td>
+      <td class="small">${q.imei ? `<span class="badge info">IMEI ${esc(q.imei)}</span>` : q.serialized ? `<label class="chk"><input type="checkbox" data-f="all" ${q.all_imeis ? "checked" : ""}> Una por cada IMEI disponible</label>` : q.stock !== undefined ? `<span class="muted">Existencia: ${Number(q.stock)}</span>` : ""}</td>
+      <td class="center"><input data-f="qty" value="${q.qty}" style="width:64px;text-align:center"></td>
+      <td><button class="sm danger icon-btn" data-a="del">✕</button></td></tr>`).join("")
+    : `<tr><td colspan="4" class="empty">Escanea productos, o en Productos usa el botón 🏷️.</td></tr>`;
+  const total = S.labelQueue.reduce((a, q) => a + (q.all_imeis ? Math.max(1, q.qty) * Math.max(1, Number(q.stock) || 1) : q.qty), 0);
+  $("#lb-total").textContent = `${total} etiqueta(s)`;
+  const tpl = S.templates[$("#lb-tpl").value];
+  $("#lb-tpl-desc").textContent = tpl ? `${tpl.description} · ${S.settings.label_dpi} dpi` : "";
+  refreshPreview();
+}
+
+VIEWS.etiquetas = () => {
+  const sel = $("#lb-tpl");
+  sel.innerHTML = templateOptions(S.labelTemplate || S.settings.label_template);
+  const modes = { download: "Modo: descargar archivo .ZPL", network: `Zebra en red: ${S.settings.label_printer_host}:${S.settings.label_printer_port}`, local: `Zebra USB: ${S.settings.label_printer_name}` };
+  $("#lb-printer").textContent = modes[S.settings.label_printer_mode] || "";
+  renderQueue();
+  setTimeout(() => $("#lb-scan").focus(), 30);
+};
+
+/* ================================================================== INVENTARIO */
+function initInventario() {
+  $("#view-inventario").innerHTML = `
+    <div class="view-head"><h1>Inventario e IMEI</h1></div>
+    <div class="grid cols-2">
+      <div class="card"><h2>📥 Entrada / ajuste de mercancía</h2>
+        <div class="search-box"><span class="scan-ico">🔎</span><input id="inv-scan" class="scan" autocomplete="off" placeholder="Escanea o busca el producto"></div>
+        <div id="inv-form" class="muted small" style="margin-top:12px">Selecciona un producto. Para celulares, escanea sus IMEIs.</div>
+      </div>
+      <div class="card"><h2>⚠️ Existencia baja</h2><div class="table-wrap" style="max-height:330px"><table><thead><tr><th>Producto</th><th class="num">Exist.</th><th class="num">Mín.</th><th></th></tr></thead><tbody id="inv-low"></tbody></table></div></div>
+    </div>
+    <div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Movimientos recientes</h2></div>
+      <div class="table-wrap" style="max-height:420px"><table><thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th class="num">Cantidad</th><th>Referencia / nota</th></tr></thead><tbody id="inv-moves"></tbody></table></div></div>`;
+  attachProductSearch($("#inv-scan"), (p) => p && invSelect(p.id));
+  $("#inv-low").addEventListener("click", (e) => { const b = e.target.closest("[data-id]"); if (b) invSelect(+b.dataset.id); });
+}
+
+async function invSelect(id) {
+  let p;
+  try { p = await GET(`/api/products/${id}`); } catch (e) { return fail(e); }
+  const box = $("#inv-form");
+  box.classList.remove("muted", "small");
+  if (p.serialized) {
+    box.innerHTML = `<h3>${esc(p.name)} <span class="badge info">IMEI</span></h3><p class="small muted">${esc(p.sku)} · disponibles: <b>${Number(p.stock)}</b></p>
+      <label class="f">Escanea los IMEIs que llegaron (uno por renglón)<textarea id="iv-imeis" class="mono" style="min-height:140px"></textarea></label>
+      <label class="chk small" style="margin:8px 0"><input type="checkbox" id="iv-lbl" checked> Enviar a etiquetas (una por IMEI)</label>
+      <div class="row"><button class="primary" id="iv-add">Registrar IMEIs</button><button id="iv-manage">Ver / dar de baja IMEIs</button></div>`;
+    $("#iv-imeis").focus();
+    $("#iv-manage").onclick = () => imeiManager(p.id);
+    $("#iv-add").onclick = async () => {
+      try {
+        const r = await POST(`/api/products/${p.id}/serials`, { imeis: $("#iv-imeis").value, notes: "Entrada" });
+        toast(`${r.added.length} IMEI registrados${r.skipped.length ? ` · ya existían: ${r.skipped.join(", ")}` : ""}`, r.skipped.length ? "bad" : "ok");
+        if ($("#iv-lbl").checked) r.added.forEach((imei) => queueItem({ product_id: p.id, name: p.name, sku: p.sku, imei, qty: 1, serialized: 1 }));
+        invSelect(p.id); VIEWS.inventario();
+      } catch (e) { fail(e); }
+    };
+    return;
+  }
+  box.innerHTML = `<h3>${esc(p.name)}</h3><p class="small muted">${esc(p.sku)} · existencia actual: <b>${Number(p.stock)}</b> · costo ${money(p.cost)}</p>
+    <div class="form-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+      <label class="f">Movimiento<select id="iv-kind"><option value="entrada">Entrada (compra)</option><option value="salida">Salida (merma / uso)</option><option value="conteo">Conteo físico (fijar existencia)</option></select></label>
+      <label class="f">Cantidad<input id="iv-qty" inputmode="decimal" value="1"></label>
+      <label class="f">Costo unitario nuevo<input id="iv-cost" inputmode="decimal" placeholder="${p.cost}"></label>
+      <label class="f span-all" style="grid-column:1/-1">Nota / proveedor<input id="iv-notes"></label></div>
+    <label class="chk small" style="margin:8px 0"><input type="checkbox" id="iv-lbl"> Enviar etiquetas de las piezas que entran</label>
+    <div class="row"><button class="primary" id="iv-save">Registrar movimiento</button></div>`;
+  $("#iv-qty").select();
+  $("#iv-save").onclick = async () => {
+    const kind = $("#iv-kind").value, qty = num($("#iv-qty").value);
+    try {
+      const r = await POST("/api/inventory/adjust", { product_id: p.id, kind, qty, cost: $("#iv-cost").value, notes: $("#iv-notes").value });
+      toast(`Existencia de ${r.name}: ${Number(r.stock)}`, "ok");
+      if ($("#iv-lbl").checked && kind === "entrada") queueItem({ product_id: p.id, name: p.name, sku: p.sku, qty: Math.round(qty), stock: r.stock });
+      invSelect(p.id); VIEWS.inventario();
+    } catch (e) { fail(e); }
+  };
+}
+
+VIEWS.inventario = async () => {
+  try {
+    const [low, moves] = await Promise.all([GET("/api/products?low=1"), GET("/api/inventory/moves")]);
+    $("#inv-low").innerHTML = low.map((p) => `<tr><td>${esc(p.name)}<div class="small muted mono">${esc(p.sku)}</div></td><td class="num"><span class="badge ${p.stock <= 0 ? "bad" : "warn"}">${Number(p.stock)}</span></td><td class="num">${Number(p.min_stock)}</td><td><button class="sm" data-id="${p.id}">Surtir</button></td></tr>`).join("") || '<tr><td colspan="4" class="empty">Todo en orden 👍</td></tr>';
+    $("#inv-moves").innerHTML = moves.map((m) => `<tr><td class="small nowrap">${esc(m.created_at)}</td><td>${esc(m.name)}<div class="small muted mono">${esc(m.sku)}</div></td>
+      <td><span class="badge ${m.qty > 0 ? "ok" : "warn"}">${esc(m.kind)}</span></td><td class="num">${m.qty > 0 ? "+" : ""}${Number(m.qty)}</td><td class="small">${esc(m.reference || "")} ${esc(m.notes || "")}</td></tr>`).join("") || '<tr><td colspan="5" class="empty">Sin movimientos</td></tr>';
+  } catch (e) { fail(e); }
+  setTimeout(() => $("#inv-scan").focus(), 30);
+};
+
+/* ================================================================== VENTAS */
+function initVentas() {
+  $("#view-ventas").innerHTML = `
+    <div class="view-head"><h1>Ventas y tickets</h1></div>
+    <div class="row" style="margin-bottom:12px">
+      <label class="f">Desde<input type="date" id="v-from"></label><label class="f">Hasta<input type="date" id="v-to"></label>
+      <label class="f" style="flex:1;max-width:380px">Buscar<input id="v-q" placeholder="Folio, cliente, teléfono, IMEI, producto…"></label>
+      <span class="spacer"></span><div id="v-sum" class="muted"></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Cliente</th><th class="num">Piezas</th><th>Pago</th><th class="num">Total</th><th>Estado</th><th></th></tr></thead><tbody id="v-body"></tbody></table></div>`;
+  $("#v-from").value = today(); $("#v-to").value = today();
+  ["v-from", "v-to"].forEach((i) => $("#" + i).onchange = VIEWS.ventas);
+  $("#v-q").oninput = debounce(VIEWS.ventas, 250);
+  $("#v-body").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-a]"); if (!b) return;
+    const id = +b.closest("tr").dataset.id;
+    if (b.dataset.a === "view") showSale(id);
+    if (b.dataset.a === "print") printSale(id);
+  });
+}
+VIEWS.ventas = async () => {
+  try {
+    const list = await GET(`/api/sales?from=${$("#v-from").value}&to=${$("#v-to").value}&q=${encodeURIComponent($("#v-q").value)}`);
+    const ok = list.filter((s) => s.status === "completada");
+    $("#v-sum").innerHTML = `${ok.length} venta(s) · <b>${money(ok.reduce((a, s) => a + s.total, 0))}</b>`;
+    $("#v-body").innerHTML = list.map((s) => `<tr data-id="${s.id}"><td class="mono"><a data-a="view">${esc(s.folio)}</a></td><td class="small">${esc(s.created_at)}</td>
+      <td>${esc(s.customer_name || "—")}<div class="small muted">${esc(s.customer_phone || "")}</div></td><td class="num">${Number(s.units || 0)}</td>
+      <td>${esc(s.payment_method)}</td><td class="num"><b>${money(s.total)}</b></td>
+      <td>${s.status === "completada" ? '<span class="badge ok">Completada</span>' : '<span class="badge bad">Cancelada</span>'}</td>
+      <td><button class="sm" data-a="view">Ver</button> <button class="sm" data-a="print">🖨</button></td></tr>`).join("") || '<tr><td colspan="8" class="empty">Sin ventas en el periodo</td></tr>';
+  } catch (e) { fail(e); }
+};
+
+/* ================================================================== CORTE Y REPORTES */
+function initCorte() {
+  $("#view-corte").innerHTML = `
+    <div class="view-head"><h1>Corte de caja y reportes</h1>
+      <button id="c-print">🖨 Imprimir corte</button></div>
+    <div class="row" style="margin-bottom:14px">
+      <label class="f">Desde<input type="date" id="c-from"></label><label class="f">Hasta<input type="date" id="c-to"></label>
+      <div class="row" style="align-self:flex-end"><button class="sm" data-r="0">Hoy</button><button class="sm" data-r="1">Ayer</button><button class="sm" data-r="7">7 días</button><button class="sm" data-r="30">30 días</button><button class="sm" data-r="m">Este mes</button></div></div>
+    <div class="kpis" id="c-kpis"></div>
+    <div class="grid cols-2">
+      <div class="card"><h2>Formas de pago y caja</h2><table><tbody id="c-pay"></tbody></table>
+        <h3 style="margin:18px 0 8px">Movimiento de efectivo</h3>
+        <div class="row"><select id="c-kind" style="max-width:190px"><option value="entrada">Entrada / fondo de caja</option><option value="salida">Salida / gasto / retiro</option></select>
+          <input id="c-amt" inputmode="decimal" placeholder="Monto" style="max-width:120px"><input id="c-note" placeholder="Concepto" style="flex:1;min-width:120px"><button class="primary" id="c-add">Registrar</button></div>
+        <table style="margin-top:8px"><tbody id="c-cash"></tbody></table></div>
+      <div class="card"><h2>Ventas por categoría</h2><table><thead><tr><th>Categoría</th><th class="num">Piezas</th><th class="num">Venta</th><th class="num">Utilidad</th></tr></thead><tbody id="c-cat"></tbody></table></div>
+    </div>
+    <div class="card"><h2>Productos más vendidos</h2><table><thead><tr><th>Producto</th><th>SKU</th><th class="num">Piezas</th><th class="num">Venta</th></tr></thead><tbody id="c-top"></tbody></table></div>`;
+  $("#c-from").value = today(); $("#c-to").value = today();
+  ["c-from", "c-to"].forEach((i) => $("#" + i).onchange = VIEWS.corte);
+  $$("[data-r]", $("#view-corte")).forEach((b) => b.onclick = () => {
+    const r = b.dataset.r, d = new Date(today() + "T12:00:00");
+    const fmt = (x) => x.toISOString().slice(0, 10);
+    let from = new Date(d), to = new Date(d);
+    if (r === "1") { from.setDate(d.getDate() - 1); to = new Date(from); }
+    else if (r === "m") from.setDate(1);
+    else from.setDate(d.getDate() - (+r ? +r - 1 : 0));
+    $("#c-from").value = fmt(from); $("#c-to").value = fmt(to); VIEWS.corte();
+  });
+  $("#c-add").onclick = async () => {
+    try { await POST("/api/cash", { kind: $("#c-kind").value, amount: $("#c-amt").value, notes: $("#c-note").value }); $("#c-amt").value = ""; $("#c-note").value = ""; toast("Movimiento registrado", "ok"); VIEWS.corte(); } catch (e) { fail(e); }
+  };
+  $("#c-print").onclick = async () => {
+    const q = `from=${$("#c-from").value}&to=${$("#c-to").value}`;
+    if (S.settings.ticket_printer_mode === "browser") return openTicketWindow(`/reports/corte?${q}&print=1`);
+    try { const r = await POST(`/api/reports/corte/print?${q}`); toast(r.message, "ok"); } catch (e) { fail(e); }
+  };
+}
+VIEWS.corte = async () => {
+  const q = `from=${$("#c-from").value}&to=${$("#c-to").value}`;
+  try {
+    const [r, cash] = await Promise.all([GET(`/api/reports/summary?${q}`), GET(`/api/cash?${q}`)]);
+    const k = (label, v) => `<div class="kpi"><small>${label}</small><b>${v}</b></div>`;
+    $("#c-kpis").innerHTML = k("Total vendido", money(r.total)) + k("Ventas", r.sales_count) + k("Ticket promedio", money(r.average_ticket)) +
+      k("Piezas", r.units) + k("Utilidad bruta", money(r.profit)) + k("Efectivo esperado", money(r.expected_cash));
+    const row = (a, b, strong) => `<tr><td>${a}</td><td class="num">${strong ? `<b>${b}</b>` : b}</td></tr>`;
+    $("#c-pay").innerHTML = row("💵 Efectivo", money(r.cash)) + row("💳 Tarjeta", money(r.card)) + row("🏦 Transferencia", money(r.transfer)) +
+      row("Total", money(r.total), 1) + row("Fondo / entradas de efectivo", money(r.cash_in)) + row("Retiros / gastos", (r.cash_out ? "-" : "") + money(r.cash_out)) +
+      row("Efectivo que debe haber en caja", money(r.expected_cash), 1) + row("Descuentos otorgados", money(r.discounts)) +
+      row(`IVA incluido`, money(r.tax)) + row("Ventas canceladas", r.cancelled_count);
+    $("#c-cash").innerHTML = cash.map((c) => `<tr><td class="small">${esc(c.created_at.slice(11, 16))}</td><td><span class="badge ${c.kind === "entrada" ? "ok" : "warn"}">${c.kind}</span></td><td>${esc(c.notes)}</td><td class="num">${money(c.amount)}</td></tr>`).join("");
+    $("#c-cat").innerHTML = r.by_category.map((c) => `<tr><td>${esc(c.category)}</td><td class="num">${c.units}</td><td class="num">${money(c.total)}</td><td class="num">${money(c.profit)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
+    $("#c-top").innerHTML = r.top_products.map((t) => `<tr><td>${esc(t.name)}</td><td class="mono small">${esc(t.sku || "")}</td><td class="num">${t.units}</td><td class="num">${money(t.total)}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">Sin ventas</td></tr>';
+  } catch (e) { fail(e); }
+};
+
+/* ================================================================== CONFIGURACIÓN */
+function field(key, label, opts = {}) {
+  const v = S.settings[key] ?? "";
+  const cls = `f ${opts.span ? "span-" + opts.span : ""}`;
+  if (opts.type === "check") return `<label class="chk ${opts.span ? "span-" + opts.span : ""}"><input type="checkbox" data-k="${key}" ${v === "1" ? "checked" : ""}> ${label}</label>`;
+  if (opts.options) return `<label class="${cls}">${label}<select data-k="${key}">${Object.entries(opts.options).map(([k, t]) => `<option value="${k}" ${String(v) === k ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>`;
+  if (opts.type === "area") return `<label class="${cls}">${label}<textarea data-k="${key}">${esc(v)}</textarea></label>`;
+  return `<label class="${cls}">${label}<input data-k="${key}" value="${esc(v)}" ${opts.ph ? `placeholder="${esc(opts.ph)}"` : ""}></label>`;
+}
+
+function initConfig() { /* se dibuja al entrar */ }
+VIEWS.config = async () => {
+  await loadBase();
+  const printers = await GET("/api/printers").then((r) => r.printers).catch(() => []);
+  const tplOpts = Object.fromEntries(Object.entries(S.templates).map(([k, v]) => [k, v.name]));
+  const el = $("#view-config");
+  el.innerHTML = `
+    <div class="view-head"><h1>Configuración</h1><a class="btn" href="/api/backup">💾 Descargar respaldo</a><button class="primary" id="cfg-save">Guardar cambios</button></div>
+    <div class="tabs"><button data-t="tienda" class="on">Tienda</button><button data-t="tickets">Tickets</button><button data-t="zebra">Etiquetas Zebra</button><button data-t="precios">Precios e IVA</button><button data-t="cats">Categorías</button></div>
+    <div data-p="tienda" class="card"><div class="form-grid">
+      ${field("store_name", "Nombre comercial", { span: 2 })}${field("store_legal_name", "Razón social", { span: 2 })}
+      ${field("store_rfc", "RFC")}${field("store_phone", "Teléfono")}${field("store_whatsapp", "WhatsApp")}${field("cashier_name", "Cajero / vendedor")}
+      ${field("store_address", "Dirección", { span: "all" })}</div></div>
+    <div data-p="tickets" class="card hidden"><div class="form-grid">
+      ${field("ticket_printer_mode", "Imprimir tickets en", { span: 2, options: { browser: "Navegador (cualquier impresora instalada)", network: "Impresora térmica en red (ESC/POS, puerto 9100)", local: "Impresora térmica USB instalada (ESC/POS crudo)", zebra: "Impresora Zebra (ZPL)" } })}
+      ${field("ticket_width", "Ancho de papel", { options: { 80: "80 mm (48 caracteres)", 58: "58 mm (32 caracteres)" } })}
+      ${field("ticket_copies", "Copias")}
+      ${field("ticket_printer_host", "IP impresora de tickets", { ph: "192.168.1.50" })}${field("ticket_printer_port", "Puerto")}
+      <label class="f span-2">Nombre impresora USB (sistema)<input data-k="ticket_printer_name" list="dl-printers" value="${esc(S.settings.ticket_printer_name)}"></label>
+      ${field("ticket_open_drawer", "Abrir cajón de dinero al imprimir", { type: "check", span: 2 })}
+      ${field("ticket_zebra_width_mm", "Ancho del ticket en Zebra (mm)", { ph: "76" })}
+      ${field("folio_prefix", "Prefijo de folio")}
+      ${field("ticket_header", "Leyenda superior", { type: "area", span: 2 })}${field("ticket_footer", "Pie del ticket", { type: "area", span: 2 })}
+      ${field("warranty_text", "Texto de garantía (se imprime cuando hay celulares o productos con garantía)", { type: "area", span: "all" })}
+      </div><div class="row" style="margin-top:12px"><button id="t-test">🖨 Ticket de prueba</button><span class="small muted">Guarda antes de probar.</span></div></div>
+    <div data-p="zebra" class="card hidden"><div class="form-grid">
+      ${field("label_printer_mode", "Conexión de la Zebra", { span: 2, options: { download: "Descargar archivo .ZPL (enviar manualmente)", network: "Zebra en red (IP, puerto 9100)", local: "Zebra USB instalada en este equipo" } })}
+      ${field("label_printer_host", "IP de la Zebra", { ph: "192.168.1.60" })}${field("label_printer_port", "Puerto")}
+      <label class="f span-2">Nombre de la Zebra USB<input data-k="label_printer_name" list="dl-printers" value="${esc(S.settings.label_printer_name)}" placeholder="ZDesigner GC420t"></label>
+      ${field("label_dpi", "Resolución", { options: { 203: "203 dpi (8 puntos/mm) — GC420, ZD220, ZD410, GK420", 300: "300 dpi (12 puntos/mm) — ZD421-300, ZT230-300", 600: "600 dpi" } })}
+      ${field("label_template", "Plantilla predeterminada", { options: tplOpts })}
+      ${field("label_darkness", "Oscuridad (0–30)")}${field("label_speed", "Velocidad (pulg/seg)")}
+      ${field("label_offset_x", "Desplazamiento X (mm)")}${field("label_offset_y", "Desplazamiento Y (mm)")}
+      ${field("label_show_store", "Imprimir nombre de la tienda en la etiqueta", { type: "check", span: 2 })}
+      </div><div class="row" style="margin-top:12px"><button id="z-test">🏷️ Etiqueta de prueba</button><span class="small muted">Para USB en Windows instala el driver ZDesigner y <span class="mono">pip install pywin32</span>.</span></div></div>
+    <div data-p="precios" class="card hidden"><div class="form-grid">
+      ${field("currency_symbol", "Símbolo de moneda")}${field("tax_rate", "IVA %")}
+      ${field("prices_include_tax", "Los precios al público ya incluyen IVA", { type: "check", span: 2 })}
+      ${field("show_tax_breakdown", "Desglosar IVA en el ticket", { type: "check", span: 2 })}
+      ${field("allow_negative_stock", "Permitir vender sin existencia", { type: "check", span: 2 })}
+      ${field("price_rounding", "Redondeo de precios", { span: 2, options: S.rounding })}
+      ${field("default_markup", "% de ganancia predeterminado")}${field("barcode_prefix", "Prefijo de códigos internos (EAN-13)")}
+      </div></div>
+    <div data-p="cats" class="card hidden">
+      <p class="small muted" style="margin-top:0">El <b>prefijo</b> forma el SKU (p. ej. FUN-SAM-0001). El <b>% de ganancia</b> se usa en el generador de precios.</p>
+      <table><thead><tr><th>Categoría</th><th>Prefijo SKU</th><th>Maneja IMEI</th><th>% ganancia</th><th class="num">Productos</th><th></th></tr></thead><tbody id="cat-body">
+      ${S.categories.map((c) => `<tr data-id="${c.id}"><td><input data-c="name" value="${esc(c.name)}"></td><td><input data-c="prefix" value="${esc(c.prefix)}" class="mono" style="width:90px"></td>
+        <td class="center"><input type="checkbox" data-c="serialized" ${c.serialized ? "checked" : ""}></td><td><input data-c="markup" value="${c.markup}" style="width:90px"></td><td class="num">${c.products}</td>
+        <td><button class="sm" data-a="save">Guardar</button> <button class="sm danger" data-a="del">✕</button></td></tr>`).join("")}
+      <tr><td><input id="nc-name" placeholder="Nueva categoría"></td><td><input id="nc-prefix" class="mono" placeholder="ABC" style="width:90px"></td><td class="center"><input type="checkbox" id="nc-ser"></td><td><input id="nc-markup" value="100" style="width:90px"></td><td></td><td><button class="sm primary" id="nc-add">Agregar</button></td></tr>
+      </tbody></table></div>
+    <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;
+  $$(".tabs button", el).forEach((b) => b.onclick = () => {
+    $$(".tabs button", el).forEach((x) => x.classList.toggle("on", x === b));
+    $$("[data-p]", el).forEach((p) => p.classList.toggle("hidden", p.dataset.p !== b.dataset.t));
+  });
+  const save = async (quiet) => {
+    const data = {};
+    $$("[data-k]", el).forEach((i) => { data[i.dataset.k] = i.type === "checkbox" ? (i.checked ? "1" : "0") : i.value; });
+    try { await PUT("/api/settings", data); await loadBase(); if (!quiet) toast("Configuración guardada", "ok"); } catch (e) { fail(e); }
+  };
+  $("#cfg-save").onclick = () => save(false);
+  $("#t-test").onclick = async () => {
+    await save(true);
+    if (S.settings.ticket_printer_mode === "browser") { const w = window.open("", "ticket", "width=420,height=600"); if (w) { w.document.write("<p style='font-family:monospace'>Prueba de impresión del navegador.<br>Si ves esto, imprime con Ctrl+P.</p>"); w.print(); } return; }
+    try { const r = await POST("/api/print/test", { target: "ticket" }); toast(r.message || "Enviado", "ok"); } catch (e) { fail(e); }
+  };
+  $("#z-test").onclick = async () => {
+    await save(true);
+    try { const r = await POST("/api/print/test", { target: "label" }); if (r.zpl) download("prueba.zpl", r.zpl); toast(r.message, "ok"); } catch (e) { fail(e); }
+  };
+  $("#cat-body").addEventListener("click", async (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    if (b.id === "nc-add") {
+      try { await POST("/api/categories", { name: $("#nc-name").value, prefix: $("#nc-prefix").value, serialized: $("#nc-ser").checked, markup: $("#nc-markup").value }); toast("Categoría agregada", "ok"); VIEWS.config().then(() => $('[data-t="cats"]').click()); } catch (er) { fail(er); }
+      return;
+    }
+    const tr = b.closest("tr"), id = tr.dataset.id;
+    const v = (k) => tr.querySelector(`[data-c="${k}"]`);
+    try {
+      if (b.dataset.a === "save") { await PUT(`/api/categories/${id}`, { name: v("name").value, prefix: v("prefix").value, serialized: v("serialized").checked, markup: v("markup").value }); toast("Categoría guardada", "ok"); await loadBase(); }
+      if (b.dataset.a === "del" && await confirmBox("¿Eliminar la categoría?", "Eliminar", true)) { await DEL(`/api/categories/${id}`); VIEWS.config().then(() => $('[data-t="cats"]').click()); }
+    } catch (er) { fail(er); }
+  });
+};
+
+/* ------------------------------------------------------------------ inicio */
+function tick() { $("#clock").textContent = new Date().toLocaleString("es-MX", { weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }); }
+
+(async function start() {
+  try { await loadBase(); } catch (e) { fail(e); }
+  initVender(); initProductos(); initEtiquetas(); initInventario(); initVentas(); initCorte(); initConfig();
+  tick(); setInterval(tick, 20000);
+  go("vender");
+})();
