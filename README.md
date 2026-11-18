@@ -112,22 +112,6 @@ en **Configuración → Tienda → Logo**). Desde ahí se puede subir otro logo 
 3. El cajero también puede hacer notas y cobrarlas directamente. Si quieres que los vendedores también
    cobren, actívalo en **Configuración → Usuarios**.
 
-## La nota de venta (igual que el talonario)
-
-Cada nota impresa lleva: logo, encabezado de la sucursal (p. ej. **GALLO / HEADBANGER CASES**), dirección,
-**NOTA DE VENTA GG-51367**, fecha, vendedor, nombre y **WhatsApp** del cliente, los artículos
-(cantidad, descripción e importe; en micas y fundas: equipo, IMEI, garantía y cambios), total,
-**cantidad con letra**, el recuadro de políticas y, en las notas con garantía, la **póliza completa con
-"Acepto y estoy consciente de las políticas de garantía" y firma del cliente**.
-
-- **Folio consecutivo por sucursal:** en Configuración → Sucursales, columna **Siguiente folio**, pon el
-  número que sigue en el talonario de cada sucursal (p. ej. González Gallo `51367`). Cada sucursal lleva su
-  propia numeración.
-- **Encabezado y dirección:** se cambian por sucursal en Configuración → Tickets (encabezado) y
-  Configuración → Sucursales (dirección).
-- **Textos de garantía:** Configuración → Tickets: recuadro corto, póliza completa y cuándo imprimirla
-  (solo en notas con garantía, siempre o nunca).
-
 ## Garantías y cambios (F3)
 
 Cada producto define su **garantía** (p. ej. 1 año) y cuántos **cambios** incluye (p. ej. 3 para una mica

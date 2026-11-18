@@ -128,12 +128,10 @@ DEFAULT_SETTINGS = {
     "cashier_name": "",
     "ticket_header": "",
     "ticket_footer": "¡Gracias por su compra!",
-    "ticket_amount_words": "1",
-    # recuadro corto de la nota física
+    # políticas de garantía de la nota de la tienda
     "warranty_text": 'NO APLICA GARANTÍA SIN NOTA, HOLOGRAMA Y EMPAQUE. LA GARANTÍA SOLO APLICA POR DEFECTO DE FÁBRICA, NO MOJADO, NO GOLPEADO NI MAL USO.',
-    # reverso de la nota física: póliza completa con firma del cliente
     "warranty_policy": 'Hospital para celulares shop garantiza a partir de la fecha de compra, el funcionamiento de este producto contra cualquier defecto en los materiales y mano de obra empleados para su fabricación. Nuestra garantía incluye la reparación, reposición o cambio del producto y/o componentes sin cargo alguno para el cliente, incluyendo mano de obra, derivados del cumplimiento de este certificado.\nHospital para celulares shop se compromete a entregar el producto en un lapso no mayor de 30 días hábiles contados a partir de la fecha de recepción del mismo en nuestra sucursal en González Gallo #160, col. centro, Tepatitlán de Morelos Jalisco. Para hacer efectiva esta garantía, no podrán exigirse mayores requisitos que presentarla sellada por el establecimiento comercial donde se adquirió.\nNOTA: No hay devoluciones de dinero, estar seguro de su compra y del artículo que compró.\nESTA GARANTÍA NO SERÁ VÁLIDA BAJO LAS SIGUIENTES CONDICIONES:\n1. Cuando esta póliza manifestara claros signos de haber sido alterada en los datos originales consignados en ella.\n2. Cuando el uso, cuidado y operación del producto no haya sido el que en este certificado está descrito.\n3. Cuando el producto haya sido usado fuera de su capacidad, maltratado, golpeado, expuesto a la humedad, mojado por algún líquido o substancia corrosiva, así como por cualquiera otra falla atribuible al consumidor.\n4. Cuando el producto haya sido desarmado, modificado o reparado por personas no autorizadas por Hospital para celulares Shop.\n5. Cuando la falla sea originada por el desgaste normal de las piezas debido al uso.\n6. No aplica garantía si no presenta su nota de compra.\n7. No aplica garantía si le quita al producto el holograma.\n8. Para hacer válida la garantía, debe traer el empaque del producto.\n9. En baterías, no aplica garantía si la batería está inflada ya que esto sucede por dejar cargando más tiempo del necesario el equipo.\nNinguna otra garantía verbal o escrita diferente a la aquí expresada será reconocida por Hospital para celulares shop.',
-    "warranty_policy_print": "garantia",  # siempre | garantia (solo notas con garantía) | nunca
+    "warranty_policy_print": "garantia",  # garantia (solo notas con garantía) | siempre | nunca
     "ticket_width": "80",
     "ticket_printer_mode": "local",
     "ticket_printer_host": "",
@@ -281,7 +279,7 @@ def migrate(conn):
 
 # Ajustes que cada sucursal puede tener distintos (dirección en el ticket e impresoras).
 BRANCH_KEYS = [
-    "store_address", "store_phone", "store_whatsapp", "ticket_header",
+    "store_address", "store_phone", "store_whatsapp",
     "ticket_printer_mode", "ticket_printer_host", "ticket_printer_port", "ticket_printer_name", "ticket_width",
     "ticket_open_drawer", "ticket_copies", "ticket_zebra_width_mm",
     "label_printer_mode", "label_printer_host", "label_printer_port", "label_printer_name", "label_dpi",
@@ -297,19 +295,13 @@ def migrate_branches(conn):
         name TEXT NOT NULL UNIQUE,
         code TEXT NOT NULL UNIQUE,
         sells INTEGER NOT NULL DEFAULT 1,
-        next_folio INTEGER NOT NULL DEFAULT 1,
         address TEXT DEFAULT '',
         phone TEXT DEFAULT '',
         agent_token TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL)""")
-    bcols = [r[1] for r in conn.execute("PRAGMA table_info(branches)")]
-    if bcols and "sells" not in bcols:
+    if "sells" not in [r[1] for r in conn.execute("PRAGMA table_info(branches)")]:
         conn.execute("ALTER TABLE branches ADD COLUMN sells INTEGER NOT NULL DEFAULT 1")
-    if bcols and "next_folio" not in bcols:
-        conn.execute("ALTER TABLE branches ADD COLUMN next_folio INTEGER NOT NULL DEFAULT 1")
-        # los folios siguen después de las ventas que ya existen
-        conn.execute("UPDATE branches SET next_folio=(SELECT COALESCE(MAX(id), 0) + 1 FROM sales)")
     if not conn.execute("SELECT COUNT(*) FROM branches").fetchone()[0]:
         in_use = conn.execute("SELECT (SELECT COUNT(*) FROM products) + (SELECT COUNT(*) FROM sales)").fetchone()[0]
         if in_use:
@@ -326,11 +318,6 @@ def migrate_branches(conn):
             # las sucursales imprimen con su agente; la Matriz (servidor) usa su Zebra USB directamente
             conn.execute("""CREATE TABLE IF NOT EXISTS branch_settings (branch_id INTEGER NOT NULL REFERENCES branches(id),
                             key TEXT NOT NULL, value TEXT, PRIMARY KEY (branch_id, key))""")
-            # encabezado y dirección de la nota de González Gallo (como en su talonario)
-            for key, value in (("ticket_header", "GALLO\nHEADBANGER CASES"),
-                               ("store_address", "González Gallo #160, Col. Centro, Tepatitlán de Morelos, Jal.")):
-                conn.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (3,?,?)", (key, value))
-            conn.execute("UPDATE branches SET address=? WHERE id=3", ("González Gallo #160, Col. Centro, Tepatitlán de Morelos, Jal.",))
             for n, (_name, _code, sells) in enumerate(branches, start=1):
                 if sells:
                     for key in ("ticket_printer_mode", "label_printer_mode"):
@@ -376,6 +363,7 @@ OLD_WARRANTY_TEXT = "Garantía sujeta a revisión. No cubre daños por humedad, 
 
 
 def update_default_texts(conn):
+    """Si seguía el texto genérico de garantía, se cambia por las políticas de la tienda."""
     conn.execute("UPDATE settings SET value=? WHERE key='warranty_text' AND value=?",
                  (DEFAULT_SETTINGS["warranty_text"], OLD_WARRANTY_TEXT))
 
