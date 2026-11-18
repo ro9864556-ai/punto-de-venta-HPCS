@@ -64,7 +64,10 @@ def create_app(db_path=None):
         if "branch" in g:
             return g.branch
         u = current_user() if session.get("uid") else None
-        bid = (u or {}).get("branch_id") or session.get("branch_id")
+        if u and u["role"] in MULTI_BRANCH_ROLES:
+            bid = session.get("branch_id") or u.get("branch_id")  # la que eligieron en el menú
+        else:
+            bid = (u or {}).get("branch_id")
         ok = bid and conn().execute("SELECT 1 FROM branches WHERE id=? AND active=1", (bid,)).fetchone()
         if not ok:
             row = conn().execute("SELECT id FROM branches WHERE active=1 ORDER BY id LIMIT 1").fetchone()
@@ -149,13 +152,16 @@ def create_app(db_path=None):
     # Lo que no aparece aquí lo puede usar cualquier usuario con sesión iniciada.
     ADMIN_ONLY = {
         "api_put_settings", "api_printers", "api_print_test", "api_category_create", "api_category_update",
-        "api_category_delete", "api_product_create", "api_product_update", "api_product_delete", "api_products_bulk_create",
-        "api_next_sku", "api_new_barcode", "api_pricing_suggest", "api_pricing_bulk", "api_delete_serial",
-        "api_cancel_sale", "api_export_csv", "api_import_csv", "api_csv_template", "api_backup",
-        "api_users", "api_user_create", "api_user_update",
-        "api_branch_create", "api_branch_update", "api_branch_select", "api_agent_config",
+        "api_category_delete", "api_product_delete", "api_pricing_bulk", "api_delete_serial",
+        "api_cancel_sale", "api_backup", "api_users", "api_user_create", "api_user_update",
+        "api_branch_create", "api_branch_update", "api_agent_config",
     }
-    STAFF_ONLY = {  # administrador y cajero
+    CATALOG = {  # administración y matriz: dar de alta productos y subir inventario
+        "api_product_create", "api_product_update", "api_products_bulk_create", "api_next_sku", "api_new_barcode",
+        "api_pricing_suggest", "api_export_csv", "api_import_csv", "api_csv_template", "api_branch_select",
+    }
+    MULTI_BRANCH_ROLES = ("admin", "matriz")  # pueden cambiar de sucursal y ver todas
+    STAFF_ONLY = {  # administración, matriz y cajero
         "api_add_serials", "api_inventory_adjust", "api_inventory_moves", "api_cash_create", "api_cash_list",
         "api_report", "corte_page", "api_corte_print", "api_dashboard", "api_label_preview", "api_label_zpl",
         "api_create_claim", "api_print_claim", "api_inventory_transfer",
@@ -229,7 +235,8 @@ def create_app(db_path=None):
             return redirect("/login")
         role = user["role"]
         if (request.endpoint in ADMIN_ONLY and role != "admin") or \
-           (request.endpoint in STAFF_ONLY and role not in ("admin", "cajero")):
+           (request.endpoint in CATALOG and role not in MULTI_BRANCH_ROLES) or \
+           (request.endpoint in STAFF_ONLY and role not in ("admin", "matriz", "cajero")):
             msg = f"Tu usuario ({dbm.ROLES.get(role, role)}) no tiene permiso para esta acción."
             return (jsonify({"error": msg}), 403) if wants_json else (msg, 403)
         return None
@@ -273,7 +280,7 @@ def create_app(db_path=None):
         u["role_name"] = dbm.ROLES.get(u["role"], u["role"])
         b = branch_row(branch_id())
         u["branch"] = {"id": b["id"], "name": b["name"], "code": b["code"]}
-        u["can_switch_branch"] = u["role"] == "admin" and not u.get("branch_id")
+        u["can_switch_branch"] = u["role"] in MULTI_BRANCH_ROLES
         return jsonify(u)
 
     # ------------------------------------------------------------ sucursales
@@ -345,7 +352,7 @@ def create_app(db_path=None):
 
     def report_branches():
         """Sucursales que entran en reportes/listados: cajero y vendedor solo la suya."""
-        if current_user()["role"] != "admin" or current_user().get("branch_id"):
+        if current_user()["role"] not in MULTI_BRANCH_ROLES:
             return [branch_id()]
         sel = request.args.get("branch") or ""
         if sel == "all":

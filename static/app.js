@@ -227,8 +227,9 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-const NAV_ROLES = { vender: ["admin", "cajero", "vendedor"], productos: ["admin", "cajero", "vendedor"], garantias: ["admin", "cajero", "vendedor"], etiquetas: ["admin", "cajero"],
-  inventario: ["admin", "cajero"], ventas: ["admin", "cajero", "vendedor"], corte: ["admin", "cajero"], config: ["admin"] };
+const ALL_ROLES = ["admin", "matriz", "cajero", "vendedor"];
+const NAV_ROLES = { vender: ALL_ROLES, productos: ALL_ROLES, garantias: ALL_ROLES, etiquetas: ["admin", "matriz", "cajero"],
+  inventario: ["admin", "matriz", "cajero"], ventas: ALL_ROLES, corte: ["admin", "matriz", "cajero"], config: ["admin"] };
 async function loadBase() {
   S.me = await GET("/api/me");
   S.sellers = await GET("/api/sellers");
@@ -742,15 +743,16 @@ async function loadProducts() {
         <td><b>${esc(p.name)}</b>${p.serialized ? ' <span class="badge info">IMEI</span>' : ""}<div class="small muted">${esc([p.brand, p.model, p.ram ? p.ram + " RAM" : "", p.capacity, p.color, p.condition].filter(Boolean).join(" · "))}</div></td>
         <td>${esc(p.category_name || "—")}</td><td class="num cost-col">${money(p.cost)}</td><td class="num"><b>${money(p.price)}</b></td>
         <td class="num cost-col ${margin < 15 ? "danger" : ""}">${margin.toFixed(0)}%</td><td class="num small">${p.warranty_days ? warrantyLabel(p.warranty_days) : "—"}${p.warranty_changes ? `<div class="muted">${p.warranty_changes} cambio${p.warranty_changes > 1 ? "s" : ""}</div>` : ""}</td><td class="num">${st}</td><td class="num multi-col small muted">${p.track_stock ? Number(p.stock_total) : ""}</td>
-        <td>${can("admin") ? '<button class="sm" data-a="edit">Editar</button> ' : ""}${can("admin", "cajero") ? '<button class="sm" data-a="label">🏷️</button> ' : ""}
-          ${p.serialized && can("admin", "cajero") ? '<button class="sm" data-a="imei">IMEI</button>' : ""} ${can("admin") ? '<button class="sm danger icon-btn" data-a="del" title="Eliminar">✕</button>' : ""}</td></tr>`;
+        <td>${can("admin", "matriz") ? '<button class="sm" data-a="edit">Editar</button> ' : ""}${can("admin", "matriz", "cajero") ? '<button class="sm" data-a="label">🏷️</button> ' : ""}
+          ${p.serialized && can("admin", "matriz", "cajero") ? '<button class="sm" data-a="imei">IMEI</button>' : ""} ${can("admin") ? '<button class="sm danger icon-btn" data-a="del" title="Eliminar">✕</button>' : ""}</td></tr>`;
     }).join("") : `<tr><td colspan="11" class="empty">No hay productos. Da clic en “Nuevo producto” o importa un CSV.</td></tr>`;
   } catch (e) { fail(e); }
 }
 
 VIEWS.productos = () => {
   $("#view-productos").classList.toggle("single-branch", !S.multi);
-  $$(".admin-only", $("#view-productos")).forEach((x) => x.classList.toggle("hidden", !can("admin")));
+  $$(".admin-only", $("#view-productos")).forEach((x) => x.classList.toggle("hidden", !can("admin", "matriz")));
+  $("#p-bulk").classList.toggle("hidden", !can("admin"));
   $("#view-productos").classList.toggle("no-costs", can("vendedor"));
   const sel = $("#p-cat"), v = sel.value;
   sel.innerHTML = catOptions(v, "Todas las categorías");
@@ -1062,7 +1064,7 @@ function initGarantias() {
 function renderWarranty(items) {
   const box = $("#w-list");
   if (!items.length) { box.innerHTML = '<div class="card empty">No se encontraron artículos con garantía. Revisa el IMEI o teléfono.</div>'; return; }
-  const staff = can("admin", "cajero");
+  const staff = can("admin", "matriz", "cajero");
   box.innerHTML = items.map((it) => {
     const status = it.sale_status !== "completada" ? '<span class="badge bad">Venta cancelada</span>'
       : it.valid ? `<span class="badge ok">Vigente · vence ${fmtDate(it.expires)} (${it.days_left} días)</span>`
@@ -1403,7 +1405,7 @@ function initVentas() {
 }
 VIEWS.ventas = async () => {
   try {
-    if (!$("#v-branch").options.length) $("#v-branch").innerHTML = branchOptions("");
+    if (!$("#v-branch").options.length) $("#v-branch").innerHTML = branchOptions(S.me.can_switch_branch ? "all" : "");
     $("#view-ventas").classList.toggle("single-branch", !S.multi);
     $("#view-ventas").classList.toggle("no-branch-pick", !(S.multi && S.me.can_switch_branch));
     const list = await GET(`/api/sales?from=${$("#v-from").value}&to=${$("#v-to").value}&q=${encodeURIComponent($("#v-q").value)}&all=${$("#v-all").checked ? 1 : 0}${branchParam("#v-branch")}`);
@@ -1459,7 +1461,7 @@ function initCorte() {
   };
 }
 VIEWS.corte = async () => {
-  if (!$("#c-branch").options.length) { $("#c-branch").innerHTML = branchOptions(""); $("#c-branch").onchange = VIEWS.corte; }
+  if (!$("#c-branch").options.length) { $("#c-branch").innerHTML = branchOptions(S.me.can_switch_branch ? "all" : ""); $("#c-branch").onchange = VIEWS.corte; }
   $("#view-corte").classList.toggle("single-branch", !S.multi);
   $("#view-corte").classList.toggle("no-branch-pick", !(S.multi && S.me.can_switch_branch));
   const q = `from=${$("#c-from").value}&to=${$("#c-to").value}${branchParam("#c-branch")}`;
@@ -1494,7 +1496,7 @@ function field(key, label, opts = {}) {
 
 function initConfig() { /* se dibuja al entrar */ }
 
-const userBranchOptions = (sel) => `<option value="">Todas (solo administradores)</option>` +
+const userBranchOptions = (sel) => `<option value="">Todas (Administración)</option>` +
   S.branches.map((b) => `<option value="${b.id}" ${String(b.id) === String(sel ?? "") ? "selected" : ""}>${esc(b.name)}</option>`).join("");
 
 async function loadBranches() {
@@ -1620,7 +1622,7 @@ VIEWS.config = async () => {
       En la computadora de cada sucursal corre el <b>agente de impresión</b> (<span class="mono">iniciar_agente.bat</span>) con su <span class="mono">agente.json</span>.</p>
       <table><thead><tr><th>Sucursal</th><th>Clave folio</th><th>Dirección</th><th>Teléfono</th><th>Activa</th><th>Agente de impresión</th><th></th></tr></thead><tbody id="br-body"></tbody></table></div>
     <div data-p="users" class="card hidden">
-      <p class="small muted" style="margin-top:0"><b>Administrador</b>: todo. <b>Cajero</b>: cobra las notas de los vendedores, hace notas, registra cambios por garantía, etiquetas, inventario, corte de caja. <b>Vendedor</b>: arma la venta y la envía a caja, consulta garantías (no ve costos, no cambia precios, no cancela ventas).</p>
+      <p class="small muted" style="margin-top:0"><b>Administración</b>: todo, en todas las sucursales. <b>Matriz (supervisor)</b>: revisa todas las sucursales, da de alta productos y sube inventario a cualquiera (entradas, IMEI, traspasos, etiquetas) y ve sus ventas y cortes; no configura ni cancela ventas. <b>Cajero</b>: cobra las notas de los vendedores, hace notas, registra cambios por garantía, etiquetas, inventario, corte de caja. <b>Vendedor</b>: arma la venta y la envía a caja, consulta garantías (no ve costos, no cambia precios, no cancela ventas).</p>
       <div style="margin-bottom:12px">${field("seller_can_charge", "Permitir que los vendedores también cobren (si no, solo envían la nota a caja)", { type: "check" })}</div>
       <table><thead><tr><th>Usuario</th><th>Nombre (sale en el ticket)</th><th>Rol</th><th>Sucursal</th><th>Nueva contraseña</th><th>Activo</th><th></th></tr></thead><tbody id="usr-body"></tbody></table></div>
     <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;

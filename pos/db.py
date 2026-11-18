@@ -209,7 +209,7 @@ def init_db(path):
     if not conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
         from werkzeug.security import generate_password_hash
         conn.execute("INSERT INTO users(username, full_name, role, password_hash, must_change, created_at) VALUES (?,?,?,?,1,?)",
-                     ("admin", "Administrador", "admin", generate_password_hash("admin"), now()))
+                     ("admin", "Administración", "admin", generate_password_hash("admin"), now()))
     if not conn.execute("SELECT value FROM settings WHERE key='secret_key'").fetchone():
         import secrets
         conn.execute("INSERT INTO settings(key, value) VALUES ('secret_key', ?)", (secrets.token_hex(32),))
@@ -217,7 +217,10 @@ def init_db(path):
     conn.close()
 
 
-ROLES = {"admin": "Administrador", "cajero": "Cajero", "vendedor": "Vendedor"}
+ROLES = {"admin": "Administración", "matriz": "Matriz (supervisor)", "cajero": "Cajero", "vendedor": "Vendedor"}
+
+# Sucursales con las que arranca una instalación nueva: nombre, clave de folio
+DEFAULT_BRANCHES = [("Matriz", "M"), ("J. Jesús Reynoso", "JR"), ("González Gallo", "GG")]
 
 MIGRATIONS = [
     # tabla, columna, definición
@@ -292,10 +295,17 @@ def migrate_branches(conn):
         active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL)""")
     if not conn.execute("SELECT COUNT(*) FROM branches").fetchone()[0]:
-        row = conn.execute("SELECT value FROM settings WHERE key='folio_prefix'").fetchone()
-        code = (row[0] if row else "V").strip(" -") or "V"
-        conn.execute("INSERT INTO branches(id, name, code, agent_token, created_at) VALUES (1, 'Matriz', ?, ?, ?)",
-                     (code, secrets.token_urlsafe(18), now()))
+        in_use = conn.execute("SELECT (SELECT COUNT(*) FROM products) + (SELECT COUNT(*) FROM sales)").fetchone()[0]
+        if in_use:
+            # base que ya se usaba con una sola tienda: todo queda como Matriz y los folios siguen igual
+            row = conn.execute("SELECT value FROM settings WHERE key='folio_prefix'").fetchone()
+            code = (row[0] if row else "V").strip(" -") or "V"
+            branches = [("Matriz", code)]
+        else:
+            branches = DEFAULT_BRANCHES
+        for n, (name, code) in enumerate(branches, start=1):
+            conn.execute("INSERT INTO branches(id, name, code, agent_token, created_at) VALUES (?,?,?,?,?)",
+                         (n, name, code, secrets.token_urlsafe(18), now()))
     conn.execute("""CREATE TABLE IF NOT EXISTS branch_stock (
         product_id INTEGER NOT NULL REFERENCES products(id),
         branch_id INTEGER NOT NULL REFERENCES branches(id),

@@ -96,14 +96,14 @@ def test_sale_flow_and_cancel(client):
     sale = r.get_json()["sale"]
     assert sale["total"] == 199 * 2 - 20 + 3499
     assert sale["change"] == round(4000 - sale["total"], 2)
-    assert sale["folio"] == "V-000001"
+    assert sale["folio"] == "M-000001"  # venta en la Matriz
     assert client.get(f"/api/products/{p['id']}").get_json()["stock"] == 3
     assert client.get(f"/api/products/{phone['id']}").get_json()["stock"] == 1
     # IMEI ya vendido
     assert client.get("/api/lookup?code=356789012345678").status_code == 409
     # ticket
     html = client.get(f"/tickets/{sale['id']}").get_data(as_text=True)
-    assert "V-000001" in html and "356789012345678" in html
+    assert "M-000001" in html and "356789012345678" in html
     assert client.get(f"/tickets/{sale['id']}?format=zpl").get_data(as_text=True).startswith("^XA")
     assert client.get(f"/tickets/{sale['id']}?format=escpos").data.startswith(b"\x1b@")
     rep = client.get("/api/reports/summary").get_json()
@@ -313,14 +313,16 @@ def test_phone_label_and_scan_to_sell(client):
 
 def test_branches_stock_transfer_reports_and_agent(app, client):
     import base64
-    r = client.post("/api/branches", json={"name": "Centro", "code": "S2", "address": "Calle 5 #20", "phone": "55 2222 3333"})
-    assert r.status_code == 201
-    s2 = r.get_json()["id"]
+    branches = {b["code"]: b for b in client.get("/api/branches").get_json()}
+    assert [b["name"] for b in branches.values()] == ["Matriz", "J. Jesús Reynoso", "González Gallo"]
+    s2 = branches["JR"]["id"]
+    assert client.put(f"/api/branches/{s2}", json={"name": "J. Jesús Reynoso", "code": "JR", "address": "Calle 5 #20",
+                                                    "phone": "55 2222 3333"}).status_code == 200
     client.post("/api/users", json={"username": "caja2", "full_name": "Caja Centro", "role": "cajero", "password": "1234", "branch_id": s2})
     funda = _product(client, initial_stock=5)  # se da de alta en la Matriz
     phone = _product(client, name="Galaxy A07", category_id=1, price=2899, serialized=1, initial_stock=0, imeis="350000000000000")
     caja2 = login(app, "caja2", "1234")
-    assert caja2.get("/api/me").get_json()["branch"]["code"] == "S2"
+    assert caja2.get("/api/me").get_json()["branch"]["code"] == "JR"
     assert caja2.get(f"/api/products/{funda['id']}").get_json()["stock"] == 0  # existencia separada
     assert caja2.post("/api/sales", json={"items": [{"product_id": funda["id"], "qty": 1}], "payment_method": "tarjeta"}).status_code == 400
     # el teléfono está en la Matriz
@@ -332,23 +334,23 @@ def test_branches_stock_transfer_reports_and_agent(app, client):
     assert client.post("/api/inventory/transfer", json={"product_id": funda["id"], "to_branch_id": s2, "qty": 50}).status_code == 400
     p = client.get(f"/api/products/{funda['id']}").get_json()
     assert p["stock"] == 3 and p["stock_total"] == 5
-    assert {b["name"]: b["stock"] for b in p["stock_by_branch"]} == {"Matriz": 3, "Centro": 2}
+    assert {b["name"]: b["stock"] for b in p["stock_by_branch"]} == {"Matriz": 3, "J. Jesús Reynoso": 2, "González Gallo": 0}
     # venta en Centro: folio con su clave y existencia de Centro
     sale = caja2.post("/api/sales", json={"items": [{"product_id": funda["id"], "qty": 1},
                                                    {"product_id": phone["id"], "qty": 1, "imei": "350000000000000"}],
                                           "payment_method": "efectivo", "received": 5000}).get_json()["sale"]
-    assert sale["folio"].startswith("S2-") and sale["branch_id"] == s2
+    assert sale["folio"].startswith("JR-") and sale["branch_id"] == s2
     assert caja2.get(f"/api/products/{funda['id']}").get_json()["stock"] == 1
     assert client.get(f"/api/products/{funda['id']}").get_json()["stock"] == 3
     txt = caja2.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
-    assert "Sucursal:" in txt and "Centro" in txt and "Calle 5 #20" in txt
+    assert "Sucursal:" in txt and "J. Jesús Reynoso" in txt and "Calle 5 #20" in txt
     m = client.post("/api/sales", json={"items": [{"product_id": funda["id"], "qty": 1}], "payment_method": "tarjeta"}).get_json()["sale"]
-    assert m["folio"].startswith("V-")
+    assert m["folio"].startswith("M-")
     # reportes: cajero solo su sucursal; administrador elige una o todas
     assert caja2.get("/api/reports/summary?branch=all").get_json()["sales_count"] == 1
     assert client.get("/api/reports/summary").get_json()["sales_count"] == 1
     allr = client.get("/api/reports/summary?branch=all").get_json()
-    assert allr["sales_count"] == 2 and {b["branch"]: b["n"] for b in allr["by_branch"]} == {"Matriz": 1, "Centro": 1}
+    assert allr["sales_count"] == 2 and {b["branch"]: b["n"] for b in allr["by_branch"]} == {"Matriz": 1, "J. Jesús Reynoso": 1, "González Gallo": 0}
     assert len(caja2.get("/api/sales?from=2000-01-01&to=2999-12-31&branch=all").get_json()) == 1
     # impresión por agente: el administrador configura la impresora de Centro
     assert client.post("/api/branch/select", json={"branch_id": s2}).status_code == 200
@@ -361,10 +363,40 @@ def test_branches_stock_transfer_reports_and_agent(app, client):
     token = [b for b in client.get("/api/branches").get_json() if b["id"] == s2][0]["agent_token"]
     assert "agent_token" not in caja2.get("/api/branches").get_json()[0]
     anon = app.test_client()
-    assert anon.get("/api/agent/jobs?code=S2&token=mal").status_code == 401
-    jobs = anon.get(f"/api/agent/jobs?code=S2&token={token}").get_json()["jobs"]
+    assert anon.get("/api/agent/jobs?code=JR&token=mal").status_code == 401
+    jobs = anon.get(f"/api/agent/jobs?code=JR&token={token}").get_json()["jobs"]
     assert len(jobs) == 1 and base64.b64decode(jobs[0]["data"]).startswith(b"\x1b@")
-    assert anon.post(f"/api/agent/jobs/{jobs[0]['id']}/done?code=S2&token={token}", json={"ok": True}).status_code == 200
-    assert anon.get(f"/api/agent/jobs?code=S2&token={token}").get_json()["jobs"] == []
+    assert anon.post(f"/api/agent/jobs/{jobs[0]['id']}/done?code=JR&token={token}", json={"ok": True}).status_code == 200
+    assert anon.get(f"/api/agent/jobs?code=JR&token={token}").get_json()["jobs"] == []
     cfg = client.get(f"/api/branches/{s2}/agente.json").get_json()
-    assert cfg["sucursal"] == "S2" and cfg["token"] == token
+    assert cfg["sucursal"] == "JR" and cfg["token"] == token
+
+
+def test_matriz_supervisor_role(app, client):
+    """Matriz: revisa ambas sucursales y sube inventario a cualquiera; no configura ni cancela."""
+    client.post("/api/users", json={"username": "matriz", "full_name": "Encargado Matriz", "role": "matriz",
+                                    "password": "1234", "branch_id": 1})
+    client.post("/api/users", json={"username": "caja", "full_name": "Caja GG", "role": "cajero", "password": "1234", "branch_id": 3})
+    m = login(app, "matriz", "1234")
+    me = m.get("/api/me").get_json()
+    assert me["role_name"] == "Matriz (supervisor)" and me["can_switch_branch"]
+    # da de alta productos y sube inventario directo a González Gallo
+    p = m.post("/api/products", json={"name": "Cargador 20W", "category_id": 4, "cost": 90, "price": 199}).get_json()
+    assert m.post("/api/branch/select", json={"branch_id": 3}).status_code == 200
+    assert m.post("/api/inventory/adjust", json={"product_id": p["id"], "kind": "entrada", "qty": 8}).status_code == 200
+    assert m.post("/api/inventory/transfer", json={"product_id": p["id"], "to_branch_id": 2, "qty": 3}).status_code == 200
+    stock = {b["name"]: b["stock"] for b in m.get(f"/api/products/{p['id']}").get_json()["stock_by_branch"]}
+    assert stock == {"Matriz": 0, "J. Jesús Reynoso": 3, "González Gallo": 5}
+    # ve ventas y cortes de todas las sucursales
+    caja = login(app, "caja", "1234")
+    caja.post("/api/sales", json={"items": [{"product_id": p["id"], "qty": 1}], "payment_method": "tarjeta", "print": False})
+    assert m.get("/api/reports/summary?branch=all").get_json()["sales_count"] == 1
+    # no configura, no administra usuarios, no cancela, no cambia precios masivos, no borra productos
+    assert m.put("/api/settings", json={"store_name": "x"}).status_code == 403
+    assert m.get("/api/users").status_code == 403
+    assert m.post("/api/sales/1/cancel", json={}).status_code == 403
+    assert m.post("/api/pricing/bulk", json={"value": 10}).status_code == 403
+    assert m.delete(f"/api/products/{p['id']}").status_code == 403
+    # el cajero no puede cambiar de sucursal ni dar de alta productos
+    assert caja.post("/api/branch/select", json={"branch_id": 1}).status_code == 403
+    assert caja.post("/api/products", json={"name": "x"}).status_code == 403

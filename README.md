@@ -27,16 +27,28 @@ Crea a tu equipo en **Configuración → Usuarios**:
 
 | Rol | Puede |
 |---|---|
-| **Administrador** | Todo: productos, precios, configuración, usuarios, cancelar ventas, respaldos. |
-| **Cajero** | Vender y cobrar a nombre de cualquier vendedor, etiquetas, inventario e IMEI, corte de caja. |
-| **Vendedor** | Hacer notas de venta a su nombre, buscar garantías. No ve costos, no cambia precios (sí puede dar descuento) y no cancela. |
+| **Administración** | Todo, en todas las sucursales: inventarios, ventas, precios, configuración, usuarios, cancelar ventas, respaldos. |
+| **Matriz (supervisor)** | Revisa todas las sucursales: da de alta productos y sube inventario a cualquiera (entradas, IMEI, traspasos, etiquetas), ve ventas, cortes y garantías de todas. No configura el sistema, no administra usuarios, no cancela ventas ni hace cambios masivos de precio. |
+| **Cajero** | En su sucursal: cobra las notas de los vendedores, hace notas, etiquetas, inventario e IMEI, cambios por garantía, corte de caja. |
+| **Vendedor** | En su sucursal: arma la venta y la envía a caja, consulta garantías. No ve costos, no cambia precios (sí puede dar descuento) y no cancela. |
 
 ## Varias sucursales en red
 
-Una sola computadora es el **servidor** (normalmente la de la Matriz) y guarda toda la información.
+La instalación nueva ya trae la estructura de la tienda:
+
+| Sucursal | Clave de folio | Quién trabaja ahí |
+|---|---|---|
+| **Matriz** | `M-000001` | Encargado de matriz (supervisa y surte a las sucursales). |
+| **J. Jesús Reynoso** | `JR-000001` | Cajeros y vendedores de esa sucursal. |
+| **González Gallo** | `GG-000001` | Cajeros y vendedores de esa sucursal. |
+
+**Administración** no es una sucursal: es el usuario administrador con sucursal “Todas”, que ve y controla
+todo. Nombres, claves y direcciones se cambian en **Configuración → Sucursales**.
+
+Una sola computadora es el **servidor** (la que siempre está encendida: Matriz o Administración) y guarda toda la información.
 Las sucursales y la computadora de administración entran desde el navegador. Todas ven los mismos
-productos y precios; cada sucursal tiene **su propia existencia, sus IMEI, sus folios** (`V-000123`,
-`S2-000124`), **su caja y sus impresoras**. El administrador puede trabajar en cualquier sucursal
+productos y precios; cada sucursal tiene **su propia existencia, sus IMEI, sus folios** (`JR-000123`,
+`GG-000124`), **su caja y sus impresoras**. Administración y Matriz pueden trabajar en cualquier sucursal
 (selector 📍 en el menú) y ver reportes de una o de **todas las sucursales**. Los cajeros y vendedores
 solo ven la suya. Entre sucursales se hacen **traspasos** (Inventario → movimiento “Traspaso”).
 
@@ -52,7 +64,7 @@ Así las computadoras se ven entre sí por internet de forma cifrada, sin abrir 
 > suspensión en Opciones de energía). Si una sucursal pierde internet, no podrá vender hasta que regrese.
 
 ### Paso 2 · Dar de alta las sucursales
-Como administrador: **Configuración → Sucursales** → nombre, clave del folio (p. ej. `S2`), dirección y
+Como administrador: **Configuración → Sucursales** → nombre, clave del folio (p. ej. `JR`), dirección y
 teléfono (salen en el ticket de esa sucursal). En **Usuarios** asigna la sucursal de cada cajero y vendedor.
 Para mover mercancía: **Inventario** → selecciona el producto → “Traspaso a otra sucursal”
 (los celulares se traspasan escaneando su IMEI).
@@ -70,7 +82,8 @@ programa pequeño, el **agente**, que recibe los tickets y etiquetas y los manda
    **Etiquetas Zebra** elige “Agente de impresión de la sucursal”. En Configuración → Sucursales verás
    el agente como **Conectado**.
 
-En la computadora servidor (Matriz) las impresoras siguen como “USB instalada en este equipo”.
+En la computadora que es el servidor, sus impresoras siguen como “USB instalada en este equipo”. Si el
+servidor está en Administración, la Matriz también usa su propio agente de impresión.
 
 ## Logo
 
