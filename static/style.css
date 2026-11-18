@@ -245,3 +245,5 @@ nav a:has(.nav-badge:not(.hidden)) kbd { margin-left: 6px; }
 .branch-box select { width: auto; max-width: 170px; padding: 3px 6px; font-size: 13px; background: #1b2f57; color: #fff; border-color: #34508a; }
 .single-branch .multi-col { display: none; }
 .no-branch-pick .admin-branch { display: none; }
+.bodega-note { max-width: 640px; margin: 40px auto; text-align: center; border-top: 4px solid var(--brand-red); }
+.bodega-note .row { justify-content: center; margin-top: 12px; }

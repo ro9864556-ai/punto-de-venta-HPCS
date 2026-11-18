@@ -219,7 +219,7 @@ $$("#nav a").forEach((a) => a.addEventListener("click", () => go(a.dataset.view)
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { const m = topModal(); if (m) { e.preventDefault(); m.close(); } return; }
-  if (e.key === "F1") { e.preventDefault(); go("vender"); }
+  if (e.key === "F1" && !can("matriz")) { e.preventDefault(); go("vender"); }
   if (e.key === "F3") { e.preventDefault(); go("garantias"); }
   if (S.view === "vender" && !topModal()) {
     if (e.key === "F2") { e.preventDefault(); checkout(); }
@@ -228,7 +228,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 const ALL_ROLES = ["admin", "matriz", "cajero", "vendedor"];
-const NAV_ROLES = { vender: ALL_ROLES, productos: ALL_ROLES, garantias: ALL_ROLES, etiquetas: ["admin", "matriz", "cajero"],
+const NAV_ROLES = { vender: ["admin", "cajero", "vendedor"], productos: ALL_ROLES, garantias: ALL_ROLES, etiquetas: ["admin", "matriz", "cajero"],
   inventario: ["admin", "matriz", "cajero"], ventas: ALL_ROLES, corte: ["admin", "matriz", "cajero"], config: ["admin"] };
 async function loadBase() {
   S.me = await GET("/api/me");
@@ -690,7 +690,18 @@ async function showSale(id) {
   });
 }
 
-VIEWS.vender = () => { renderTotals(); renderPendingBanner(); refreshPending(); focusScan(); };
+VIEWS.vender = () => {
+  const bodega = S.me && !S.me.branch.sells;
+  let note = $("#bodega-note");
+  if (!note) { note = document.createElement("div"); note.id = "bodega-note"; $("#view-vender").prepend(note); }
+  note.className = bodega ? "card bodega-note" : "hidden";
+  note.innerHTML = bodega ? `<h2>🏬 ${esc(S.me.branch.name)} es bodega</h2><p>Aquí no se vende al público. Elige la sucursal donde vas a vender:</p>
+    <div class="row">${S.branches.filter((b) => b.active && b.sells).map((b) => `<button class="primary" data-go-branch="${b.id}">${esc(b.name)}</button>`).join("")}</div>` : "";
+  $$("[data-go-branch]", note).forEach((b) => b.onclick = async () => { await POST("/api/branch/select", { branch_id: +b.dataset.goBranch }); location.reload(); });
+  $(".pos").classList.toggle("hidden", bodega);
+  if (bodega) return;
+  renderTotals(); renderPendingBanner(); refreshPending(); focusScan();
+};
 
 /* ================================================================== PRODUCTOS */
 function initProductos() {
@@ -1510,21 +1521,23 @@ async function loadBranches() {
   };
   body.innerHTML = list.map((b) => `<tr data-id="${b.id}"><td><input data-b="name" value="${esc(b.name)}"></td>
       <td><input data-b="code" value="${esc(b.code)}" class="mono" style="width:70px"></td><td><input data-b="address" value="${esc(b.address || "")}"></td>
-      <td><input data-b="phone" value="${esc(b.phone || "")}" style="width:130px"></td><td class="center"><input type="checkbox" data-b="active" ${b.active ? "checked" : ""}></td>
+      <td><input data-b="phone" value="${esc(b.phone || "")}" style="width:130px"></td>
+      <td class="center"><input type="checkbox" data-b="sells" ${b.sells ? "checked" : ""}>${b.sells ? "" : '<div class="small muted">Bodega</div>'}</td>
+      <td class="center"><input type="checkbox" data-b="active" ${b.active ? "checked" : ""}></td>
       <td>${agentState(b)}${b.pending_jobs ? ` <span class="badge warn">${b.pending_jobs} en cola</span>` : ""}<div><a class="small" href="/api/branches/${b.id}/agente.json">⬇ Descargar agente.json</a></div></td>
       <td><button class="sm" data-a="save">Guardar</button></td></tr>`).join("") +
-    `<tr><td><input id="nb-name" placeholder="Nombre, p. ej. Centro"></td><td><input id="nb-code" class="mono" placeholder="S2" style="width:70px"></td>
-      <td><input id="nb-address" placeholder="Dirección (sale en el ticket)"></td><td><input id="nb-phone" placeholder="Teléfono" style="width:130px"></td><td></td><td></td>
+    `<tr><td><input id="nb-name" placeholder="Nueva sucursal"></td><td><input id="nb-code" class="mono" placeholder="Clave" style="width:70px"></td>
+      <td><input id="nb-address" placeholder="Dirección (sale en el ticket)"></td><td><input id="nb-phone" placeholder="Teléfono" style="width:130px"></td><td class="center"><input type="checkbox" id="nb-sells" checked></td><td></td><td></td>
       <td><button class="sm primary" id="nb-add">Agregar</button></td></tr>`;
   body.onclick = async (e) => {
     const b = e.target.closest("button"); if (!b) return;
     try {
       if (b.id === "nb-add") {
-        await POST("/api/branches", { name: $("#nb-name").value, code: $("#nb-code").value, address: $("#nb-address").value, phone: $("#nb-phone").value });
+        await POST("/api/branches", { name: $("#nb-name").value, code: $("#nb-code").value, address: $("#nb-address").value, phone: $("#nb-phone").value, sells: $("#nb-sells").checked ? 1 : 0 });
         toast("Sucursal agregada", "ok");
       } else {
         const tr = b.closest("tr"), v = (k) => tr.querySelector(`[data-b="${k}"]`);
-        await PUT(`/api/branches/${tr.dataset.id}`, { name: v("name").value, code: v("code").value, address: v("address").value, phone: v("phone").value, active: v("active").checked ? 1 : 0 });
+        await PUT(`/api/branches/${tr.dataset.id}`, { name: v("name").value, code: v("code").value, address: v("address").value, phone: v("phone").value, sells: v("sells").checked ? 1 : 0, active: v("active").checked ? 1 : 0 });
         toast("Sucursal guardada", "ok");
       }
       await loadBase(); loadBranches(); loadUsers();
@@ -1620,7 +1633,7 @@ VIEWS.config = async () => {
     <div data-p="branches" class="card hidden">
       <p class="small muted" style="margin-top:0">Todas las sucursales comparten productos y precios; cada una tiene su existencia, sus IMEI, sus folios (<span class="mono">CLAVE-000123</span>), su caja y sus impresoras.
       En la computadora de cada sucursal corre el <b>agente de impresión</b> (<span class="mono">iniciar_agente.bat</span>) con su <span class="mono">agente.json</span>.</p>
-      <table><thead><tr><th>Sucursal</th><th>Clave folio</th><th>Dirección</th><th>Teléfono</th><th>Activa</th><th>Agente de impresión</th><th></th></tr></thead><tbody id="br-body"></tbody></table></div>
+      <table><thead><tr><th>Sucursal</th><th>Clave folio</th><th>Dirección</th><th>Teléfono</th><th>Vende al público</th><th>Activa</th><th>Agente de impresión</th><th></th></tr></thead><tbody id="br-body"></tbody></table></div>
     <div data-p="users" class="card hidden">
       <p class="small muted" style="margin-top:0"><b>Administración</b>: todo, en todas las sucursales. <b>Matriz (supervisor)</b>: revisa todas las sucursales, da de alta productos y sube inventario a cualquiera (entradas, IMEI, traspasos, etiquetas) y ve sus ventas y cortes; no configura ni cancela ventas. <b>Cajero</b>: cobra las notas de los vendedores, hace notas, registra cambios por garantía, etiquetas, inventario, corte de caja. <b>Vendedor</b>: arma la venta y la envía a caja, consulta garantías (no ve costos, no cambia precios, no cancela ventas).</p>
       <div style="margin-bottom:12px">${field("seller_can_charge", "Permitir que los vendedores también cobren (si no, solo envían la nota a caja)", { type: "check" })}</div>
@@ -1692,6 +1705,6 @@ function tick() { $("#clock").textContent = new Date().toLocaleString("es-MX", {
   try { await loadBase(); } catch (e) { fail(e); }
   initVender(); initProductos(); initGarantias(); initEtiquetas(); initInventario(); initVentas(); initCorte(); initConfig();
   tick(); setInterval(tick, 20000);
-  go("vender");
+  go(can("matriz") ? "inventario" : "vender");  // la Matriz es bodega: entra directo a Inventario
   if (S.me?.must_change) changePassword(true);
 })();

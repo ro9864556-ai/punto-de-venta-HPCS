@@ -220,7 +220,8 @@ def init_db(path):
 ROLES = {"admin": "Administración", "matriz": "Matriz (supervisor)", "cajero": "Cajero", "vendedor": "Vendedor"}
 
 # Sucursales con las que arranca una instalación nueva: nombre, clave de folio
-DEFAULT_BRANCHES = [("Matriz", "M"), ("J. Jesús Reynoso", "JR"), ("González Gallo", "GG")]
+# nombre, clave de folio, ¿vende al público?  (la Matriz es bodega y es la computadora servidor)
+DEFAULT_BRANCHES = [("Matriz", "M", 0), ("J. Jesús Reynoso", "JR", 1), ("González Gallo", "GG", 1)]
 
 MIGRATIONS = [
     # tabla, columna, definición
@@ -289,23 +290,34 @@ def migrate_branches(conn):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
         code TEXT NOT NULL UNIQUE,
+        sells INTEGER NOT NULL DEFAULT 1,
         address TEXT DEFAULT '',
         phone TEXT DEFAULT '',
         agent_token TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL)""")
+    if "sells" not in [r[1] for r in conn.execute("PRAGMA table_info(branches)")]:
+        conn.execute("ALTER TABLE branches ADD COLUMN sells INTEGER NOT NULL DEFAULT 1")
     if not conn.execute("SELECT COUNT(*) FROM branches").fetchone()[0]:
         in_use = conn.execute("SELECT (SELECT COUNT(*) FROM products) + (SELECT COUNT(*) FROM sales)").fetchone()[0]
         if in_use:
             # base que ya se usaba con una sola tienda: todo queda como Matriz y los folios siguen igual
             row = conn.execute("SELECT value FROM settings WHERE key='folio_prefix'").fetchone()
             code = (row[0] if row else "V").strip(" -") or "V"
-            branches = [("Matriz", code)]
+            branches = [("Matriz", code, 1)]
         else:
             branches = DEFAULT_BRANCHES
-        for n, (name, code) in enumerate(branches, start=1):
-            conn.execute("INSERT INTO branches(id, name, code, agent_token, created_at) VALUES (?,?,?,?,?)",
-                         (n, name, code, secrets.token_urlsafe(18), now()))
+        for n, (name, code, sells) in enumerate(branches, start=1):
+            conn.execute("INSERT INTO branches(id, name, code, sells, agent_token, created_at) VALUES (?,?,?,?,?,?)",
+                         (n, name, code, sells, secrets.token_urlsafe(18), now()))
+        if not in_use:
+            # las sucursales imprimen con su agente; la Matriz (servidor) usa su Zebra USB directamente
+            conn.execute("""CREATE TABLE IF NOT EXISTS branch_settings (branch_id INTEGER NOT NULL REFERENCES branches(id),
+                            key TEXT NOT NULL, value TEXT, PRIMARY KEY (branch_id, key))""")
+            for n, (_name, _code, sells) in enumerate(branches, start=1):
+                if sells:
+                    for key in ("ticket_printer_mode", "label_printer_mode"):
+                        conn.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?,?,'agent')", (n, key))
     conn.execute("""CREATE TABLE IF NOT EXISTS branch_stock (
         product_id INTEGER NOT NULL REFERENCES products(id),
         branch_id INTEGER NOT NULL REFERENCES branches(id),

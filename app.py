@@ -279,13 +279,13 @@ def create_app(db_path=None):
         u = dict(current_user())
         u["role_name"] = dbm.ROLES.get(u["role"], u["role"])
         b = branch_row(branch_id())
-        u["branch"] = {"id": b["id"], "name": b["name"], "code": b["code"]}
+        u["branch"] = {"id": b["id"], "name": b["name"], "code": b["code"], "sells": b["sells"]}
         u["can_switch_branch"] = u["role"] in MULTI_BRANCH_ROLES
         return jsonify(u)
 
     # ------------------------------------------------------------ sucursales
     def _branch_public(b, with_secret=False):
-        out = {k: b[k] for k in ("id", "name", "code", "address", "phone", "active")}
+        out = {k: b[k] for k in ("id", "name", "code", "address", "phone", "active", "sells")}
         if with_secret:
             out["agent_token"] = b["agent_token"]
             seen = conn().execute("SELECT value FROM branch_settings WHERE branch_id=? AND key='agent_last_seen'", (b["id"],)).fetchone()
@@ -307,14 +307,25 @@ def create_app(db_path=None):
             raise ApiError("Nombre y clave de folio son obligatorios")
         return name, code, (d.get("address") or "").strip(), (d.get("phone") or "").strip()
 
+    def _sells(d):
+        return 0 if d.get("sells") in (0, False, "0") else 1
+
+    def require_selling_branch():
+        """Las ventas solo se hacen en sucursales que venden al público (no en la bodega)."""
+        if current_user()["role"] == "matriz":
+            raise ApiError("El usuario de Matriz no vende; las ventas se hacen en las sucursales.", 403)
+        b = branch_row(branch_id())
+        if not b["sells"]:
+            raise ApiError(f"{b['name']} es bodega y no vende al público. Cambia a una sucursal para vender.", 400)
+
     @app.post("/api/branches")
     def api_branch_create():
         import secrets
         name, code, address, phone = _branch_values(body())
         c = conn()
         try:
-            bid = c.execute("INSERT INTO branches(name, code, address, phone, agent_token, created_at) VALUES (?,?,?,?,?,?)",
-                            (name, code, address, phone, secrets.token_urlsafe(18), dbm.now())).lastrowid
+            bid = c.execute("INSERT INTO branches(name, code, address, phone, sells, agent_token, created_at) VALUES (?,?,?,?,?,?,?)",
+                            (name, code, address, phone, _sells(body()), secrets.token_urlsafe(18), dbm.now())).lastrowid
         except Exception:
             raise ApiError("Ya existe una sucursal con ese nombre o clave")
         for key, value in (("store_address", address), ("store_phone", phone)):
@@ -332,7 +343,8 @@ def create_app(db_path=None):
         if not active and not c.execute("SELECT COUNT(*) FROM branches WHERE active=1 AND id<>?", (bid,)).fetchone()[0]:
             raise ApiError("Debe quedar al menos una sucursal activa")
         try:
-            c.execute("UPDATE branches SET name=?, code=?, address=?, phone=?, active=? WHERE id=?", (name, code, address, phone, active, bid))
+            c.execute("UPDATE branches SET name=?, code=?, address=?, phone=?, active=?, sells=? WHERE id=?",
+                      (name, code, address, phone, active, _sells(d), bid))
         except Exception:
             raise ApiError("Ya existe una sucursal con ese nombre o clave")
         for key, value in (("store_address", address), ("store_phone", phone)):
@@ -442,7 +454,8 @@ def create_app(db_path=None):
 
     @app.get("/api/sellers")
     def api_sellers():
-        rows = conn().execute("SELECT id, full_name, role FROM users WHERE active=1 AND (branch_id IS NULL OR branch_id=?) ORDER BY full_name",
+        rows = conn().execute("""SELECT id, full_name, role FROM users WHERE active=1 AND role<>'matriz'
+                                 AND (branch_id IS NULL OR branch_id=?) ORDER BY full_name""",
                               (branch_id(),)).fetchall()
         return jsonify(dbm.rows_to_list(rows))
 
@@ -1068,6 +1081,7 @@ def create_app(db_path=None):
     @app.post("/api/sales/pending")
     def api_create_pending():
         """El vendedor arma la nota y la manda a caja; el cajero la cobra después."""
+        require_selling_branch()
         d = body()
         c = conn()
         calc = _sale_lines(d, c, check_stock=False)
@@ -1117,6 +1131,7 @@ def create_app(db_path=None):
     @app.post("/api/sales")
     def api_create_sale():
         """Cobra una venta (nueva o una nota pendiente con pending_id)."""
+        require_selling_branch()
         d = body()
         s = settings()
         if is_vendedor() and s.get("seller_can_charge", "0") != "1":

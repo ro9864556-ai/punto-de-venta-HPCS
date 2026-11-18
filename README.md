@@ -38,14 +38,16 @@ La instalación nueva ya trae la estructura de la tienda:
 
 | Sucursal | Clave de folio | Quién trabaja ahí |
 |---|---|---|
-| **Matriz** | `M-000001` | Encargado de matriz (supervisa y surte a las sucursales). |
+| **Matriz** | — (bodega, no vende) | Encargado de matriz: recibe la mercancía, la etiqueta y surte a las sucursales. Es la computadora **servidor**. |
 | **J. Jesús Reynoso** | `JR-000001` | Cajeros y vendedores de esa sucursal. |
 | **González Gallo** | `GG-000001` | Cajeros y vendedores de esa sucursal. |
 
 **Administración** no es una sucursal: es el usuario administrador con sucursal “Todas”, que ve y controla
 todo. Nombres, claves y direcciones se cambian en **Configuración → Sucursales**.
 
-Una sola computadora es el **servidor** (la que siempre está encendida: Matriz o Administración) y guarda toda la información.
+La computadora de la **Matriz es el servidor**: siempre encendida y guarda toda la información. Administración
+y las sucursales entran desde el navegador. La Matriz no vende al público (casilla “Vende al público” en
+Configuración → Sucursales); el encargado de matriz entra directo a Inventario y no ve la pantalla de Vender.
 Las sucursales y la computadora de administración entran desde el navegador. Todas ven los mismos
 productos y precios; cada sucursal tiene **su propia existencia, sus IMEI, sus folios** (`JR-000123`,
 `GG-000124`), **su caja y sus impresoras**. Administración y Matriz pueden trabajar en cualquier sucursal
@@ -56,7 +58,7 @@ solo ven la suya. Entre sucursales se hacen **traspasos** (Inventario → movimi
 Así las computadoras se ven entre sí por internet de forma cifrada, sin abrir puertos ni contratar IP fija.
 1. En **cada** computadora (servidor, sucursales y administración) instala Tailscale desde
    <https://tailscale.com/download> e inicia sesión con **la misma cuenta** (la de la tienda).
-2. En la computadora servidor abre **`iniciar_servidor_red.bat`**. La ventana muestra la dirección,
+2. En la computadora de la **Matriz** abre **`iniciar_servidor_red.bat`** (ponlo en Inicio de Windows para que arranque solo). La ventana muestra la dirección,
    p. ej. `http://100.101.102.103:5000  (Tailscale)`. Si Windows pregunta por el firewall, da **Permitir**.
 3. En las demás computadoras abre esa dirección en el navegador (crea un acceso directo en el escritorio).
 
@@ -82,8 +84,9 @@ programa pequeño, el **agente**, que recibe los tickets y etiquetas y los manda
    **Etiquetas Zebra** elige “Agente de impresión de la sucursal”. En Configuración → Sucursales verás
    el agente como **Conectado**.
 
-En la computadora que es el servidor, sus impresoras siguen como “USB instalada en este equipo”. Si el
-servidor está en Administración, la Matriz también usa su propio agente de impresión.
+La Matriz (servidor) imprime las etiquetas en su Zebra USB directamente (“USB instalada en este equipo”),
+así que **no necesita agente**. J. Jesús Reynoso y González Gallo ya vienen configuradas para imprimir por
+agente; solo falta instalar el agente en su computadora. Administración no necesita agente.
 
 ## Logo
 
