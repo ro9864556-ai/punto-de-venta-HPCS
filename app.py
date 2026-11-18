@@ -772,7 +772,7 @@ def create_app(db_path=None):
 
     def _customer_fields(d):
         return ((d.get("customer_name") or "").strip(), (d.get("customer_phone") or "").strip(),
-                (d.get("customer_email") or "").strip(), (d.get("device_model") or "").strip(),
+                (d.get("device_model") or "").strip(),
                 re.sub(r"\s", "", d.get("device_imei") or ""), (d.get("notes") or "").strip())
 
     def _insert_items(c, sale_id, lines):
@@ -802,7 +802,9 @@ def create_app(db_path=None):
         calc = _sale_lines(d, c, check_stock=False)
         user = current_user()
         seller = _resolve_seller(d, user["id"])
-        name, phone, email, model, dimei, notes = _customer_fields(d)
+        name, phone, model, dimei, notes = _customer_fields(d)
+        if not any(l["warranty"] or l["changes"] or l["p"]["ask_device"] for l in calc["lines"]):
+            model = dimei = ""  # el equipo del cliente solo se registra cuando la venta lleva garantía
         sale_id = int(d.get("pending_id") or 0)
         if sale_id:  # actualizar una nota pendiente propia
             row = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente'", (sale_id,)).fetchone()
@@ -811,9 +813,9 @@ def create_app(db_path=None):
         else:
             sale_id = _new_sale_row(c, "pendiente")
         c.execute("""UPDATE sales SET subtotal=?, discount=?, tax=?, total=?, cost_total=?, customer_name=?, customer_phone=?,
-                     customer_email=?, device_model=?, device_imei=?, notes=?, seller_id=?, seller_name=?, user_id=?, sent_at=?
+                     device_model=?, device_imei=?, notes=?, seller_id=?, seller_name=?, user_id=?, sent_at=?
                      WHERE id=?""",
-                  (calc["subtotal"], calc["discount"], calc["tax"], calc["total"], calc["cost_total"], name, phone, email, model,
+                  (calc["subtotal"], calc["discount"], calc["tax"], calc["total"], calc["cost_total"], name, phone, model,
                    dimei, notes, seller["id"], seller["full_name"], user["id"], dbm.now(), sale_id))
         _insert_items(c, sale_id, calc["lines"])
         c.commit()
@@ -885,15 +887,17 @@ def create_app(db_path=None):
 
         user = current_user()
         seller = _resolve_seller(d, pending["seller_id"] if pending else user["id"])
-        name, phone, email, model, dimei, notes = _customer_fields(d)
+        name, phone, model, dimei, notes = _customer_fields(d)
+        if not any(l["warranty"] or l["changes"] or l["p"]["ask_device"] for l in calc["lines"]):
+            model = dimei = ""  # el equipo del cliente solo se registra cuando la venta lleva garantía
         ts = dbm.now()
         sale_id = pending["id"] if pending else _new_sale_row(c, "completada")
         c.execute("""UPDATE sales SET created_at=?, subtotal=?, discount=?, tax=?, total=?, cost_total=?, payment_method=?,
                         paid_cash=?, paid_card=?, paid_transfer=?, received=?, change=?, customer_name=?, customer_phone=?,
-                        customer_email=?, device_model=?, device_imei=?, notes=?, cashier=?, user_id=?, seller_id=?,
+                        device_model=?, device_imei=?, notes=?, cashier=?, user_id=?, seller_id=?,
                         seller_name=?, status='completada' WHERE id=?""",
                   (ts, calc["subtotal"], calc["discount"], calc["tax"], total, calc["cost_total"], method, paid_cash, paid_card,
-                   paid_transfer, received, change, name, phone, email, model, dimei, notes, user["full_name"], user["id"],
+                   paid_transfer, received, change, name, phone, model, dimei, notes, user["full_name"], user["id"],
                    seller["id"], seller["full_name"], sale_id))
         folio = c.execute("SELECT folio FROM sales WHERE id=?", (sale_id,)).fetchone()["folio"]
         _insert_items(c, sale_id, lines)

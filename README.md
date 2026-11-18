@@ -39,7 +39,7 @@ en **Configuración → Tienda → Logo**). Desde ahí se puede subir otro logo 
 
 ## Flujo de venta: vendedor → caja
 
-1. El **vendedor** escanea los productos, captura cliente, teléfono, modelo e IMEI del equipo y presiona
+1. El **vendedor** escanea los productos, captura cliente y teléfono (y el modelo e IMEI del equipo si la venta lleva garantía) y presiona
    **Enviar a caja (F2)**. La nota queda *pendiente de cobro* (no cuenta en el corte ni descuenta inventario).
 2. El **cajero** ve el aviso **Notas por cobrar** (con contador en el menú), da clic en **Cobrar**, puede
    ajustar la nota y cobra con F2. Se imprime la nota con el nombre del vendedor y de quien cobró.
@@ -60,8 +60,9 @@ administrador puede autorizar un cambio extra.
 
 ## Nota de venta
 
-Cada nota lleva: fecha, vendedor, cliente, teléfono (y email opcional), los artículos con su precio y
-garantía (con fecha de vencimiento), el **modelo y el IMEI del equipo del cliente** y el total.
+Cada nota lleva: fecha, vendedor, cliente, teléfono, los artículos con su precio y
+garantía (con fecha de vencimiento), el **modelo y el IMEI del equipo del cliente** cuando la venta lleva
+garantía, y el total. Si ningún artículo tiene garantía, esa sección no aparece.
 Los productos marcados con “Pedir modelo e IMEI del equipo del cliente” (micas, fundas, reparaciones)
 avisan si falta capturarlos. En **Ventas** se busca una garantía por IMEI, teléfono, nombre o folio en
 todas las fechas.

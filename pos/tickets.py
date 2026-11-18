@@ -108,8 +108,6 @@ def build_sale_ticket(sale, items, s, reprint=False):
     t.cols("Cliente:", sale.get("customer_name") or "Público en general")
     if sale.get("customer_phone"):
         t.cols("Teléfono:", sale["customer_phone"])
-    if sale.get("customer_email"):
-        t.cols("Email:", sale["customer_email"])
     t.sep()
     units = 0
     for it in items:

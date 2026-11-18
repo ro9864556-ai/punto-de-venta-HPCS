@@ -8,7 +8,7 @@ const S = {
   rounding: {},
   cart: [],
   cartDiscount: 0,
-  customer: { name: "", phone: "", email: "", model: "", imei: "", seller: "" },
+  customer: { name: "", phone: "", model: "", imei: "", seller: "" },
   me: null,
   sellers: [],
   pendingId: null,      // nota pendiente que el cajero está cobrando
@@ -274,8 +274,7 @@ function initVender() {
         <label class="f">Vendedor<select id="cust-seller"></select></label>
         <input id="cust-name" placeholder="Nombre del cliente">
         <input id="cust-phone" placeholder="Teléfono del cliente" inputmode="tel">
-        <input id="cust-email" placeholder="Email del cliente (opcional)" type="email">
-        <fieldset id="dev-box" style="margin:4px 0 0;padding:8px 10px 10px"><legend class="small">📱 Equipo del cliente (garantía)</legend>
+        <fieldset id="dev-box" class="hidden" style="margin:4px 0 0;padding:8px 10px 10px"><legend class="small">📱 Equipo del cliente (para la garantía)</legend>
           <div class="grid" style="gap:8px">
             <input id="cust-model" placeholder="Modelo, p. ej. iPhone 17 Pro Max" list="dl-models">
             <input id="cust-imei" placeholder="IMEI del equipo (*#06#)" inputmode="numeric" class="mono">
@@ -292,7 +291,7 @@ function initVender() {
     </div>
   </div>`;
   loadCart();
-  const custFields = { name: "#cust-name", phone: "#cust-phone", email: "#cust-email", model: "#cust-model", imei: "#cust-imei", seller: "#cust-seller" };
+  const custFields = { name: "#cust-name", phone: "#cust-phone", model: "#cust-model", imei: "#cust-imei", seller: "#cust-seller" };
   fillSellers();
   Object.entries(custFields).forEach(([k, sel]) => {
     $(sel).value = S.customer[k] || $(sel).value || "";
@@ -364,11 +363,11 @@ async function loadPending(id) {
   S.cart = sale.items.map((i) => ({ key: `${i.product_id}-${i.imei || ""}`, product_id: i.product_id, name: i.name, sku: i.sku, price: i.unit_price, qty: i.qty,
     discount: i.discount, imei: i.imei || "", serialized: i.imei ? 1 : 0, stock: Infinity, track_stock: 0, warranty: i.warranty_days, changes: i.warranty_changes, ask_device: 0 }));
   S.cartDiscount = sale.discount || 0;
-  S.customer = { name: sale.customer_name || "", phone: sale.customer_phone || "", email: sale.customer_email || "", model: sale.device_model || "",
+  S.customer = { name: sale.customer_name || "", phone: sale.customer_phone || "", model: sale.device_model || "",
     imei: sale.device_imei || "", seller: String(sale.seller_id || "") };
   S.pendingId = sale.id; S.pendingFolio = sale.folio; S.pendingNotes = sale.notes || "";
   $("#t-disc").value = S.cartDiscount;
-  [["name", "#cust-name"], ["phone", "#cust-phone"], ["email", "#cust-email"], ["model", "#cust-model"], ["imei", "#cust-imei"]].forEach(([k, sel]) => { $(sel).value = S.customer[k]; });
+  [["name", "#cust-name"], ["phone", "#cust-phone"], ["model", "#cust-model"], ["imei", "#cust-imei"]].forEach(([k, sel]) => { $(sel).value = S.customer[k]; });
   fillSellers();
   saveCart(); renderCart(); renderPendingBanner(); refreshPending();
   toast(`Nota ${sale.folio} cargada. Revisa y cobra (F2).`, "ok");
@@ -377,7 +376,7 @@ async function loadPending(id) {
 async function sendToCaja() {
   if (!S.cart.length) return toast("El ticket está vacío");
   if (topModal()) return;
-  const needsDevice = S.cart.some((l) => l.ask_device || ((l.warranty > 0 || l.changes > 0) && !l.imei));
+  const needsDevice = cartNeedsDevice();
   if (needsDevice && (!S.customer.model || !S.customer.imei)) {
     const ok = await confirmBox("Falta el <b>modelo</b> o el <b>IMEI</b> del equipo del cliente; se usan para la garantía y los cambios. ¿Enviar de todos modos?", "Enviar así");
     if (!ok) { $(S.customer.model ? "#cust-imei" : "#cust-model").focus(); return; }
@@ -397,16 +396,17 @@ async function sendToCaja() {
 function salePayloadBase() {
   return {
     items: S.cart.map((l) => ({ product_id: l.product_id, qty: l.qty, unit_price: l.price, discount: num(l.discount), imei: l.imei, warranty_days: l.warranty || 0, warranty_changes: l.changes || 0 })),
-    seller_id: $("#cust-seller").value, customer_name: S.customer.name, customer_phone: S.customer.phone, customer_email: S.customer.email,
-    device_model: S.customer.model, device_imei: S.customer.imei,
+    seller_id: $("#cust-seller").value, customer_name: S.customer.name, customer_phone: S.customer.phone,
+    // el modelo e IMEI del equipo solo se guardan cuando la venta lleva garantía
+    device_model: cartNeedsDevice() ? S.customer.model : "", device_imei: cartNeedsDevice() ? S.customer.imei : "",
   };
 }
 
 function clearCart() {
   S.pendingId = null; S.pendingFolio = ""; S.pendingNotes = "";
-  S.cart = []; S.cartDiscount = 0; S.customer = { name: "", phone: "", email: "", model: "", imei: "", seller: S.customer.seller || "" };
+  S.cart = []; S.cartDiscount = 0; S.customer = { name: "", phone: "", model: "", imei: "", seller: S.customer.seller || "" };
   $("#t-disc").value = "0";
-  ["#cust-name", "#cust-phone", "#cust-email", "#cust-model", "#cust-imei"].forEach((x) => { $(x).value = ""; });
+  ["#cust-name", "#cust-phone", "#cust-model", "#cust-imei"].forEach((x) => { $(x).value = ""; });
   fillSellers();
   renderPendingBanner();
   saveCart(); renderCart(); focusScan();
@@ -459,6 +459,8 @@ function pickImei(p) {
   });
 }
 
+const cartNeedsDevice = () => S.cart.some((l) => l.ask_device || ((l.warranty > 0 || l.changes > 0) && !l.imei));
+
 function cartTotals() {
   const gross = S.cart.reduce((a, l) => a + l.qty * l.price, 0);
   const ldisc = S.cart.reduce((a, l) => a + num(l.discount), 0);
@@ -501,8 +503,7 @@ function renderCart() {
       <td><button class="sm danger icon-btn" data-a="del" title="Quitar">✕</button></td></tr>`).join("");
   }
   renderTotals();
-  const needsDevice = S.cart.some((l) => l.ask_device || ((l.warranty > 0 || l.changes > 0) && !l.imei));
-  $("#dev-box")?.classList.toggle("needs", needsDevice);
+  $("#dev-box")?.classList.toggle("hidden", !cartNeedsDevice());
 }
 
 document.addEventListener("change", (e) => {
@@ -530,7 +531,7 @@ async function checkout() {
   if (sellerOnly()) return sendToCaja();
   if (!S.cart.length) return toast("El ticket está vacío");
   if (topModal()) return;
-  const needsDevice = S.cart.some((l) => l.ask_device || ((l.warranty > 0 || l.changes > 0) && !l.imei));
+  const needsDevice = cartNeedsDevice();
   if (needsDevice && (!S.customer.model || !S.customer.imei)) {
     const ok = await confirmBox("Falta el <b>modelo</b> o el <b>IMEI</b> del equipo del cliente; se usan para hacer válida la garantía y los cambios. ¿Cobrar de todos modos?", "Cobrar sin ellos");
     if (!ok) { $(S.customer.model ? "#cust-imei" : "#cust-model").focus(); return; }
@@ -639,7 +640,7 @@ async function showSale(id) {
         <table><tbody>
           <tr><td class="muted">Fecha</td><td>${esc(s.created_at)}</td></tr>
           <tr><td class="muted">Vendedor</td><td>${esc(s.seller_name || s.cashier || "—")}${s.cashier && s.cashier !== s.seller_name ? ` <span class="muted small">(cobró ${esc(s.cashier)})</span>` : ""}</td></tr>
-          <tr><td class="muted">Cliente</td><td>${esc(s.customer_name || "—")} ${esc(s.customer_phone || "")} ${esc(s.customer_email || "")}</td></tr>
+          <tr><td class="muted">Cliente</td><td>${esc(s.customer_name || "—")} ${esc(s.customer_phone || "")}</td></tr>
           ${s.device_model || s.device_imei ? `<tr><td class="muted">Equipo</td><td>${esc(s.device_model || "")} <span class="mono">${esc(s.device_imei || "")}</span></td></tr>` : ""}
           <tr><td class="muted">Pago</td><td>${esc(s.payment_method)}</td></tr>
           <tr><td class="muted">Total</td><td><b>${money(s.total)}</b></td></tr>

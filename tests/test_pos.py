@@ -278,3 +278,11 @@ def test_logo_in_tickets(client):
     assert client.application.test_client().get("/logo.png").status_code == 200  # visible en el login
     client.put("/api/settings", json={"ticket_logo": "0"})
     assert b"\x1dv0\x00" not in client.get(f"/tickets/{sale['id']}?format=escpos").data
+
+
+def test_device_only_with_warranty(client):
+    cable = _product(client, name="Cable USB-C", category_id=5, price=99, warranty_days=0)
+    sale = client.post("/api/sales", json={"items": [{"product_id": cable["id"], "qty": 1}], "payment_method": "tarjeta",
+                                           "device_model": "iPhone 13", "device_imei": "351111111111111"}).get_json()["sale"]
+    assert sale["device_imei"] == "" and sale["device_model"] == ""
+    assert "EQUIPO DEL CLIENTE" not in client.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
