@@ -470,7 +470,8 @@ def test_politicas_de_garantia_en_la_nota(client):
         assert frag in txt, frag
     assert "Garantía: 6 meses" in txt
     # todas las notas llevan las políticas; un producto sin garantía lo dice en su renglón
-    aro = _product(client, name="Aro MagSafe", category_id=12, price=49, track_stock=0, warranty_days=0)
+    sop = [c["id"] for c in client.get("/api/categories").get_json() if c["prefix"] == "SOP"][0]
+    aro = _product(client, name="Aro MagSafe", category_id=sop, price=49, track_stock=0, warranty_days=0)
     s2 = client.post("/api/sales", json={"items": [{"product_id": aro["id"], "qty": 1}], "payment_method": "tarjeta",
                                          "print": False}).get_json()["sale"]
     t2 = client.get(f"/tickets/{s2['id']}?format=txt").get_data(as_text=True)
@@ -479,3 +480,137 @@ def test_politicas_de_garantia_en_la_nota(client):
     client.put("/api/settings", json={"warranty_policy_print": "nunca"})
     t3 = client.get(f"/tickets/{s2['id']}?format=txt").get_data(as_text=True)
     assert "Firma del cliente" not in t3 and "POLÍTICAS DE GARANTÍA" not in t3
+
+
+# ---------------------------------------------------------------- correcciones de la revisión de código
+
+def test_doble_cobro_simultaneo(app, client):
+    """Dos cajas cobran la misma nota al mismo tiempo: solo una lo logra y el inventario baja una vez."""
+    import threading
+    p = _product(client, name="Funda", initial_stock=5, warranty_days=30)
+    pend = client.post("/api/sales/pending", json={"items": [{"product_id": p["id"], "qty": 1}]}).get_json()["sale"]
+    cajas = [login(app) for _ in range(2)]
+    for c in cajas:
+        c.post("/api/branch/select", json={"branch_id": 2})
+    barrier, results = threading.Barrier(2), []
+
+    def cobrar(c):
+        barrier.wait()
+        r = c.post("/api/sales", json={"pending_id": pend["id"], "items": [{"product_id": p["id"], "qty": 1}],
+                                       "payment_method": "tarjeta", "print": False})
+        results.append(r.status_code)
+
+    hilos = [threading.Thread(target=cobrar, args=(c,)) for c in cajas]
+    [h.start() for h in hilos]
+    [h.join() for h in hilos]
+    assert sorted(results) == [201, 400]
+    assert client.get(f"/api/products/{p['id']}").get_json()["stock"] == 4
+
+
+def test_mismo_imei_en_dos_cajas(app, client):
+    import threading
+    tel = _product(client, name="Galaxy A07", category_id=1, price=2899, serialized=1, initial_stock=0,
+                   imeis="350000000000099", warranty_days=365)
+    cajas = [login(app) for _ in range(2)]
+    for c in cajas:
+        c.post("/api/branch/select", json={"branch_id": 2})
+    barrier, results = threading.Barrier(2), []
+
+    def vender(c):
+        barrier.wait()
+        r = c.post("/api/sales", json={"items": [{"product_id": tel["id"], "qty": 1, "imei": "350000000000099"}],
+                                       "payment_method": "tarjeta", "print": False})
+        results.append(r.status_code)
+
+    hilos = [threading.Thread(target=vender, args=(c,)) for c in cajas]
+    [h.start() for h in hilos]
+    [h.join() for h in hilos]
+    assert sorted(results) == [201, 400]
+
+
+def test_no_descarta_notas_de_otra_sucursal(app, client):
+    p = _product(client, name="Funda", initial_stock=5, warranty_days=30)
+    pend = client.post("/api/sales/pending", json={"items": [{"product_id": p["id"], "qty": 1}]}).get_json()["sale"]  # JR
+    client.post("/api/users", json={"username": "cajagg", "full_name": "Caja GG", "role": "cajero", "password": "1234", "branch_id": 3})
+    assert login(app, "cajagg", "1234").delete(f"/api/sales/pending/{pend['id']}").status_code == 404
+    assert client.delete(f"/api/sales/pending/{pend['id']}").status_code == 200  # su propia sucursal sí
+
+
+def test_agente_no_reimprime_trabajos_viejos(app, client):
+    import sqlite3
+    token = [b for b in client.get("/api/branches").get_json() if b["id"] == 2][0]["agent_token"]
+    p = _product(client, name="Funda", initial_stock=5, warranty_days=30)
+    client.post("/api/sales", json={"items": [{"product_id": p["id"], "qty": 1}], "payment_method": "tarjeta"})
+    # el trabajo se creó hace 5 minutos (la sucursal estaba sin internet)
+    db = sqlite3.connect(app.config["DB_PATH"])
+    db.execute("UPDATE print_jobs SET created_at=datetime('now','localtime','-5 minutes')")
+    db.commit()
+    anon = app.test_client()
+    first = anon.get(f"/api/agent/jobs?code=JR&token={token}").get_json()["jobs"]
+    second = anon.get(f"/api/agent/jobs?code=JR&token={token}").get_json()["jobs"]
+    assert len(first) == 1 and second == []  # no se entrega dos veces
+    # si el agente no confirma en 2 minutos desde que lo recibió, sí se reintenta
+    db.execute("UPDATE print_jobs SET sent_at=datetime('now','localtime','-3 minutes')")
+    db.commit()
+    assert len(anon.get(f"/api/agent/jobs?code=JR&token={token}").get_json()["jobs"]) == 1
+
+
+def test_etiqueta_de_prueba_por_agente(client):
+    r = client.post("/api/print/test", json={"target": "label"})  # J. Jesús Reynoso imprime por agente
+    assert r.status_code == 200 and "J. Jesús Reynoso" in r.get_json()["message"]
+
+
+def test_reimpresion_con_datos_de_la_sucursal_de_venta(client):
+    client.put("/api/branches/2", json={"name": "J. Jesús Reynoso", "code": "JR", "address": "Calle Reynoso 10", "phone": ""})
+    p = _product(client, name="Funda", initial_stock=5, warranty_days=30)
+    sale = client.post("/api/sales", json={"items": [{"product_id": p["id"], "qty": 1}], "payment_method": "tarjeta",
+                                           "print": False}).get_json()["sale"]
+    client.post("/api/branch/select", json={"branch_id": 1})  # Administración ahora en la Matriz
+    client.put("/api/settings", json={"ticket_printer_mode": "browser"})
+    r = client.post(f"/api/sales/{sale['id']}/print").get_json()
+    assert r["mode"] == "browser"  # usa la impresora de donde se reimprime
+    txt = client.get(f"/tickets/{sale['id']}?format=txt").get_data(as_text=True)
+    assert "Calle Reynoso 10" in txt and "J. Jesús Reynoso" in txt
+
+
+def test_politicas_siempre_en_instalacion_existente(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "vieja.db")
+    create_app(path)
+    db = sqlite3.connect(path)
+    db.execute("UPDATE settings SET value='garantia' WHERE key='warranty_policy_print'")  # como quedó antes
+    db.execute("DELETE FROM settings WHERE key='policy_always_migrated'")
+    db.commit()
+    c = login(create_app(path))
+    assert c.get("/api/settings").get_json()["settings"]["warranty_policy_print"] == "siempre"
+    # si después alguien lo cambia a mano, se respeta
+    c.put("/api/settings", json={"warranty_policy_print": "garantia"})
+    assert login(create_app(path)).get("/api/settings").get_json()["settings"]["warranty_policy_print"] == "garantia"
+
+
+def test_no_borra_existencia_al_activar_imei(client):
+    p = _product(client, name="Smartwatch", initial_stock=12, warranty_days=30)
+    r = client.put(f"/api/products/{p['id']}", json={"serialized": 1})
+    assert r.status_code == 400 and "12" in r.get_json()["error"]
+    assert client.get(f"/api/products/{p['id']}").get_json()["stock"] == 12
+
+
+def test_cambio_en_articulo_sin_garantia(client):
+    aro = _product(client, name="Aro MagSafe", initial_stock=5, warranty_days=0)
+    sale = client.post("/api/sales", json={"items": [{"product_id": aro["id"], "qty": 1}], "payment_method": "tarjeta",
+                                           "print": False}).get_json()["sale"]
+    r = client.post("/api/warranty/claims", json={"sale_item_id": sale["items"][0]["id"]})
+    assert r.status_code == 400 and "no tiene garantía" in r.get_json()["error"]
+
+
+def test_csv_avisa_productos_sin_garantia(client):
+    data = "name,category,cost,price,stock\nCable USB-C 1m,Cables,35,99,12\n"
+    r = client.post("/api/products/import", data={"file": (io.BytesIO(data.encode()), "p.csv")},
+                    content_type="multipart/form-data").get_json()
+    assert r["created"] == 1 and "warranty_days" in r["warnings"][0]
+
+
+def test_mercancia_recibida_con_numero_de_serie_alfanumerico(client):
+    reloj = _product(client, name="Smartwatch", serialized=1, initial_stock=0, imeis="SN-A1B2C3\nSN-Z9Y8X7", warranty_days=30)
+    incoming = {r["name"]: r for r in client.get("/api/inventory/incoming").get_json()}
+    assert incoming["Smartwatch"]["imeis"] == ["SN-A1B2C3", "SN-Z9Y8X7"] and reloj["stock"] == 2

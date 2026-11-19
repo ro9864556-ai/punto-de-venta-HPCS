@@ -343,6 +343,8 @@ def migrate_branches(conn):
         created_at TEXT NOT NULL,
         done_at TEXT)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs ON print_jobs(branch_id, status)")
+    if "sent_at" not in [r[1] for r in conn.execute("PRAGMA table_info(print_jobs)")]:
+        conn.execute("ALTER TABLE print_jobs ADD COLUMN sent_at TEXT")
     for table, column, ddl in [("serials", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
                                ("sales", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
                                ("inventory_moves", "branch_id", "INTEGER NOT NULL DEFAULT 1"),
@@ -366,12 +368,16 @@ def update_default_texts(conn):
     """Si seguía el texto genérico de garantía, se cambia por las políticas de la tienda."""
     conn.execute("UPDATE settings SET value=? WHERE key='warranty_text' AND value=?",
                  (DEFAULT_SETTINGS["warranty_text"], OLD_WARRANTY_TEXT))
+    if not conn.execute("SELECT 1 FROM settings WHERE key='policy_always_migrated'").fetchone():
+        # antes el valor predeterminado era 'garantia'; ahora las políticas van en todas las notas
+        conn.execute("UPDATE settings SET value='siempre' WHERE key='warranty_policy_print' AND value='garantia'")
+        conn.execute("INSERT INTO settings(key, value) VALUES ('policy_always_migrated', '1')")
 
 
 def get_settings(conn, branch_id=None):
     """Ajustes generales con los de la sucursal encima."""
     out = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")
-           if r["key"] not in ("secret_key", "branch_stock_migrated")}
+           if r["key"] not in ("secret_key", "branch_stock_migrated", "policy_always_migrated")}
     if branch_id:
         for r in conn.execute("SELECT key, value FROM branch_settings WHERE branch_id=?", (branch_id,)):
             out[r["key"]] = r["value"]

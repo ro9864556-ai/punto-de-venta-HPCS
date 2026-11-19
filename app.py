@@ -96,6 +96,14 @@ def create_app(db_path=None):
         c.execute("""INSERT INTO branch_stock(product_id, branch_id, stock) VALUES (?,?,?)
                      ON CONFLICT(product_id, branch_id) DO UPDATE SET stock=excluded.stock""", (pid, bid, value))
 
+    def begin_write(c=None):
+        """Bloquea la base para escribir ANTES de validar: dos cajas no pueden cobrar la misma nota
+        ni vender el mismo IMEI al mismo tiempo (la segunda espera y ve que ya no está disponible)."""
+        c = c or conn()
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        return c
+
     def log_move(c, pid, bid, qty, kind, reference="", notes="", ts=None, imeis=""):
         c.execute("""INSERT INTO inventory_moves(product_id, branch_id, qty, kind, reference, notes, created_at, imeis)
                      VALUES (?,?,?,?,?,?,?,?)""", (pid, bid, qty, kind, reference, notes, ts or dbm.now(), imeis))
@@ -393,11 +401,12 @@ def create_app(db_path=None):
         c = conn()
         c.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?, 'agent_last_seen', ?)", (b["id"], dbm.now()))
         # trabajos que se enviaron hace más de 2 minutos sin confirmación se reintentan
+        begin_write(c)
         c.execute("""UPDATE print_jobs SET status='pendiente' WHERE branch_id=? AND status='enviado'
-                     AND created_at < datetime('now', 'localtime', '-2 minutes')""", (b["id"],))
+                     AND COALESCE(sent_at, created_at) < datetime('now', 'localtime', '-2 minutes')""", (b["id"],))
         rows = c.execute("SELECT * FROM print_jobs WHERE branch_id=? AND status='pendiente' ORDER BY id LIMIT 20", (b["id"],)).fetchall()
         for r in rows:
-            c.execute("UPDATE print_jobs SET status='enviado' WHERE id=?", (r["id"],))
+            c.execute("UPDATE print_jobs SET status='enviado', sent_at=? WHERE id=?", (dbm.now(), r["id"]))
         c.commit()
         return jsonify({"branch": b["name"], "jobs": [{"id": r["id"], "target": r["target"], "title": r["title"],
                                                         "data": base64.b64encode(r["data"]).decode()} for r in rows]})
@@ -569,6 +578,9 @@ def create_app(db_path=None):
             zpl = labels.test_label_zpl(s)
             if s.get("label_printer_mode") == "download":
                 return jsonify({"zpl": zpl, "message": "Modo descarga: se generó el archivo ZPL."})
+            if s.get("label_printer_mode") == "agent":
+                enqueue_print(branch_id(), "label", zpl, "Etiqueta de prueba")
+                return jsonify({"message": f"Etiqueta de prueba enviada a la Zebra de {s.get('branch_name', 'la sucursal')}."})
             printing.send(zpl, s["label_printer_mode"], s.get("label_printer_host"), s.get("label_printer_port"),
                           s.get("label_printer_name"))
             return jsonify({"message": "Etiqueta de prueba enviada."})
@@ -757,9 +769,16 @@ def create_app(db_path=None):
     @app.put("/api/products/<int:pid>")
     def api_product_update(pid):
         existing = get_product(pid)
-        c = conn()
+        c = begin_write()
         vals = _product_values(body(), c, existing)
         _check_unique(c, vals, pid)
+        if vals["serialized"] and not existing["serialized"]:
+            loose = c.execute("""SELECT b.name, bs.stock FROM branch_stock bs JOIN branches b ON b.id=bs.branch_id
+                                 WHERE bs.product_id=? AND bs.stock<>0""", (pid,)).fetchall()
+            if loose:
+                detail = ", ".join(f"{r['name']}: {r['stock']:g}" for r in loose)
+                raise ApiError(f"No se puede activar 'Maneja IMEI': hay existencia sin IMEI ({detail}). "
+                               "Primero ajusta esa existencia a 0 en Inventario y luego registra cada equipo con su IMEI.")
         sets = ", ".join(f"{k}=?" for k in vals)
         c.execute(f"UPDATE products SET {sets}, active=1, updated_at=? WHERE id=?", list(vals.values()) + [dbm.now(), pid])
         if vals["serialized"]:
@@ -874,7 +893,8 @@ def create_app(db_path=None):
                       (pid, imei, "disponible", bid, ts))
             added.append(imei)
         if added:
-            log_move(c, pid, bid, len(added), "entrada", notes=(notes + " IMEI: " + ", ".join(added))[:900], ts=ts)
+            log_move(c, pid, bid, len(added), "entrada", notes=(notes + " IMEI: " + ", ".join(added))[:900], ts=ts,
+                     imeis=",".join(added))
         sync_serial_stock(c, pid, bid)
         return added, skipped
 
@@ -908,6 +928,7 @@ def create_app(db_path=None):
     @app.post("/api/inventory/adjust")
     def api_inventory_adjust():
         d = body()
+        begin_write()
         p = get_product(int(d.get("product_id") or 0))
         if p["serialized"]:
             raise ApiError("Los productos con IMEI se ajustan dando de alta o baja cada IMEI")
@@ -934,6 +955,7 @@ def create_app(db_path=None):
     def api_inventory_transfer():
         """Traspaso de mercancía de la sucursal actual a otra."""
         d = body()
+        begin_write()
         p = get_product(int(d.get("product_id") or 0))
         src = branch_id()
         dst = int(d.get("to_branch_id") or 0)
@@ -992,9 +1014,10 @@ def create_app(db_path=None):
             item = dict(r)
             if item["serialized"]:
                 listed = [x for x in (item["imeis"] or "").split(",") if x]
-                if not listed:  # entradas por IMEI guardan la lista en la nota
-                    listed = re.findall(r"\b\d{14,17}\b", conn().execute("SELECT notes FROM inventory_moves WHERE id=?",
-                                                                          (item["id"],)).fetchone()["notes"] or "")
+                if not listed:  # movimientos anteriores: la lista quedó en la nota después de "IMEI:"
+                    note = conn().execute("SELECT notes FROM inventory_moves WHERE id=?", (item["id"],)).fetchone()["notes"] or ""
+                    tail = note.split("IMEI:", 1)[1] if "IMEI:" in note else ""
+                    listed = [x.strip() for x in tail.split(",") if x.strip()]
                 # solo los que siguen disponibles aquí (los vendidos ya no se etiquetan)
                 item["imeis"] = [x for x in listed if conn().execute(
                     "SELECT 1 FROM serials WHERE imei=? AND status='disponible' AND branch_id=?", (x, bid)).fetchone()]
@@ -1116,6 +1139,7 @@ def create_app(db_path=None):
         require_selling_branch()
         d = body()
         c = conn()
+        begin_write()
         calc = _sale_lines(d, c, check_stock=False)
         user = current_user()
         seller = _resolve_seller(d, user["id"])
@@ -1151,8 +1175,8 @@ def create_app(db_path=None):
 
     @app.delete("/api/sales/pending/<int:sale_id>")
     def api_discard_pending(sale_id):
-        c = conn()
-        row = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente'", (sale_id,)).fetchone()
+        c = begin_write()
+        row = c.execute("SELECT * FROM sales WHERE id=? AND status='pendiente' AND branch_id=?", (sale_id, branch_id())).fetchone()
         if not row or (is_vendedor() and row["seller_id"] != current_user()["id"]):
             raise ApiError("Nota pendiente no encontrada", 404)
         c.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
@@ -1165,6 +1189,7 @@ def create_app(db_path=None):
         """Cobra una venta (nueva o una nota pendiente con pending_id)."""
         require_selling_branch()
         d = body()
+        begin_write()
         s = settings()
         if is_vendedor() and s.get("seller_can_charge", "0") != "1":
             raise ApiError("Los vendedores no cobran: usa “Enviar a caja” y el cajero cobra la nota.", 403)
@@ -1281,6 +1306,7 @@ def create_app(db_path=None):
 
     @app.post("/api/sales/<int:sale_id>/cancel")
     def api_cancel_sale(sale_id):
+        begin_write()  # antes de leer: dos cancelaciones simultáneas no regresan el inventario dos veces
         sale = _sale(sale_id)
         if sale["status"] != "completada":
             raise ApiError("Solo se pueden cancelar ventas cobradas")
@@ -1317,9 +1343,12 @@ def create_app(db_path=None):
             for _ in range(copies):
                 if s.get("label_printer_mode") == "agent":
                     enqueue_print(bid, "label", data, title)
+                elif s.get("label_printer_mode") == "download":
+                    raise printing.PrintError("Los tickets están configurados para la Zebra, pero la Zebra está en modo "
+                                              "'Descargar archivo'. Configura su conexión en Etiquetas Zebra.")
                 else:
-                    printing.send(data, s.get("label_printer_mode") if s.get("label_printer_mode") != "download" else "network",
-                                  s.get("label_printer_host"), s.get("label_printer_port"), s.get("label_printer_name"))
+                    printing.send(data, s.get("label_printer_mode"), s.get("label_printer_host"),
+                                  s.get("label_printer_port"), s.get("label_printer_name"))
             return jsonify({"mode": "zebra", "message": f"{title}: enviado a la Zebra"})
         data = tickets.to_escpos(t, open_drawer=s.get("ticket_open_drawer") == "1", logo_path=logo_file())
         if mode == "agent":
@@ -1330,15 +1359,18 @@ def create_app(db_path=None):
             printing.send(data, mode, s.get("ticket_printer_host"), s.get("ticket_printer_port"), s.get("ticket_printer_name"))
         return jsonify({"mode": mode, "message": f"{title}: enviado a la impresora de tickets"})
 
-    def _print_sale(sale, s, reprint=False):
+    def _print_sale(sale, s, reprint=False, printer_s=None):
+        """s: datos de la sucursal donde se vendió; printer_s: impresora donde se imprime (por defecto la misma)."""
+        printer_s = printer_s or s
         t = tickets.build_sale_ticket(sale, sale["items"], s, reprint=reprint)
-        copies = max(1, int(num(s.get("ticket_copies"), 1)))
-        resp = _dispatch_ticket(t, s, f"Ticket {sale['folio']}", copies)
+        copies = max(1, int(num(printer_s.get("ticket_copies"), 1)))
+        resp = _dispatch_ticket(t, printer_s, f"Ticket {sale['folio']}", copies)
         return resp.get_json()
 
     @app.post("/api/sales/<int:sale_id>/print")
     def api_print_sale(sale_id):
-        return jsonify(_print_sale(_sale(sale_id), settings(), reprint=True))
+        sale = _sale(sale_id)
+        return jsonify(_print_sale(sale, settings(sale["branch_id"]), reprint=True, printer_s=settings()))
 
     @app.get("/tickets/<int:sale_id>")
     def ticket_page(sale_id):
@@ -1415,11 +1447,14 @@ def create_app(db_path=None):
         """Registra un cambio por garantía (p. ej. mica nueva) y descuenta la pieza del inventario."""
         d = body()
         c = conn()
+        begin_write()
         item_id = int(d.get("sale_item_id") or 0)
         row = c.execute("SELECT sale_id FROM sale_items WHERE id=?", (item_id,)).fetchone()
         if not row:
             raise ApiError("Artículo no encontrado", 404)
-        it = next(x for x in _warranty_items([row["sale_id"]]) if x["id"] == item_id)
+        it = next((x for x in _warranty_items([row["sale_id"]]) if x["id"] == item_id), None)
+        if it is None:
+            raise ApiError("Este artículo no tiene garantía ni cambios")
         user = current_user()
         force = bool(d.get("force")) and user["role"] == "admin"
         if it["sale_status"] != "completada":
@@ -1458,7 +1493,9 @@ def create_app(db_path=None):
         if not claim:
             raise ApiError("Cambio no encontrado", 404)
         claim = dict(claim)
-        item = next(x for x in _warranty_items([claim["sale_id"]]) if x["id"] == claim["sale_item_id"])
+        item = next((x for x in _warranty_items([claim["sale_id"]]) if x["id"] == claim["sale_item_id"]), None)
+        if item is None:
+            raise ApiError("El artículo de este cambio ya no tiene garantía registrada", 404)
         return tickets.build_claim_ticket(claim, item, settings())
 
     def _print_claim(claim_id):
@@ -1726,7 +1763,11 @@ def create_app(db_path=None):
             except ApiError as exc:
                 errors.append(f"Fila {n}: {exc}")
         c.commit()
-        return jsonify({"created": created, "updated": updated, "errors": errors[:50]})
+        warnings = []
+        if created and "warranty_days" not in (reader.fieldnames and [f.strip().lower() for f in reader.fieldnames] or []):
+            warnings.append(f"El archivo no trae la columna warranty_days: {created} producto(s) nuevo(s) quedaron "
+                            "'Sin garantía'. Revísalos en Productos.")
+        return jsonify({"created": created, "updated": updated, "errors": errors[:50], "warnings": warnings})
 
     @app.get("/api/products/template.csv")
     def api_csv_template():

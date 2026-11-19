@@ -1043,7 +1043,7 @@ function importCsv() {
         const fd = new FormData(); fd.append("file", file);
         try {
           const r = await api("POST", "/api/products/import", fd);
-          $("#csv-res", m).innerHTML = `<b>${r.created}</b> creados, <b>${r.updated}</b> actualizados.${r.errors.length ? `<div class="danger">${r.errors.map(esc).join("<br>")}</div>` : ""}`;
+          $("#csv-res", m).innerHTML = `<b>${r.created}</b> creados, <b>${r.updated}</b> actualizados.${(r.warnings || []).map((w) => `<div class="pend-banner" style="margin-top:8px">⚠️ ${esc(w)}</div>`).join("")}${r.errors.length ? `<div class="danger">${r.errors.map(esc).join("<br>")}</div>` : ""}`;
           await loadBase(); loadProducts();
         } catch (e) { fail(e); }
       };
