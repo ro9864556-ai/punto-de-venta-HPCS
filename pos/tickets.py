@@ -126,9 +126,11 @@ def build_sale_ticket(sale, items, s, reprint=False):
         if it.get("imei"):
             t.text(f"  IMEI/Serie: {it['imei']}")
         days = int(it.get("warranty_days") or 0)
+        changes = int(it.get("warranty_changes") or 0)
         if days:
             t.text(f"  Garantía: {warranty_label(days)} (vence {_vence(sale['created_at'], days)})")
-        changes = int(it.get("warranty_changes") or 0)
+        elif not changes:
+            t.text("  Sin garantía")  # cada artículo dice exactamente qué garantía lleva
         if changes:
             t.text(f"  Incluye {changes} cambio{'s' if changes > 1 else ''} por garantía")
     if sale.get("device_model") or sale.get("device_imei"):
@@ -178,7 +180,7 @@ def build_sale_ticket(sale, items, s, reprint=False):
     t.sep()
     has_warranty = (any(int(i.get("warranty_days") or 0) or int(i.get("warranty_changes") or 0) or i.get("imei") for i in items)
                     or sale.get("device_imei"))
-    if has_warranty and (s.get("warranty_text") or "").strip():
+    if s.get("warranty_policy_print", "siempre") != "nunca" and (s.get("warranty_text") or "").strip():
         t.text("POLÍTICAS DE GARANTÍA:", "C", bold=True)
         t.text(s["warranty_text"].strip(), "C")
         t.feed()
@@ -186,7 +188,7 @@ def build_sale_ticket(sale, items, s, reprint=False):
         t.text(s["ticket_footer"].strip(), "C", bold=True)
     t.feed()
     t.barcode(sale["folio"])
-    mode = s.get("warranty_policy_print", "garantia")
+    mode = s.get("warranty_policy_print", "siempre")
     if (s.get("warranty_policy") or "").strip() and (mode == "siempre" or (mode == "garantia" and has_warranty)):
         # póliza completa (el reverso de la nota de la tienda) con firma del cliente
         t.feed()

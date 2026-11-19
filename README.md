@@ -112,16 +112,15 @@ en **Configuración → Tienda → Logo**). Desde ahí se puede subir otro logo 
 3. El cajero también puede hacer notas y cobrarlas directamente. Si quieres que los vendedores también
    cobren, actívalo en **Configuración → Usuarios**.
 
-## Garantía automática de los productos
+## Garantía de cada producto y políticas en la nota
 
-Casi todos los productos llevan garantía. Al dar de alta un producto se le pone sola, en este orden:
-1. **Marca:** Cybershop 2 años · G-Tide 1 año · Somos Tel 1 año (se agregan más marcas).
-2. **Producto original** (casilla en el producto): garantía de originales.
-3. **Categoría:** cargadores, cables, memorias, audífonos, etc. con la garantía estándar; micas de hidrogel
-   6 meses con 1 cambio; protectores, soportes/aros MagSafe, chips y servicios sin garantía.
+La garantía se pone **al subir cada producto** (Nuevo producto o Alta rápida): el campo empieza en
+“— Elige la garantía —” y no se puede guardar sin elegir una (o “Sin garantía”). En la nota, cada
+artículo dice su garantía y fecha de vencimiento, o “Sin garantía”.
 
-Todo se ajusta en **Configuración → Garantías**, que también tiene botones para aplicar las reglas a los
-productos que ya estaban dados de alta. La garantía siempre se puede cambiar en el producto o al vender.
+**Todas las notas** imprimen las políticas de garantía de la tienda y la póliza completa con
+“Acepto y estoy consciente de las políticas de garantía” y firma del cliente. Los textos y cuándo se
+imprimen se cambian en Configuración → Tickets.
 
 ## Garantías y cambios (F3)
 

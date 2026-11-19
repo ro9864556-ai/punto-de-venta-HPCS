@@ -468,36 +468,14 @@ def test_politicas_de_garantia_en_la_nota(client):
                  "9. En baterías", "Acepto y estoy consciente de las políticas de garantía.", "Firma del cliente",
                  "Cliente: Jesús", "TOTAL $259.00"):  # el formato de la nota sigue igual
         assert frag in txt, frag
-    # una venta sin garantía (p. ej. un aro MagSafe) no gasta papel en la póliza
-    sop = [c["id"] for c in client.get("/api/categories").get_json() if c["prefix"] == "SOP"][0]
-    aro = _product(client, name="Aro MagSafe", category_id=sop, price=49, track_stock=0)
-    assert aro["warranty_days"] == 0
+    assert "Garantía: 6 meses" in txt
+    # todas las notas llevan las políticas; un producto sin garantía lo dice en su renglón
+    aro = _product(client, name="Aro MagSafe", category_id=12, price=49, track_stock=0, warranty_days=0)
     s2 = client.post("/api/sales", json={"items": [{"product_id": aro["id"], "qty": 1}], "payment_method": "tarjeta",
                                          "print": False}).get_json()["sale"]
-    assert "ESTA GARANTÍA NO SERÁ VÁLIDA" not in client.get(f"/tickets/{s2['id']}?format=txt").get_data(as_text=True)
-    # se puede imprimir siempre
-    client.put("/api/settings", json={"warranty_policy_print": "siempre"})
-    assert "Firma del cliente" in client.get(f"/tickets/{s2['id']}?format=txt").get_data(as_text=True)
-
-
-def test_garantia_automatica(client):
-    """Casi todo lleva garantía: por marca (Cybershop 2 años…), original, o la de su categoría."""
-    cats = {c["prefix"]: c["id"] for c in client.get("/api/categories").get_json()}
-    w = lambda **kw: _product(client, initial_stock=1, **kw)  # noqa: E731
-    assert w(name="Cargador Cybershop 20W", brand="Cybershop", category_id=cats["CAR"])["warranty_days"] == 730
-    assert w(name="Cable G-Tide", brand="G-Tide", category_id=cats["CAB"])["warranty_days"] == 365
-    assert w(name="Audífonos Somos Tel", brand="somos tel", category_id=cats["AUD"])["warranty_days"] == 365
-    assert w(name="Cargador Apple original", brand="Apple", original=1, category_id=cats["CAR"])["warranty_days"] == 365
-    assert w(name="Memoria 64GB", brand="Kingston", category_id=cats["MEM"])["warranty_days"] == 30
-    mica = w(name="Mica hidrogel HD", category_id=cats["HID"])
-    assert (mica["warranty_days"], mica["warranty_changes"]) == (180, 1)
-    assert w(name="Aro MagSafe", category_id=cats["SOP"])["warranty_days"] == 0
-    assert w(name="Mica cristal genérica", category_id=cats["MIC"])["warranty_days"] == 0
-    assert w(name="Cable con garantía a mano", category_id=cats["CAB"], warranty_days=90)["warranty_days"] == 90
-    # reglas editables y aplicables a lo que ya existe
-    client.put("/api/warranty/brands", json={"brands": [{"brand": "Cybershop", "warranty_days": 730}, {"brand": "Kingston", "warranty_days": 365}]})
-    assert client.get("/api/warranty/default?brand=Kingston").get_json()["warranty_days"] == 365
-    r = client.post("/api/warranty/apply-defaults", json={"only_without": False}).get_json()
-    assert r["changed"] >= 2  # memoria Kingston y el cable capturado a mano
-    prods = {p["name"]: p for p in client.get("/api/products").get_json()}
-    assert prods["Memoria 64GB"]["warranty_days"] == 365 and prods["Aro MagSafe"]["warranty_days"] == 0
+    t2 = client.get(f"/tickets/{s2['id']}?format=txt").get_data(as_text=True)
+    assert "Sin garantía" in t2 and "ESTA GARANTÍA NO SERÁ VÁLIDA" in t2 and "Firma del cliente" in t2
+    # se puede desactivar
+    client.put("/api/settings", json={"warranty_policy_print": "nunca"})
+    t3 = client.get(f"/tickets/{s2['id']}?format=txt").get_data(as_text=True)
+    assert "Firma del cliente" not in t3 and "POLÍTICAS DE GARANTÍA" not in t3

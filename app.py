@@ -153,7 +153,6 @@ def create_app(db_path=None):
     ADMIN_ONLY = {
         "api_put_settings", "api_printers", "api_print_test", "api_category_create", "api_category_update",
         "api_category_delete", "api_product_delete", "api_pricing_bulk", "api_delete_serial",
-        "api_category_warranty", "api_brand_warranties_save", "api_apply_default_warranties",
         "api_cancel_sale", "api_backup", "api_users", "api_user_create", "api_user_update",
         "api_branch_create", "api_branch_update", "api_agent_config",
     }
@@ -552,7 +551,7 @@ def create_app(db_path=None):
         for key, value in data.items():
             if key in dbm.BRANCH_KEYS:
                 c.execute("INSERT OR REPLACE INTO branch_settings(branch_id, key, value) VALUES (?,?,?)", (bid, key, str(value)))
-            elif key in dbm.DEFAULT_SETTINGS or key in ("ticket_zebra_width_mm", "allow_negative_stock", "warranty_policy", "original_warranty_days",
+            elif key in dbm.DEFAULT_SETTINGS or key in ("ticket_zebra_width_mm", "allow_negative_stock", "warranty_policy",
                                                         "warranty_policy_print"):
                 c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(value)))
         c.commit()
@@ -592,65 +591,12 @@ def create_app(db_path=None):
             raise ApiError("Nombre y prefijo son obligatorios")
         try:
             c = conn()
-            cur = c.execute("""INSERT INTO categories(name, prefix, serialized, markup, ask_device, default_warranty_days, default_changes)
-                               VALUES (?,?,?,?,?,?,?)""",
-                            (name, prefix, 1 if d.get("serialized") else 0, num(d.get("markup"), 100), 1 if d.get("ask_device") else 0,
-                             int(num(d.get("default_warranty_days"), dbm.STANDARD_WARRANTY)), int(num(d.get("default_changes"), 0))))
+            cur = c.execute("INSERT INTO categories(name, prefix, serialized, markup, ask_device) VALUES (?,?,?,?,?)",
+                            (name, prefix, 1 if d.get("serialized") else 0, num(d.get("markup"), 100), 1 if d.get("ask_device") else 0))
             c.commit()
         except Exception as exc:  # sqlite3.IntegrityError
             raise ApiError(f"La categoría o el prefijo ya existe ({exc})")
         return jsonify({"id": cur.lastrowid})
-
-    @app.put("/api/categories/<int:cid>/warranty")
-    def api_category_warranty(cid):
-        d = body()
-        conn().execute("UPDATE categories SET default_warranty_days=?, default_changes=? WHERE id=?",
-                       (max(0, int(num(d.get("default_warranty_days"), 0))), max(0, int(num(d.get("default_changes"), 0))), cid))
-        conn().commit()
-        return jsonify({"ok": True})
-
-    # ------------------------------------------------------------ reglas de garantía
-    @app.get("/api/warranty/brands")
-    def api_brand_warranties():
-        return jsonify(dbm.rows_to_list(conn().execute("SELECT * FROM brand_warranties ORDER BY brand").fetchall()))
-
-    @app.put("/api/warranty/brands")
-    def api_brand_warranties_save():
-        """Reemplaza la lista de marcas con garantía propia."""
-        rows = body().get("brands") or []
-        c = conn()
-        c.execute("DELETE FROM brand_warranties")
-        for r in rows:
-            brand = (r.get("brand") or "").strip()
-            if brand:
-                c.execute("INSERT OR REPLACE INTO brand_warranties(brand, warranty_days, changes) VALUES (?,?,?)",
-                          (brand, max(0, int(num(r.get("warranty_days"), 0))), max(0, int(num(r.get("changes"), 0)))))
-        c.commit()
-        return jsonify({"ok": True})
-
-    @app.get("/api/warranty/default")
-    def api_default_warranty():
-        a = request.args
-        days, changes, src = dbm.default_warranty(conn(), a.get("category_id") or None, a.get("brand", ""),
-                                                  a.get("original") in ("1", "true"), settings())
-        return jsonify({"warranty_days": days, "warranty_changes": changes, "source": src})
-
-    @app.post("/api/warranty/apply-defaults")
-    def api_apply_default_warranties():
-        """Aplica las reglas a los productos existentes (solo a los que no tienen garantía, o a todos)."""
-        only_without = body().get("only_without", True)
-        c = conn()
-        changed = 0
-        for p in c.execute("SELECT id, category_id, brand, original, warranty_days, warranty_changes FROM products WHERE active=1").fetchall():
-            if only_without and p["warranty_days"]:
-                continue
-            days, changes, _ = dbm.default_warranty(c, p["category_id"], p["brand"], p["original"], settings())
-            if (days, changes) != (p["warranty_days"], p["warranty_changes"]):
-                c.execute("UPDATE products SET warranty_days=?, warranty_changes=?, updated_at=? WHERE id=?",
-                          (days, changes, dbm.now(), p["id"]))
-                changed += 1
-        c.commit()
-        return jsonify({"changed": changed})
 
     @app.put("/api/categories/<int:cid>")
     def api_category_update(cid):
@@ -677,7 +623,7 @@ def create_app(db_path=None):
     # ------------------------------------------------------------ productos
     PRODUCT_FIELDS = ["sku", "barcode", "name", "brand", "model", "color", "capacity", "category_id", "cost", "price",
                       "wholesale_price", "min_stock", "serialized", "track_stock", "warranty_days", "location", "notes",
-                      "ask_device", "warranty_changes", "ram", "condition", "original"]
+                      "ask_device", "warranty_changes", "ram", "condition"]
 
     @app.get("/api/products")
     def api_products():
@@ -743,17 +689,11 @@ def create_app(db_path=None):
         vals["serialized"] = 1 if vals.get("serialized") in (1, True, "1", "true", "on") else 0
         vals["track_stock"] = 0 if vals.get("track_stock") in (0, False, "0", "false") else 1
         vals["ask_device"] = 1 if vals.get("ask_device") in (1, True, "1", "true", "on") else 0
-        vals["original"] = 1 if vals.get("original") in (1, True, "1", "true", "on") else 0
         if vals["serialized"]:
             vals["track_stock"] = 1
         vals["category_id"] = int(vals["category_id"]) if vals.get("category_id") not in (None, "", 0, "0") else None
         for f in ("brand", "model", "color", "capacity", "location", "notes", "ram", "condition"):
             vals[f] = (vals.get(f) or "").strip()
-        if existing is None and d.get("warranty_days") in (None, ""):
-            days, changes, _src = dbm.default_warranty(c, vals["category_id"], vals["brand"], vals["original"], settings())
-            vals["warranty_days"] = days
-            if d.get("warranty_changes") in (None, ""):
-                vals["warranty_changes"] = changes
         vals["sku"] = (vals.get("sku") or "").strip().upper() or generate_sku(c, vals["category_id"], vals["brand"])
         barcode = re.sub(r"\s", "", str(vals.get("barcode") or ""))
         if not barcode:
