@@ -131,7 +131,8 @@ DEFAULT_SETTINGS = {
     # políticas de garantía de la nota de la tienda
     "warranty_text": 'NO APLICA GARANTÍA SIN NOTA, HOLOGRAMA Y EMPAQUE. LA GARANTÍA SOLO APLICA POR DEFECTO DE FÁBRICA, NO MOJADO, NO GOLPEADO NI MAL USO.',
     "warranty_policy": 'Hospital para celulares shop garantiza a partir de la fecha de compra, el funcionamiento de este producto contra cualquier defecto en los materiales y mano de obra empleados para su fabricación. Nuestra garantía incluye la reparación, reposición o cambio del producto y/o componentes sin cargo alguno para el cliente, incluyendo mano de obra, derivados del cumplimiento de este certificado.\nHospital para celulares shop se compromete a entregar el producto en un lapso no mayor de 30 días hábiles contados a partir de la fecha de recepción del mismo en nuestra sucursal en González Gallo #160, col. centro, Tepatitlán de Morelos Jalisco. Para hacer efectiva esta garantía, no podrán exigirse mayores requisitos que presentarla sellada por el establecimiento comercial donde se adquirió.\nNOTA: No hay devoluciones de dinero, estar seguro de su compra y del artículo que compró.\nESTA GARANTÍA NO SERÁ VÁLIDA BAJO LAS SIGUIENTES CONDICIONES:\n1. Cuando esta póliza manifestara claros signos de haber sido alterada en los datos originales consignados en ella.\n2. Cuando el uso, cuidado y operación del producto no haya sido el que en este certificado está descrito.\n3. Cuando el producto haya sido usado fuera de su capacidad, maltratado, golpeado, expuesto a la humedad, mojado por algún líquido o substancia corrosiva, así como por cualquiera otra falla atribuible al consumidor.\n4. Cuando el producto haya sido desarmado, modificado o reparado por personas no autorizadas por Hospital para celulares Shop.\n5. Cuando la falla sea originada por el desgaste normal de las piezas debido al uso.\n6. No aplica garantía si no presenta su nota de compra.\n7. No aplica garantía si le quita al producto el holograma.\n8. Para hacer válida la garantía, debe traer el empaque del producto.\n9. En baterías, no aplica garantía si la batería está inflada ya que esto sucede por dejar cargando más tiempo del necesario el equipo.\nNinguna otra garantía verbal o escrita diferente a la aquí expresada será reconocida por Hospital para celulares shop.',
-    "warranty_policy_print": "garantia",  # garantia (solo notas con garantía) | siempre | nunca
+    "warranty_policy_print": "garantia",
+    "original_warranty_days": "365",  # garantia (solo notas con garantía) | siempre | nunca
     "ticket_width": "80",
     "ticket_printer_mode": "local",
     "ticket_printer_host": "",
@@ -210,6 +211,8 @@ def init_db(path):
     if conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 0:
         conn.executemany("INSERT INTO categories(name, prefix, serialized, markup) VALUES (?,?,?,?)", DEFAULT_CATEGORIES)
         conn.execute("UPDATE categories SET ask_device=1 WHERE prefix IN ('MIC', 'HID', 'FUN', 'REF', 'SRV')")
+        for prefix, (days, changes) in CATEGORY_WARRANTY.items():
+            conn.execute("UPDATE categories SET default_warranty_days=?, default_changes=? WHERE prefix=?", (days, changes, prefix))
     if not conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
         from werkzeug.security import generate_password_hash
         conn.execute("INSERT INTO users(username, full_name, role, password_hash, must_change, created_at) VALUES (?,?,?,?,1,?)",
@@ -275,6 +278,7 @@ def migrate(conn):
         created_at TEXT NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_item ON warranty_claims(sale_item_id)")
     migrate_branches(conn)
+    migrate_warranty_rules(conn)
 
 
 # Ajustes que cada sucursal puede tener distintos (dirección en el ticket e impresoras).
@@ -368,10 +372,58 @@ def update_default_texts(conn):
                  (DEFAULT_SETTINGS["warranty_text"], OLD_WARRANTY_TEXT))
 
 
+# Garantía que se propone al dar de alta un producto (días, cambios), según su categoría.
+# Casi todo lleva garantía; no llevan: protectores (la mayoría), soportes/aros MagSafe, chips y servicios.
+STANDARD_WARRANTY = 30  # garantía estándar de accesorios (ajustable en Configuración → Garantías)
+CATEGORY_WARRANTY = {
+    "CEL": (365, 0), "FUN": (STANDARD_WARRANTY, 0), "MIC": (0, 0), "HID": (180, 1), "CAR": (STANDARD_WARRANTY, 0),
+    "CAB": (STANDARD_WARRANTY, 0), "AUD": (STANDARD_WARRANTY, 0), "BOC": (STANDARD_WARRANTY, 0), "MEM": (STANDARD_WARRANTY, 0),
+    "SWT": (STANDARD_WARRANTY, 0), "PWB": (STANDARD_WARRANTY, 0), "SOP": (0, 0), "REF": (STANDARD_WARRANTY, 0),
+    "CHP": (0, 0), "ACC": (STANDARD_WARRANTY, 0), "SRV": (0, 0),
+}
+# Marcas con garantía propia
+BRAND_WARRANTY = [("Cybershop", 730, 0), ("G-Tide", 365, 0), ("Somos Tel", 365, 0)]
+
+
+def migrate_warranty_rules(conn):
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(categories)")]
+    if "default_warranty_days" not in cols:
+        conn.execute("ALTER TABLE categories ADD COLUMN default_warranty_days INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE categories ADD COLUMN default_changes INTEGER NOT NULL DEFAULT 0")
+        for prefix, (days, changes) in CATEGORY_WARRANTY.items():
+            conn.execute("UPDATE categories SET default_warranty_days=?, default_changes=? WHERE prefix=?", (days, changes, prefix))
+    if "original" not in [r[1] for r in conn.execute("PRAGMA table_info(products)")]:
+        conn.execute("ALTER TABLE products ADD COLUMN original INTEGER NOT NULL DEFAULT 0")
+    conn.execute("""CREATE TABLE IF NOT EXISTS brand_warranties (
+        brand TEXT PRIMARY KEY COLLATE NOCASE,
+        warranty_days INTEGER NOT NULL,
+        changes INTEGER NOT NULL DEFAULT 0)""")
+    if not conn.execute("SELECT 1 FROM settings WHERE key='brand_warranties_seeded'").fetchone():
+        conn.executemany("INSERT OR IGNORE INTO brand_warranties(brand, warranty_days, changes) VALUES (?,?,?)", BRAND_WARRANTY)
+        conn.execute("INSERT INTO settings(key, value) VALUES ('brand_warranties_seeded', '1')")
+
+
+def default_warranty(conn, category_id=None, brand="", original=False, settings=None):
+    """(días, cambios, de dónde sale) — marca > producto original > categoría."""
+    brand = (brand or "").strip()
+    if brand:
+        row = conn.execute("SELECT warranty_days, changes FROM brand_warranties WHERE brand=?", (brand,)).fetchone()
+        if row:
+            return row[0], row[1], f"marca {brand}"
+    if original:
+        days = int((settings or {}).get("original_warranty_days") or DEFAULT_SETTINGS["original_warranty_days"])
+        return days, 0, "producto original"
+    if category_id:
+        row = conn.execute("SELECT name, default_warranty_days, default_changes FROM categories WHERE id=?", (category_id,)).fetchone()
+        if row:
+            return row[1], row[2], f"categoría {row[0]}"
+    return 0, 0, ""
+
+
 def get_settings(conn, branch_id=None):
     """Ajustes generales con los de la sucursal encima."""
     out = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")
-           if r["key"] not in ("secret_key", "branch_stock_migrated")}
+           if r["key"] not in ("secret_key", "branch_stock_migrated", "brand_warranties_seeded")}
     if branch_id:
         for r in conn.execute("SELECT key, value FROM branch_settings WHERE branch_id=?", (branch_id,)):
             out[r["key"]] = r["value"]

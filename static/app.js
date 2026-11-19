@@ -40,6 +40,15 @@ const warrantyOptions = (sel) => {
   return opts.map(([d, t]) => `<option value="${d}" ${d === Math.round(num(sel)) ? "selected" : ""}>${t}</option>`).join("");
 };
 const can = (...roles) => S.me && roles.includes(S.me.role);
+/** Garantía que corresponde: marca > producto original > categoría. */
+function defaultWarranty(categoryId, brand, original) {
+  const b = (S.brandWarranties || []).find((x) => x.brand.toLowerCase() === String(brand || "").trim().toLowerCase());
+  if (b) return { days: b.warranty_days, changes: b.changes, source: `marca ${b.brand}` };
+  if (original) return { days: Math.round(num(S.settings.original_warranty_days || 365)), changes: 0, source: "producto original" };
+  const c = S.categories.find((x) => String(x.id) === String(categoryId));
+  if (c) return { days: c.default_warranty_days || 0, changes: c.default_changes || 0, source: `categoría ${c.name}` };
+  return { days: 0, changes: 0, source: "" };
+}
 const branchOptions = (sel, { all = true, current = true } = {}) =>
   (current ? `<option value="">${esc(S.me.branch.name)} (esta)</option>` : "") +
   (all ? `<option value="all" ${sel === "all" ? "selected" : ""}>Todas las sucursales</option>` : "") +
@@ -251,6 +260,7 @@ async function loadBase() {
   const s = await GET("/api/settings");
   S.settings = s.settings; S.templates = s.label_templates; S.rounding = s.rounding_modes;
   S.categories = await GET("/api/categories");
+  S.brandWarranties = await GET("/api/warranty/brands").catch(() => []);
   $("#brand-name").textContent = S.settings.store_name || "Punto de Venta";
   document.title = `${S.settings.store_name || "Punto de Venta"} · POS`;
 }
@@ -772,7 +782,7 @@ VIEWS.productos = () => {
 
 async function productForm(id) {
   let p = { name: "", brand: "", model: "", color: "", capacity: "", category_id: "", sku: "", barcode: "", cost: "", price: "", wholesale_price: "",
-    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "", ask_device: 0, warranty_changes: 0, ram: "", condition: "" };
+    min_stock: 1, serialized: 0, track_stock: 1, warranty_days: 0, location: "", notes: "", ask_device: 0, warranty_changes: 0, ram: "", condition: "", original: 0 };
   if (id) { try { p = await GET(`/api/products/${id}`); } catch (e) { return fail(e); } }
   const cat = S.categories.find((c) => String(c.id) === String(p.category_id));
   const isNew = !id;
@@ -786,6 +796,7 @@ async function productForm(id) {
       <label class="f">RAM (celulares)<input name="ram" value="${esc(p.ram || "")}" placeholder="4GB" list="dl-ram"></label>
       <label class="f">Almacenamiento / medida<input name="capacity" value="${esc(p.capacity)}" placeholder="128GB, 20W, 1m…" list="dl-rom"></label>
       <label class="f">Color<input name="color" value="${esc(p.color)}"></label>
+      <label class="chk" style="align-self:end;padding-bottom:8px"><input type="checkbox" name="original" ${p.original ? "checked" : ""}> Producto original</label>
       <label class="f">Condición<select name="condition">${["", "Nuevo", "Seminuevo", "Reacondicionado", "Usado"].map((c) => `<option value="${c}" ${c === (p.condition || "") ? "selected" : ""}>${c || "—"}</option>`).join("")}</select></label>
       <label class="f">Ubicación<input name="location" value="${esc(p.location)}" placeholder="Vitrina 2, bodega…"></label>
       <label class="f span-2">SKU (vacío = automático)<div class="input-group"><input name="sku" value="${esc(p.sku)}" class="mono" placeholder="Se genera: CAT-MAR-0001"><button type="button" id="gen-sku">Generar</button></div></label>
@@ -811,6 +822,7 @@ async function productForm(id) {
           <label class="f">Existencia mínima<input name="min_stock" inputmode="decimal" value="${p.min_stock}"></label>
           <label class="f">Garantía<select name="warranty_days">${warrantyOptions(p.warranty_days)}</select></label>
           <label class="f">Cambios incluidos<select name="warranty_changes">${changesOptions(p.warranty_changes || 0)}</select></label>
+          <div class="span-all small" id="w-hint" style="grid-column:1/-1;color:var(--muted)"></div>
           <label class="chk span-2"><input type="checkbox" name="ask_device" ${p.ask_device ? "checked" : ""}> Pedir modelo e IMEI del equipo del cliente (micas, fundas, reparaciones)</label>
           ${isNew ? `<label class="f span-2" id="f-initial">Existencia inicial<input name="initial_stock" inputmode="decimal" value="0"></label>
           <label class="f span-all hidden" id="f-imeis">IMEIs iniciales (uno por renglón; escanéalos)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia en ${esc(S.me.branch.name)}: <b>${Number(p.stock)}</b>${S.multi ? ` · ${(p.stock_by_branch || []).filter((b) => b.id !== S.me.branch.id).map((b) => `${esc(b.name)}: ${Number(b.stock)}`).join(" · ")}` : ""} — ajústala en Inventario.</div>`}
@@ -819,7 +831,7 @@ async function productForm(id) {
       </fieldset>
       <datalist id="dl-ram">${["2GB", "3GB", "4GB", "6GB", "8GB", "12GB", "16GB"].map((x) => `<option value="${x}">`).join("")}</datalist>
       <datalist id="dl-rom">${["32GB", "64GB", "128GB", "256GB", "512GB", "1TB"].map((x) => `<option value="${x}">`).join("")}</datalist>
-      <datalist id="dl-brands">${["Samsung", "Apple", "Xiaomi", "Motorola", "Huawei", "Honor", "Oppo", "Realme", "ZTE", "Alcatel", "Nokia", "Vivo", "Infinix", "Tecno", "Genérico"].map((b) => `<option value="${b}">`).join("")}</datalist>
+      <datalist id="dl-brands">${["Cybershop", "G-Tide", "Somos Tel", "Samsung", "Apple", "Xiaomi", "Motorola", "Huawei", "Honor", "Oppo", "Realme", "ZTE", "Alcatel", "Nokia", "Vivo", "Infinix", "Tecno", "Genérico"].map((b) => `<option value="${b}">`).join("")}</datalist>
       </form>`,
     foot: `<button data-close>Cancelar</button>${isNew ? '<button id="pf-save-label">Guardar e imprimir etiqueta</button>' : ""}<button class="primary" id="pf-save">Guardar</button>`,
     onOpen: (m, close) => {
@@ -862,6 +874,20 @@ async function productForm(id) {
       $("#gen-sku", m).onclick = async () => {
         try { val("sku").value = (await GET(`/api/products/next-sku?category_id=${val("category_id").value}&brand=${encodeURIComponent(val("brand").value)}`)).sku; } catch (e) { fail(e); }
       };
+      // garantía sugerida según marca / original / categoría
+      let warrantyTouched = !isNew;
+      const applyWarranty = () => {
+        const w = defaultWarranty(val("category_id").value, val("brand").value, val("original").checked);
+        const same = num(val("warranty_days").value) === w.days && num(val("warranty_changes").value) === w.changes;
+        if (!warrantyTouched) { val("warranty_days").innerHTML = warrantyOptions(w.days); val("warranty_changes").innerHTML = changesOptions(w.changes); }
+        const label = w.days ? `${warrantyLabel(w.days)}${w.changes ? ` · ${w.changes} cambio${w.changes > 1 ? "s" : ""}` : ""}` : "sin garantía";
+        $("#w-hint", m).innerHTML = w.source ? `🛡️ Garantía sugerida por ${esc(w.source)}: <b>${label}</b>${!warrantyTouched || same ? "" : ' <a id="w-use">Usar esta</a>'}` : "";
+        const use = $("#w-use", m); if (use) use.onclick = () => { warrantyTouched = false; applyWarranty(); };
+      };
+      ["category_id", "original"].forEach((n) => val(n).addEventListener("change", applyWarranty));
+      val("brand").addEventListener("input", applyWarranty);
+      ["warranty_days", "warranty_changes"].forEach((n) => val(n).addEventListener("change", () => { warrantyTouched = true; applyWarranty(); }));
+      applyWarranty();
       $("#gen-bc", m).onclick = async () => { try { val("barcode").value = (await GET("/api/products/new-barcode")).barcode; } catch (e) { fail(e); } };
       suggest();
       const save = async (thenLabel) => {
@@ -869,6 +895,7 @@ async function productForm(id) {
         data.serialized = val("serialized").checked ? 1 : 0;
         data.track_stock = val("track_stock").checked ? 1 : 0;
         data.ask_device = val("ask_device").checked ? 1 : 0;
+        data.original = val("original").checked ? 1 : 0;
         if (!data.name.trim()) return toast("Escribe el nombre del producto", "bad");
         if (!num(data.price) && !await confirmBox("El precio de venta está en $0. ¿Guardar así?")) return;
         try {
@@ -973,6 +1000,13 @@ function quickAdd() {
         $('[data-q="warranty_changes"]', tr).innerHTML = changesOptions($("#qa-chg", m).value);
       });
       body.addEventListener("click", (e) => { if (e.target.closest('[data-a="rm"]')) e.target.closest("tr").remove(); });
+      body.addEventListener("change", (e) => {
+        if (!e.target.matches('[data-q="category_id"], [data-q="brand"]')) return;
+        const tr = e.target.closest("tr");
+        const w = defaultWarranty($('[data-q="category_id"]', tr).value, $('[data-q="brand"]', tr).value, false);
+        $('[data-q="warranty_days"]', tr).innerHTML = warrantyOptions(w.days);
+        $('[data-q="warranty_changes"]', tr).innerHTML = changesOptions(w.changes);
+      });
       $("#qa-save", m).onclick = async () => {
         const rows = $$("tr", body).map((tr) => Object.fromEntries($$("[data-q]", tr).map((i) => [i.dataset.q, i.type === "checkbox" ? (i.checked ? 1 : 0) : i.value])))
           .filter((r) => r.name.trim());
@@ -1532,6 +1566,37 @@ function field(key, label, opts = {}) {
 
 function initConfig() { /* se dibuja al entrar */ }
 
+function loadWarrantyRules() {
+  const bw = $("#bw-body"); if (!bw) return;
+  const brandRow = (b = { brand: "", warranty_days: 365, changes: 0 }) => `<tr><td><input data-w="brand" value="${esc(b.brand)}" placeholder="Marca"></td>
+    <td><select data-w="warranty_days">${warrantyOptions(b.warranty_days)}</select></td><td><select data-w="changes">${changesOptions(b.changes)}</select></td>
+    <td><button class="sm danger icon-btn" data-w="rm">✕</button></td></tr>`;
+  bw.innerHTML = (S.brandWarranties || []).map(brandRow).join("");
+  $("#bw-add").onclick = () => bw.insertAdjacentHTML("beforeend", brandRow());
+  bw.onclick = (e) => { if (e.target.closest('[data-w="rm"]')) e.target.closest("tr").remove(); };
+  $("#bw-save").onclick = async () => {
+    const brands = $$("tr", bw).map((tr) => ({ brand: $('[data-w="brand"]', tr).value, warranty_days: $('[data-w="warranty_days"]', tr).value, changes: $('[data-w="changes"]', tr).value }));
+    try { await PUT("/api/warranty/brands", { brands }); await loadBase(); toast("Marcas guardadas", "ok"); loadWarrantyRules(); } catch (e) { fail(e); }
+  };
+  $("#orig-days").innerHTML = warrantyOptions(S.settings.original_warranty_days || 365);
+  $("#orig-save").onclick = async () => { try { await PUT("/api/settings", { original_warranty_days: $("#orig-days").value }); await loadBase(); toast("Guardado", "ok"); } catch (e) { fail(e); } };
+  const cw = $("#cw-body");
+  cw.innerHTML = S.categories.map((c) => `<tr data-id="${c.id}"><td>${esc(c.name)}</td><td><select data-w="days">${warrantyOptions(c.default_warranty_days || 0)}</select></td>
+    <td><select data-w="changes">${changesOptions(c.default_changes || 0)}</select></td></tr>`).join("");
+  $("#cw-save").onclick = async () => {
+    try {
+      for (const tr of $$("tr", cw)) await PUT(`/api/categories/${tr.dataset.id}/warranty`, { default_warranty_days: $('[data-w="days"]', tr).value, default_changes: $('[data-w="changes"]', tr).value });
+      await loadBase(); toast("Garantías por categoría guardadas", "ok");
+    } catch (e) { fail(e); }
+  };
+  const apply = async (only_without) => {
+    if (!only_without && !await confirmBox("Se va a reemplazar la garantía de <b>todos</b> los productos con estas reglas (también los que cambiaste a mano). ¿Continuar?", "Recalcular", true)) return;
+    try { const r = await POST("/api/warranty/apply-defaults", { only_without }); $("#wa-res").textContent = `${r.changed} producto(s) actualizados`; toast(`${r.changed} producto(s) actualizados`, "ok"); } catch (e) { fail(e); }
+  };
+  $("#wa-empty").onclick = () => apply(true);
+  $("#wa-all").onclick = () => apply(false);
+}
+
 const userBranchOptions = (sel) => `<option value="">Todas (Administración)</option>` +
   S.branches.map((b) => `<option value="${b.id}" ${String(b.id) === String(sel ?? "") ? "selected" : ""}>${esc(b.name)}</option>`).join("");
 
@@ -1605,7 +1670,7 @@ VIEWS.config = async () => {
   const el = $("#view-config");
   el.innerHTML = `
     <div class="view-head"><h1>Configuración</h1><a class="btn" href="/api/backup">💾 Descargar respaldo</a><button class="primary" id="cfg-save">Guardar cambios</button></div>
-    <div class="tabs"><button data-t="tienda" class="on">Tienda</button><button data-t="tickets">Tickets</button><button data-t="zebra">Etiquetas Zebra</button><button data-t="precios">Precios e IVA</button><button data-t="cats">Categorías</button><button data-t="users">👤 Usuarios</button><button data-t="branches">🏬 Sucursales</button></div>
+    <div class="tabs"><button data-t="tienda" class="on">Tienda</button><button data-t="tickets">Tickets</button><button data-t="zebra">Etiquetas Zebra</button><button data-t="precios">Precios e IVA</button><button data-t="cats">Categorías</button><button data-t="garantias">🛡️ Garantías</button><button data-t="users">👤 Usuarios</button><button data-t="branches">🏬 Sucursales</button></div>
     <div data-p="tienda" class="card"><div class="form-grid">
       ${field("store_name", "Nombre comercial", { span: 2 })}${field("store_legal_name", "Razón social", { span: 2 })}
       ${field("store_rfc", "RFC")}${field("store_phone", "Teléfono")}${field("store_whatsapp", "WhatsApp")}
@@ -1657,6 +1722,21 @@ VIEWS.config = async () => {
         <td><button class="sm" data-a="save">Guardar</button> <button class="sm danger" data-a="del">✕</button></td></tr>`).join("")}
       <tr><td><input id="nc-name" placeholder="Nueva categoría"></td><td><input id="nc-prefix" class="mono" placeholder="ABC" style="width:90px"></td><td class="center"><input type="checkbox" id="nc-ser"></td><td class="center"><input type="checkbox" id="nc-dev"></td><td><input id="nc-markup" value="100" style="width:90px"></td><td></td><td><button class="sm primary" id="nc-add">Agregar</button></td></tr>
       </tbody></table></div>
+    <div data-p="garantias" class="card hidden">
+      <p class="small muted" style="margin-top:0">Al dar de alta un producto se le pone la garantía que corresponde: primero por <b>marca</b>, luego si es <b>producto original</b> y si no, la de su <b>categoría</b>. Siempre se puede cambiar en el producto o al vender.</p>
+      <div class="grid cols-2">
+        <div><h3 style="margin-bottom:8px">Marcas con garantía propia</h3>
+          <table><thead><tr><th>Marca</th><th>Garantía</th><th>Cambios</th><th></th></tr></thead><tbody id="bw-body"></tbody></table>
+          <div class="row" style="margin-top:8px"><button class="sm" id="bw-add">＋ Agregar marca</button><button class="sm primary" id="bw-save">Guardar marcas</button></div>
+          <h3 style="margin:18px 0 8px">Productos originales</h3>
+          <div class="row"><select id="orig-days" style="max-width:200px"></select><button class="sm primary" id="orig-save">Guardar</button></div></div>
+        <div><h3 style="margin-bottom:8px">Por categoría</h3>
+          <table><thead><tr><th>Categoría</th><th>Garantía</th><th>Cambios</th></tr></thead><tbody id="cw-body"></tbody></table>
+          <div class="row" style="margin-top:8px"><button class="sm primary" id="cw-save">Guardar categorías</button></div></div>
+      </div>
+      <fieldset><legend>Productos que ya están dados de alta</legend>
+        <div class="row"><button id="wa-empty">Poner garantía a los que no tienen</button><button class="danger" id="wa-all">Recalcular todos con estas reglas</button><span class="small muted" id="wa-res"></span></div></fieldset>
+    </div>
     <div data-p="branches" class="card hidden">
       <p class="small muted" style="margin-top:0">Todas las sucursales comparten productos y precios; cada una tiene su existencia, sus IMEI, sus folios (<span class="mono">CLAVE-000123</span>), su caja y sus impresoras.
       En la computadora de cada sucursal corre el <b>agente de impresión</b> (<span class="mono">iniciar_agente.bat</span>) con su <span class="mono">agente.json</span>.</p>
@@ -1668,6 +1748,7 @@ VIEWS.config = async () => {
     <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;
   loadUsers();
   loadBranches();
+  loadWarrantyRules();
   $("#logo-up").onclick = async () => {
     const f = $("#logo-file").files[0]; if (!f) return toast("Selecciona una imagen", "bad");
     const fd = new FormData(); fd.append("file", f);

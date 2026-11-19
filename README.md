@@ -112,6 +112,17 @@ en **Configuración → Tienda → Logo**). Desde ahí se puede subir otro logo 
 3. El cajero también puede hacer notas y cobrarlas directamente. Si quieres que los vendedores también
    cobren, actívalo en **Configuración → Usuarios**.
 
+## Garantía automática de los productos
+
+Casi todos los productos llevan garantía. Al dar de alta un producto se le pone sola, en este orden:
+1. **Marca:** Cybershop 2 años · G-Tide 1 año · Somos Tel 1 año (se agregan más marcas).
+2. **Producto original** (casilla en el producto): garantía de originales.
+3. **Categoría:** cargadores, cables, memorias, audífonos, etc. con la garantía estándar; micas de hidrogel
+   6 meses con 1 cambio; protectores, soportes/aros MagSafe, chips y servicios sin garantía.
+
+Todo se ajusta en **Configuración → Garantías**, que también tiene botones para aplicar las reglas a los
+productos que ya estaban dados de alta. La garantía siempre se puede cambiar en el producto o al vender.
+
 ## Garantías y cambios (F3)
 
 Cada producto define su **garantía** (p. ej. 1 año) y cuántos **cambios** incluye (p. ej. 3 para una mica
