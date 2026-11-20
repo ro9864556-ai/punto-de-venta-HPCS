@@ -161,7 +161,7 @@ def create_app(db_path=None):
     ADMIN_ONLY = {
         "api_put_settings", "api_printers", "api_print_test", "api_category_create", "api_category_update",
         "api_category_delete", "api_product_delete", "api_pricing_bulk", "api_delete_serial",
-        "api_cancel_sale", "api_backup", "api_users", "api_user_create", "api_user_update",
+        "api_backup", "api_users", "api_user_create", "api_user_update", "api_set_cancel_password",
         "api_branch_create", "api_branch_update", "api_agent_config",
     }
     CATALOG = {  # administración y matriz: dar de alta productos y subir inventario
@@ -173,6 +173,7 @@ def create_app(db_path=None):
         "api_add_serials", "api_inventory_adjust", "api_inventory_moves", "api_cash_create", "api_cash_list",
         "api_report", "corte_page", "api_corte_print", "api_dashboard", "api_label_preview", "api_label_zpl",
         "api_create_claim", "api_print_claim", "api_inventory_transfer", "api_inventory_incoming",
+        "api_cancel_sale", "api_inventory_receive",
     }
     PUBLIC = {"login_page", "api_login", "static", "logo_png", "api_agent_jobs", "api_agent_job_done"}
     ADMIN_ONLY.add("api_upload_logo")
@@ -548,9 +549,22 @@ def create_app(db_path=None):
     # ------------------------------------------------------------ configuración
     @app.get("/api/settings")
     def api_get_settings():
-        return jsonify({"settings": settings(), "rounding_modes": ROUNDING_MODES,
+        s = settings()
+        row = conn().execute("SELECT value FROM settings WHERE key='cancel_password_hash'").fetchone()
+        s["cancel_password_set"] = "1" if row and row["value"] else "0"
+        return jsonify({"settings": s, "rounding_modes": ROUNDING_MODES,
                         "label_templates": {k: {"name": v["name"], "description": v["description"],
                                                 "size": v["size"]} for k, v in labels.TEMPLATES.items()}})
+
+    @app.put("/api/cancel-password")
+    def api_set_cancel_password():
+        """Clave que Administración da a los cajeros para cancelar notas."""
+        pwd = body().get("password") or ""
+        if len(pwd) < 4:
+            raise ApiError("La clave de cancelación debe tener al menos 4 caracteres")
+        conn().execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('cancel_password_hash', ?)", (generate_password_hash(pwd),))
+        conn().commit()
+        return jsonify({"ok": True})
 
     @app.put("/api/settings")
     def api_put_settings():
@@ -713,6 +727,20 @@ def create_app(db_path=None):
         vals["barcode"] = barcode
         return vals
 
+    def _serial_choice(d):
+        """El catálogo exige decir si el producto lleva serie (IMEI / número de serie) o no."""
+        v = d.get("serialized")
+        if v in (1, True, "1", "true", "on", "con", "si", "sí"):
+            return 1
+        if v in (0, False, "0", "false", "off", "sin", "no"):
+            return 0
+        raise ApiError("Indica si el producto lleva serie (IMEI / número de serie) o no lleva serie")
+
+    def _check_new_serials(c, serials):
+        dup = [x for x in serials if c.execute("SELECT 1 FROM serials WHERE imei=? OR imei2=?", (x, x)).fetchone()]
+        if dup:
+            raise ApiError(f"Estas series ya están registradas: {', '.join(dup)}")
+
     def _check_unique(c, vals, pid=None):
         for f, label in (("sku", "SKU"), ("barcode", "código de barras")):
             row = c.execute(f"SELECT id, name FROM products WHERE {f}=? AND id<>?", (vals[f], pid or 0)).fetchone()
@@ -721,8 +749,20 @@ def create_app(db_path=None):
 
     @app.post("/api/products")
     def api_product_create():
-        d = body()
-        c = conn()
+        d = dict(body())
+        c = begin_write()
+        d["serialized"] = _serial_choice(d)
+        initial = num(d.get("initial_stock"), 0)
+        imeis = _parse_imeis(d.get("imeis"))
+        if d["serialized"]:
+            if initial and not imeis:
+                raise ApiError("Este producto lleva serie: el inventario inicial se captura con una serie "
+                               "(IMEI / número de serie) por pieza, no con una cantidad")
+            if initial and int(initial) != len(imeis):
+                raise ApiError(f"Dice {initial:g} piezas pero capturaste {len(imeis)} series")
+            _check_new_serials(c, imeis)
+        elif imeis:
+            raise ApiError("Este producto no lleva serie: captura solo la cantidad")
         vals = _product_values(d, c)
         _check_unique(c, vals)
         ts = dbm.now()
@@ -730,13 +770,11 @@ def create_app(db_path=None):
         cur = c.execute(f"INSERT INTO products({', '.join(cols)}, stock, created_at, updated_at) "
                         f"VALUES ({', '.join('?' * len(cols))}, 0, ?, ?)", [vals[k] for k in cols] + [ts, ts])
         pid = cur.lastrowid
-        initial = num(d.get("initial_stock"), 0)
         if initial and not vals["serialized"]:
             add_stock(c, pid, branch_id(), initial)
             log_move(c, pid, branch_id(), initial, "entrada", notes="Inventario inicial", ts=ts)
-        imeis = _parse_imeis(d.get("imeis"))
         if imeis and vals["serialized"]:
-            _add_serials(c, pid, imeis, "Alta de producto")
+            _add_serials(c, pid, imeis, "Inventario inicial")
         c.commit()
         return jsonify(get_product(pid)), 201
 
@@ -751,6 +789,9 @@ def create_app(db_path=None):
             if not (row.get("name") or "").strip():
                 continue
             try:
+                row = {**row, "serialized": _serial_choice(row)}
+                if row["serialized"] and num(row.get("initial_stock"), 0):
+                    raise ApiError("lleva serie: su existencia se ingresa en Recepción de mercancía capturando cada serie")
                 vals = _product_values(row, c)
                 _check_unique(c, vals)
                 cols = list(vals.keys())
@@ -772,6 +813,11 @@ def create_app(db_path=None):
         c = begin_write()
         vals = _product_values(body(), c, existing)
         _check_unique(c, vals, pid)
+        if existing["serialized"] and not vals["serialized"]:
+            n = c.execute("SELECT COUNT(*) FROM serials WHERE product_id=? AND status='disponible'", (pid,)).fetchone()[0]
+            if n:
+                raise ApiError(f"No se puede cambiar a 'sin serie': hay {n} pieza(s) registradas con su serie. "
+                               "Dalas de baja primero o deja el producto como 'con serie'.")
         if vals["serialized"] and not existing["serialized"]:
             loose = c.execute("""SELECT b.name, bs.stock FROM branch_stock bs JOIN branches b ON b.id=bs.branch_id
                                  WHERE bs.product_id=? AND bs.stock<>0""", (pid,)).fetchall()
@@ -931,7 +977,8 @@ def create_app(db_path=None):
         begin_write()
         p = get_product(int(d.get("product_id") or 0))
         if p["serialized"]:
-            raise ApiError("Los productos con IMEI se ajustan dando de alta o baja cada IMEI")
+            raise ApiError("Este producto lleva serie: no se ingresa por cantidad. Captura la serie (IMEI / número de serie) "
+                           "de cada pieza en Recepción de mercancía")
         kind = d.get("kind", "entrada")
         qty = num(d.get("qty"))
         if kind == "entrada":
@@ -950,6 +997,69 @@ def create_app(db_path=None):
         log_move(c, p["id"], bid, delta, kind, notes=d.get("notes", ""))
         c.commit()
         return jsonify(get_product(p["id"]))
+
+    @app.post("/api/inventory/receive")
+    def api_inventory_receive():
+        """Recepción de mercancía / inventario inicial: varios productos en una sola captura.
+        Sin serie → cantidad. Con serie → una serie por pieza (se rechaza si solo traen cantidad)."""
+        d = body()
+        c = begin_write()
+        bid = branch_id()
+        lines = [ln for ln in (d.get("lines") or []) if ln.get("product_id")]
+        if not lines:
+            raise ApiError("Agrega al menos un producto a la recepción")
+        errors, plan, seen = [], [], set()
+        for ln in lines:
+            try:
+                p = get_product(int(ln["product_id"]))
+            except (ApiError, ValueError):
+                errors.append("Un producto ya no existe en el catálogo")
+                continue
+            serials = _parse_imeis(ln.get("serials"))
+            qty = num(ln.get("qty"), 0)
+            if p["serialized"]:
+                if not serials:
+                    errors.append(f"{p['name']}: lleva serie, captura una serie (IMEI / número de serie) por pieza; "
+                                  "no se puede ingresar solo la cantidad")
+                    continue
+                if qty and int(qty) != len(serials):
+                    errors.append(f"{p['name']}: dice {qty:g} piezas pero capturaste {len(serials)} series")
+                dup = [x for x in serials if x in seen or c.execute("SELECT 1 FROM serials WHERE imei=? OR imei2=?", (x, x)).fetchone()]
+                if dup:
+                    errors.append(f"{p['name']}: estas series ya están registradas: {', '.join(dup)}")
+                seen.update(serials)
+                plan.append((p, len(serials), serials, ln))
+            else:
+                if serials:
+                    errors.append(f"{p['name']}: no lleva serie, captura solo la cantidad")
+                    continue
+                if qty <= 0:
+                    errors.append(f"{p['name']}: captura la cantidad recibida")
+                    continue
+                plan.append((p, qty, [], ln))
+        if errors:
+            raise ApiError("No se registró la recepción:\n• " + "\n• ".join(errors))
+        ts = dbm.now()
+        ref = (d.get("reference") or "").strip() or "Recepción"
+        notes = (d.get("notes") or "").strip()
+        out = []
+        for p, qty, serials, ln in plan:
+            if ln.get("cost") not in (None, ""):
+                c.execute("UPDATE products SET cost=?, updated_at=? WHERE id=?", (num(ln["cost"]), ts, p["id"]))
+            if serials:
+                for imei in serials:
+                    c.execute("INSERT INTO serials(product_id, imei, status, branch_id, created_at) VALUES (?,?,?,?,?)",
+                              (p["id"], imei, "disponible", bid, ts))
+                sync_serial_stock(c, p["id"], bid)
+                log_move(c, p["id"], bid, qty, "entrada", ref, f"{notes} IMEI: {', '.join(serials)}".strip(), ts, ",".join(serials))
+            else:
+                add_stock(c, p["id"], bid, qty)
+                log_move(c, p["id"], bid, qty, "entrada", ref, notes, ts)
+            out.append({"product_id": p["id"], "name": p["name"], "sku": p["sku"], "qty": qty, "serials": serials,
+                        "serialized": p["serialized"]})
+        c.commit()
+        pieces = sum(x["qty"] for x in out)
+        return jsonify({"message": f"Recepción registrada: {len(out)} producto(s), {pieces:g} pieza(s)", "lines": out})
 
     @app.post("/api/inventory/transfer")
     def api_inventory_transfer():
@@ -1308,6 +1418,17 @@ def create_app(db_path=None):
     def api_cancel_sale(sale_id):
         begin_write()  # antes de leer: dos cancelaciones simultáneas no regresan el inventario dos veces
         sale = _sale(sale_id)
+        user = current_user()
+        if user["role"] != "admin":
+            if sale["branch_id"] != branch_id():
+                raise ApiError("Solo puedes cancelar notas de tu sucursal", 403)
+            row = conn().execute("SELECT value FROM settings WHERE key='cancel_password_hash'").fetchone()
+            if not row or not row["value"]:
+                raise ApiError("Administración todavía no define la clave de cancelación (Configuración → Usuarios)", 403)
+            if not check_password_hash(row["value"], body().get("password") or ""):
+                raise ApiError("Clave de cancelación incorrecta", 403)
+            if not (body().get("reason") or "").strip():
+                raise ApiError("Escribe el motivo de la cancelación")
         if sale["status"] != "completada":
             raise ApiError("Solo se pueden cancelar ventas cobradas")
         c = conn()
@@ -1327,7 +1448,7 @@ def create_app(db_path=None):
             elif p["track_stock"]:
                 add_stock(c, p["id"], bid, it["qty"])
                 log_move(c, p["id"], bid, it["qty"], "cancelación", sale["folio"], ts=ts)
-        notes = (sale.get("notes") or "") + (f" | Cancelada: {reason}" if reason else "")
+        notes = (sale.get("notes") or "") + f" | Cancelada por {user['full_name']}" + (f": {reason}" if reason else "")
         c.execute("UPDATE sales SET status='cancelada', cancelled_at=?, notes=? WHERE id=?", (ts, notes.strip(" |"), sale_id))
         c.commit()
         return jsonify(_sale(sale_id))
@@ -1748,6 +1869,9 @@ def create_app(db_path=None):
                     pid = existing["id"]
                     updated += 1
                 else:
+                    data["serialized"] = _serial_choice({"serialized": (row.get("serialized") or row.get("serie") or "").lower()})
+                    if data["serialized"] and row.get("stock") not in (None, "", "0"):
+                        raise ApiError("lleva serie: su existencia se ingresa en Recepción de mercancía capturando cada serie")
                     vals = _product_values(data, c)
                     _check_unique(c, vals)
                     cols = list(vals.keys())

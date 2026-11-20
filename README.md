@@ -122,6 +122,24 @@ artículo dice su garantía y fecha de vencimiento, o “Sin garantía”.
 “Acepto y estoy consciente de las políticas de garantía” y firma del cliente. Los textos y cuándo se
 imprimen se cambian en Configuración → Tickets.
 
+## Productos con serie y sin serie · Recepción de mercancía
+
+Al dar de alta un producto en el catálogo **hay que indicar si lleva serie** (IMEI / número de serie) o no;
+si no se indica, el sistema rechaza el alta (también en Alta rápida e importación CSV, columna
+`serialized`: 1 con serie, 0 sin serie).
+
+**Inventario → Recepción de mercancía / inventario inicial:** se agregan varios productos a la vez.
+- **Sin serie:** se escribe la cantidad (ej. 10 fundas).
+- **Con serie:** se escanea la serie de cada pieza; la cantidad se cuenta sola (ej. 4 celulares = 4 series).
+- Si un producto con serie trae solo cantidad, o las series no coinciden con la cantidad, o una serie ya
+  existe, **se rechaza toda la recepción** y se explica el motivo. Lo recibido puede mandarse a etiquetas.
+
+## Cancelar notas
+
+Administración cancela directamente. Los **cajeros** pueden cancelar notas de su sucursal escribiendo la
+**clave de cancelación** que define Administración en Configuración → Usuarios, y un motivo. La nota
+registra quién la canceló y por qué; el producto regresa al inventario.
+
 ## Garantías y cambios (F3)
 
 Cada producto define su **garantía** (p. ej. 1 año) y cuántos **cambios** incluye (p. ej. 3 para una mica

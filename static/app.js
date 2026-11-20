@@ -42,6 +42,9 @@ const warrantyOptions = (sel) => {
   return opts.map(([d, t]) => `<option value="${d}" ${d === Math.round(num(sel)) ? "selected" : ""}>${t}</option>`).join("");
 };
 const can = (...roles) => S.me && roles.includes(S.me.role);
+const serialOptions = (sel) =>
+  (sel === "" || sel === null || sel === undefined ? '<option value="" selected>— Elige —</option>' : "") +
+  `<option value="0" ${String(sel) === "0" ? "selected" : ""}>Sin serie</option><option value="1" ${String(sel) === "1" ? "selected" : ""}>Con serie</option>`;
 const branchOptions = (sel, { all = true, current = true } = {}) =>
   (current ? `<option value="">${esc(S.me.branch.name)} (esta)</option>` : "") +
   (all ? `<option value="all" ${sel === "all" ? "selected" : ""}>Todas las sucursales</option>` : "") +
@@ -678,15 +681,30 @@ async function showSale(id) {
         </tbody></table></div>
       <div><iframe class="ticket" src="/tickets/${s.id}"></iframe>
         <div class="row small" style="margin-top:6px">Descargar: <a href="/tickets/${s.id}?format=zpl">ZPL (Zebra)</a> · <a href="/tickets/${s.id}?format=escpos">ESC/POS</a> · <a href="/tickets/${s.id}?format=txt" target="_blank">Texto</a></div></div></div>`,
-    foot: `${s.status !== "cancelada" && can("admin") ? '<button class="danger" id="sv-cancel">Cancelar venta</button><span class="spacer"></span>' : ""}
+    foot: `${s.status === "completada" && can("admin", "matriz", "cajero") ? '<button class="danger" id="sv-cancel">Cancelar venta</button><span class="spacer"></span>' : ""}
            <button id="sv-print">🖨 Reimprimir ticket</button><button data-close class="primary">Cerrar</button>`,
     onOpen: (m, close) => {
       $("#sv-print", m).onclick = () => printSale(s.id);
       const c = $("#sv-cancel", m);
       if (c) c.onclick = async () => {
-        const reason = await promptBox("Cancelar venta", "Motivo de la cancelación (regresa el producto al inventario)");
-        if (reason === null) return;
-        try { await POST(`/api/sales/${s.id}/cancel`, { reason }); toast("Venta cancelada; inventario restaurado", "ok"); close(); if (S.view === "ventas") VIEWS.ventas(); } catch (e) { fail(e); }
+        const needsKey = !can("admin");
+        modal({
+          title: `Cancelar venta ${esc(s.folio)}`, size: "narrow",
+          body: `<p class="small" style="margin-top:0">El producto regresa al inventario y la nota queda como cancelada.</p>
+            <div class="grid" style="gap:10px"><label class="f">Motivo de la cancelación *<input id="cx-reason" autofocus></label>
+            ${needsKey ? '<label class="f">Clave de cancelación *<input id="cx-pass" type="password" autocomplete="off"></label>' : ""}</div>`,
+          foot: `<button data-close>Regresar</button><button class="danger" id="cx-ok">Cancelar venta</button>`,
+          onOpen: (cm, cclose) => {
+            $("#cx-ok", cm).onclick = async () => {
+              const reason = $("#cx-reason", cm).value.trim();
+              if (!reason) return toast("Escribe el motivo", "bad");
+              try {
+                await POST(`/api/sales/${s.id}/cancel`, { reason, password: needsKey ? $("#cx-pass", cm).value : undefined });
+                toast("Venta cancelada; inventario restaurado", "ok"); cclose(); close(); if (S.view === "ventas") VIEWS.ventas();
+              } catch (e) { fail(e); }
+            };
+          },
+        });
       };
     },
   });
@@ -808,14 +826,17 @@ async function productForm(id) {
       </fieldset>
       <fieldset style="grid-column:1/-1"><legend>📦 Inventario y garantía</legend>
         <div class="form-grid">
-          <label class="chk"><input type="checkbox" name="serialized" ${p.serialized ? "checked" : ""}> Maneja IMEI / número de serie</label>
+          <label class="f span-2">¿Lleva serie? *<select name="serialized" class="w-required">
+            ${isNew ? '<option value="" selected>— Elige: con serie o sin serie —</option>' : ""}
+            <option value="0" ${!isNew && !p.serialized ? "selected" : ""}>Sin serie: se controla por cantidad</option>
+            <option value="1" ${!isNew && p.serialized ? "selected" : ""}>Con serie: IMEI / número de serie por pieza</option></select></label>
           <label class="chk"><input type="checkbox" name="track_stock" ${p.track_stock ? "checked" : ""}> Controla existencia</label>
           <label class="f">Existencia mínima<input name="min_stock" inputmode="decimal" value="${p.min_stock}"></label>
           <label class="f">Garantía *<select name="warranty_days" class="w-required">${warrantyOptions(isNew ? "" : p.warranty_days)}</select></label>
           <label class="f">Cambios incluidos<select name="warranty_changes">${changesOptions(p.warranty_changes || 0)}</select></label>
           <label class="chk span-2"><input type="checkbox" name="ask_device" ${p.ask_device ? "checked" : ""}> Pedir modelo e IMEI del equipo del cliente (micas, fundas, reparaciones)</label>
           ${isNew ? `<label class="f span-2" id="f-initial">Existencia inicial<input name="initial_stock" inputmode="decimal" value="0"></label>
-          <label class="f span-all hidden" id="f-imeis">IMEIs iniciales (uno por renglón; escanéalos)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia en ${esc(S.me.branch.name)}: <b>${Number(p.stock)}</b>${S.multi ? ` · ${(p.stock_by_branch || []).filter((b) => b.id !== S.me.branch.id).map((b) => `${esc(b.name)}: ${Number(b.stock)}`).join(" · ")}` : ""} — ajústala en Inventario.</div>`}
+          <label class="f span-all hidden" id="f-imeis">Series iniciales: escanea la serie de cada pieza (IMEI / número de serie, una por renglón; déjalo vacío si aún no llega)<textarea name="imeis" class="mono" placeholder="356789012345678"></textarea></label>` : `<div class="span-2 muted small" style="grid-column:span 2;align-self:center">Existencia en ${esc(S.me.branch.name)}: <b>${Number(p.stock)}</b>${S.multi ? ` · ${(p.stock_by_branch || []).filter((b) => b.id !== S.me.branch.id).map((b) => `${esc(b.name)}: ${Number(b.stock)}`).join(" · ")}` : ""} — ajústala en Inventario.</div>`}
           <label class="f span-all">Notas<input name="notes" value="${esc(p.notes)}"></label>
         </div>
       </fieldset>
@@ -828,16 +849,16 @@ async function productForm(id) {
       const f = $("#pf", m);
       const val = (n) => f.elements[n];
       const toggleSerial = () => {
-        const ser = val("serialized").checked;
+        const ser = val("serialized").value === "1";
         $("#f-initial", m)?.classList.toggle("hidden", ser);
         $("#f-imeis", m)?.classList.toggle("hidden", !ser);
         if (ser) val("track_stock").checked = true;
       };
-      val("serialized").onchange = toggleSerial;
+      val("serialized").onchange = () => { toggleSerial(); if (val("serialized").value === "1" && !val("condition").value) val("condition").value = "Nuevo"; };
       toggleSerial();
       val("category_id").onchange = () => {
         const c = S.categories.find((x) => String(x.id) === val("category_id").value);
-        if (c) { $("#pg-markup", m).value = c.markup; if (isNew) { val("serialized").checked = !!c.serialized; toggleSerial(); val("track_stock").checked = c.prefix !== "SRV"; val("ask_device").checked = !!c.ask_device; if (c.serialized && !val("condition").value) val("condition").value = "Nuevo"; } }
+        if (c) { $("#pg-markup", m).value = c.markup; if (isNew) { val("track_stock").checked = c.prefix !== "SRV"; val("ask_device").checked = !!c.ask_device; if (c.serialized && !val("condition").value) val("condition").value = "Nuevo"; } }
         suggest();
       };
       let suggested = null;
@@ -868,7 +889,7 @@ async function productForm(id) {
       suggest();
       const save = async (thenLabel) => {
         const data = Object.fromEntries(new FormData(f).entries());
-        data.serialized = val("serialized").checked ? 1 : 0;
+        if (data.serialized === "") { val("serialized").focus(); return toast("Indica si el producto lleva serie (IMEI / número de serie) o no", "bad"); }
         data.track_stock = val("track_stock").checked ? 1 : 0;
         data.ask_device = val("ask_device").checked ? 1 : 0;
         if (!data.name.trim()) return toast("Escribe el nombre del producto", "bad");
@@ -940,6 +961,7 @@ function quickAdd() {
   const row = (r = {}) => `<tr>
     <td><input data-q="name" value="${esc(r.name || "")}" placeholder="Nombre" style="min-width:250px"></td>
     <td><select data-q="category_id" style="width:150px">${catOptions(r.category_id ?? hid?.id ?? "")}</select></td>
+    <td><select data-q="serialized" class="w-required" style="width:105px">${serialOptions(r.serialized ?? "")}</select></td>
     <td><input data-q="brand" value="${esc(r.brand || "")}" placeholder="Marca" style="width:90px"></td>
     <td><input data-q="cost" inputmode="decimal" style="width:80px" value="${r.cost ?? ""}"></td>
     <td><input data-q="price" inputmode="decimal" style="width:80px" value="${r.price ?? ""}"></td>
@@ -957,7 +979,7 @@ function quickAdd() {
         <label class="f" style="flex-direction:row;align-items:center;gap:6px">Garantía<select id="qa-war" style="width:150px">${warrantyOptions("")}</select></label>
         <label class="f" style="flex-direction:row;align-items:center;gap:6px">Cambios<select id="qa-chg" style="width:130px">${changesOptions(0)}</select></label>
         <button id="qa-apply" class="sm">Aplicar a todas</button></div>
-      <div class="table-wrap" style="max-height:52vh"><table><thead><tr><th>Producto</th><th>Categoría</th><th>Marca</th><th>Costo</th><th>Precio</th><th>Garantía</th><th>Cambios</th><th title="Controla existencia">Inventario</th><th>Cant. inicial</th><th>Pide equipo</th><th></th></tr></thead>
+      <div class="table-wrap" style="max-height:52vh"><table><thead><tr><th>Producto</th><th>Categoría</th><th>¿Serie?</th><th>Marca</th><th>Costo</th><th>Precio</th><th>Garantía</th><th>Cambios</th><th title="Controla existencia">Inventario</th><th>Cant. inicial</th><th>Pide equipo</th><th></th></tr></thead>
       <tbody id="qa-body">${row()}${row()}${row()}</tbody></table></div>
       <button id="qa-add" style="margin-top:8px">＋ Agregar renglón</button><div id="qa-res" class="small" style="margin-top:8px"></div>`,
     foot: `<button data-close>Cerrar</button><button class="primary" id="qa-save">Guardar productos</button>`,
@@ -967,7 +989,7 @@ function quickAdd() {
       $("#qa-micas", m).onclick = () => {
         $$("tr", body).forEach((tr) => { if (!$('[data-q="name"]', tr).value.trim()) tr.remove(); });
         const price = $("#qa-price", m).value, war = $("#qa-war", m).value === "" ? "" : num($("#qa-war", m).value);
-        body.insertAdjacentHTML("beforeend", MICA_TYPES.map((name) => row({ name, price, warranty_days: war, warranty_changes: num($("#qa-chg", m).value),
+        body.insertAdjacentHTML("beforeend", MICA_TYPES.map((name) => row({ name, price, serialized: 0, warranty_days: war, warranty_changes: num($("#qa-chg", m).value),
           category_id: (name.includes("hidrogel") ? hid : S.categories.find((c) => c.prefix === "MIC"))?.id })).join(""));
       };
       $("#qa-apply", m).onclick = () => $$("tr", body).forEach((tr) => {
@@ -980,6 +1002,10 @@ function quickAdd() {
         const rows = $$("tr", body).map((tr) => Object.fromEntries($$("[data-q]", tr).map((i) => [i.dataset.q, i.type === "checkbox" ? (i.checked ? 1 : 0) : i.value])))
           .filter((r) => r.name.trim());
         if (!rows.length) return toast("Escribe al menos un producto", "bad");
+        const noSerial = rows.filter((r) => r.serialized === "");
+        if (noSerial.length) return toast(`Indica si llevan serie: ${noSerial.map((r) => r.name).join(", ")}`, "bad");
+        const serialWithQty = rows.filter((r) => r.serialized === "1" && num(r.initial_stock));
+        if (serialWithQty.length) return toast(`${serialWithQty.map((r) => r.name).join(", ")}: llevan serie, su existencia se ingresa en Recepción de mercancía con cada serie`, "bad");
         const noWarranty = rows.filter((r) => r.warranty_days === "");
         if (noWarranty.length) return toast(`Elige la garantía de: ${noWarranty.map((r) => r.name).join(", ")}`, "bad");
         const noPrice = rows.filter((r) => !num(r.price));
@@ -1032,7 +1058,7 @@ function bulkPricing() {
 function importCsv() {
   modal({
     title: "Importar productos desde CSV / Excel", size: "narrow",
-    body: `<p class="small">Guarda tu hoja de Excel como <b>CSV</b>. Columnas reconocidas: <span class="mono small">sku, barcode, name, brand, model, color, capacity, category, cost, price, wholesale_price, stock, min_stock, serialized, track_stock, warranty_days, location, notes</span>. Si el SKU o código ya existe, se actualiza.</p>
+    body: `<p class="small">Guarda tu hoja de Excel como <b>CSV</b>. Columnas reconocidas: <span class="mono small">sku, barcode, name, brand, model, color, capacity, category, cost, price, wholesale_price, stock, min_stock, serialized, track_stock, warranty_days, location, notes</span>. Si el SKU o código ya existe, se actualiza. Los productos nuevos deben traer <b>serialized</b>: <b>1</b> con serie, <b>0</b> sin serie.</p>
       <p><a href="/api/products/template.csv">⬇ Descargar plantilla de ejemplo</a></p>
       <input type="file" id="csv-file" accept=".csv,text/csv"><div id="csv-res" class="small" style="margin-top:10px"></div>`,
     foot: `<button data-close>Cerrar</button><button class="primary" id="csv-go">Importar</button>`,
@@ -1334,6 +1360,15 @@ VIEWS.etiquetas = () => {
 function initInventario() {
   $("#view-inventario").innerHTML = `
     <div class="view-head"><h1>Inventario e IMEI</h1></div>
+    <div class="card" style="margin-bottom:16px"><h2>📦 Recepción de mercancía / inventario inicial</h2>
+      <p class="small muted" style="margin:-4px 0 10px">Agrega los productos que llegaron. <b>Sin serie</b>: escribe la cantidad. <b>Con serie</b>: escanea la serie de cada pieza (la cantidad se cuenta sola).</p>
+      <div class="search-box"><span class="scan-ico">➕</span><input id="rc-scan" class="scan" autocomplete="off" placeholder="Escanea o busca un producto del catálogo para agregarlo"></div>
+      <div class="table-wrap" style="margin-top:10px;max-height:none"><table><thead><tr><th>Producto</th><th>Tipo</th><th>Cantidad / series</th><th class="num">Costo unit.</th><th></th></tr></thead><tbody id="rc-body"></tbody></table></div>
+      <div class="row" style="margin-top:10px"><input id="rc-ref" placeholder="Proveedor / factura (opcional)" style="max-width:280px"><input id="rc-notes" placeholder="Nota (opcional)" style="max-width:280px">
+        <label class="chk small"><input type="checkbox" id="rc-lbl" checked> Mandar a etiquetas lo recibido</label><span class="spacer"></span>
+        <button class="primary" id="rc-save">Registrar recepción</button></div>
+      <div id="rc-res" class="small" style="margin-top:8px;white-space:pre-line"></div>
+    </div>
     <div class="grid cols-2">
       <div class="card"><h2>📥 Entrada / ajuste de mercancía</h2>
         <div class="search-box"><span class="scan-ico">🔎</span><input id="inv-scan" class="scan" autocomplete="off" placeholder="Escanea o busca el producto"></div>
@@ -1344,6 +1379,49 @@ function initInventario() {
     <div class="card"><div class="row" style="margin-bottom:10px"><h2 style="margin:0">Movimientos recientes</h2></div>
       <div class="table-wrap" style="max-height:420px"><table><thead><tr><th>Fecha</th><th class="multi-col">Sucursal</th><th>Producto</th><th>Tipo</th><th class="num">Cantidad</th><th>Referencia / nota</th></tr></thead><tbody id="inv-moves"></tbody></table></div></div>`;
   attachProductSearch($("#inv-scan"), (p) => p && invSelect(p.id));
+  S.reception = [];
+  const renderRc = () => {
+    $("#rc-body").innerHTML = S.reception.map((r, i) => `<tr data-i="${i}"><td><b>${esc(r.name)}</b><div class="small muted mono">${esc(r.sku)}</div></td>
+      <td>${r.serialized ? '<span class="badge info">Con serie</span>' : '<span class="badge">Sin serie</span>'}</td>
+      <td>${r.serialized
+        ? `<textarea data-r="serials" class="mono" style="min-height:70px;min-width:240px" placeholder="Escanea una serie por renglón">${esc(r.serials || "")}</textarea><div class="small muted" data-r="count">${(r.serials || "").split(/[\s,;]+/).filter(Boolean).length} serie(s)</div>`
+        : `<input data-r="qty" inputmode="decimal" value="${r.qty ?? ""}" placeholder="Piezas" style="width:110px">`}</td>
+      <td class="num"><input data-r="cost" inputmode="decimal" value="${r.cost ?? ""}" placeholder="${r.cur_cost ?? ""}" style="width:100px"></td>
+      <td><button class="sm danger icon-btn" data-r="rm">✕</button></td></tr>`).join("")
+      || '<tr><td colspan="5" class="empty">Escanea o busca productos para agregarlos a la recepción.</td></tr>';
+  };
+  attachProductSearch($("#rc-scan"), (p) => {
+    if (!p) return;
+    if (S.reception.some((r) => r.product_id === p.id)) return toast("Ese producto ya está en la recepción", "bad");
+    S.reception.push({ product_id: p.id, name: p.name, sku: p.sku, serialized: p.serialized, cur_cost: p.cost });
+    renderRc();
+    setTimeout(() => $(`#rc-body tr[data-i="${S.reception.length - 1}"] [data-r]`)?.focus(), 30);
+  });
+  $("#rc-body").addEventListener("input", (e) => {
+    const tr = e.target.closest("tr[data-i]"); if (!tr) return;
+    const r = S.reception[+tr.dataset.i];
+    r[e.target.dataset.r] = e.target.value;
+    if (e.target.dataset.r === "serials") $('[data-r="count"]', tr).textContent = `${e.target.value.split(/[\s,;]+/).filter(Boolean).length} serie(s)`;
+  });
+  $("#rc-body").addEventListener("click", (e) => {
+    if (!e.target.closest('[data-r="rm"]')) return;
+    S.reception.splice(+e.target.closest("tr").dataset.i, 1); renderRc();
+  });
+  $("#rc-save").onclick = async () => {
+    if (!S.reception.length) return toast("Agrega al menos un producto", "bad");
+    try {
+      const r = await POST("/api/inventory/receive", { lines: S.reception.map((x) => ({ product_id: x.product_id, qty: x.qty, serials: x.serials, cost: x.cost })),
+        reference: $("#rc-ref").value, notes: $("#rc-notes").value });
+      $("#rc-res").textContent = r.message;
+      toast(r.message, "ok");
+      if ($("#rc-lbl").checked) r.lines.forEach((l) => {
+        if (l.serialized) l.serials.forEach((imei) => queueItem({ product_id: l.product_id, name: l.name, sku: l.sku, imei, qty: 1, serialized: 1 }));
+        else queueItem({ product_id: l.product_id, name: l.name, sku: l.sku, qty: Math.round(l.qty), serialized: 0 });
+      });
+      S.reception = []; $("#rc-ref").value = ""; $("#rc-notes").value = ""; renderRc(); VIEWS.inventario();
+    } catch (e) { $("#rc-res").innerHTML = `<div class="danger">${esc(e.message)}</div>`; fail(e); }
+  };
+  renderRc();
   $("#inv-low").addEventListener("click", (e) => { const b = e.target.closest("[data-id]"); if (b) invSelect(+b.dataset.id); });
 }
 
@@ -1668,11 +1746,17 @@ VIEWS.config = async () => {
       <table><thead><tr><th>Sucursal</th><th>Clave folio</th><th>Dirección</th><th>Teléfono</th><th>Vende al público</th><th>Activa</th><th>Agente de impresión</th><th></th></tr></thead><tbody id="br-body"></tbody></table></div>
     <div data-p="users" class="card hidden">
       <p class="small muted" style="margin-top:0"><b>Administración</b>: todo, en todas las sucursales. <b>Matriz (supervisor)</b>: revisa todas las sucursales, da de alta productos y sube inventario a cualquiera (entradas, IMEI, traspasos, etiquetas) y ve sus ventas y cortes; no configura ni cancela ventas. <b>Cajero</b>: cobra las notas de los vendedores, hace notas, registra cambios por garantía, etiquetas, inventario, corte de caja. <b>Vendedor</b>: arma la venta y la envía a caja, consulta garantías (no ve costos, no cambia precios, no cancela ventas).</p>
+      <fieldset style="margin:0 0 14px"><legend>🔑 Clave de cancelación</legend>
+        <p class="small muted" style="margin-top:0">Los cajeros pueden cancelar notas de su sucursal escribiendo esta clave (Administración cancela sin clave). Estado: <b id="cx-state">${S.settings.cancel_password_set === "1" ? "definida" : "sin definir"}</b></p>
+        <div class="row"><input id="cx-new" type="password" placeholder="Nueva clave" style="max-width:200px" autocomplete="new-password"><button class="sm primary" id="cx-save">Guardar clave</button></div></fieldset>
       <div style="margin-bottom:12px">${field("seller_can_charge", "Permitir que los vendedores también cobren (si no, solo envían la nota a caja)", { type: "check" })}</div>
       <table><thead><tr><th>Usuario</th><th>Nombre (sale en el ticket)</th><th>Rol</th><th>Sucursal</th><th>Nueva contraseña</th><th>Activo</th><th></th></tr></thead><tbody id="usr-body"></tbody></table></div>
     <datalist id="dl-printers">${printers.map((p) => `<option value="${esc(p)}">`).join("")}</datalist>`;
   loadUsers();
   loadBranches();
+  $("#cx-save").onclick = async () => {
+    try { await PUT("/api/cancel-password", { password: $("#cx-new").value }); $("#cx-new").value = ""; $("#cx-state").textContent = "definida"; toast("Clave de cancelación guardada", "ok"); } catch (e) { fail(e); }
+  };
   $("#logo-up").onclick = async () => {
     const f = $("#logo-file").files[0]; if (!f) return toast("Selecciona una imagen", "bad");
     const fd = new FormData(); fd.append("file", f);

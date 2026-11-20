@@ -249,3 +249,4 @@ nav a:has(.nav-badge:not(.hidden)) kbd { margin-left: 6px; }
 .bodega-note .row { justify-content: center; margin-top: 12px; }
 textarea[data-k="warranty_policy"] { min-height: 220px; font-size: 13px; }
 select.w-required:has(option[value=""]:checked) { border-color: var(--warn); background: var(--warn-soft); }
+.toast { white-space: pre-line; }

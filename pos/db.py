@@ -377,7 +377,7 @@ def update_default_texts(conn):
 def get_settings(conn, branch_id=None):
     """Ajustes generales con los de la sucursal encima."""
     out = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")
-           if r["key"] not in ("secret_key", "branch_stock_migrated", "policy_always_migrated")}
+           if r["key"] not in ("secret_key", "branch_stock_migrated", "policy_always_migrated", "cancel_password_hash")}
     if branch_id:
         for r in conn.execute("SELECT key, value FROM branch_settings WHERE branch_id=?", (branch_id,)):
             out[r["key"]] = r["value"]

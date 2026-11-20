@@ -64,7 +64,8 @@ def test_labels_render(tpl):
 
 
 def _product(client, **kw):
-    data = {"name": "Funda Galaxy A15", "brand": "Samsung", "category_id": 2, "cost": 60, "price": 199, "initial_stock": 5}
+    data = {"name": "Funda Galaxy A15", "brand": "Samsung", "category_id": 2, "cost": 60, "price": 199, "initial_stock": 5,
+            "serialized": 0}
     data.update(kw)
     r = client.post("/api/products", json=data)
     assert r.status_code == 201, r.get_json()
@@ -146,7 +147,7 @@ def test_bulk_pricing_and_csv(client):
     assert r["rows"][0]["new_price"] == 209
     csv_text = client.get("/api/products/export.csv").get_data(as_text=True)
     assert p["sku"] in csv_text
-    data = "name,category,cost,price,stock\nCable USB-C 1m,Cables,35,99,12\n"
+    data = "name,category,cost,price,stock,serialized\nCable USB-C 1m,Cables,35,99,12,0\n"
     r = client.post("/api/products/import", data={"file": (io.BytesIO(data.encode()), "p.csv")},
                     content_type="multipart/form-data").get_json()
     assert r["created"] == 1 and not r["errors"]
@@ -261,8 +262,8 @@ def test_last_admin_and_password(app, client):
 
 
 def test_bulk_create_micas(client):
-    rows = [{"name": "Mica de hidrogel HD", "category_id": 3, "price": 259, "warranty_days": 180, "track_stock": 0, "ask_device": 1},
-            {"name": "Mica de hidrogel mate", "category_id": 3, "price": 259, "warranty_days": 180, "track_stock": 0},
+    rows = [{"name": "Mica de hidrogel HD", "category_id": 3, "price": 259, "warranty_days": 180, "track_stock": 0, "ask_device": 1, "serialized": 0},
+            {"name": "Mica de hidrogel mate", "category_id": 3, "price": 259, "warranty_days": 180, "track_stock": 0, "serialized": 0},
             {"name": ""}]
     r = client.post("/api/products/bulk", json={"rows": rows}).get_json()
     assert len(r["created"]) == 2 and not r["errors"]
@@ -394,7 +395,7 @@ def test_matriz_supervisor_role(app, client):
     me = m.get("/api/me").get_json()
     assert me["role_name"] == "Matriz (supervisor)" and me["can_switch_branch"]
     # da de alta productos y sube inventario directo a González Gallo
-    p = m.post("/api/products", json={"name": "Cargador 20W", "category_id": 4, "cost": 90, "price": 199}).get_json()
+    p = m.post("/api/products", json={"name": "Cargador 20W", "category_id": 4, "cost": 90, "price": 199, "serialized": 0}).get_json()
     assert m.post("/api/branch/select", json={"branch_id": 3}).status_code == 200
     assert m.post("/api/inventory/adjust", json={"product_id": p["id"], "kind": "entrada", "qty": 8}).status_code == 200
     assert m.post("/api/inventory/transfer", json={"product_id": p["id"], "to_branch_id": 2, "qty": 3}).status_code == 200
@@ -604,7 +605,7 @@ def test_cambio_en_articulo_sin_garantia(client):
 
 
 def test_csv_avisa_productos_sin_garantia(client):
-    data = "name,category,cost,price,stock\nCable USB-C 1m,Cables,35,99,12\n"
+    data = "name,category,cost,price,stock,serialized\nCable USB-C 1m,Cables,35,99,12,0\n"
     r = client.post("/api/products/import", data={"file": (io.BytesIO(data.encode()), "p.csv")},
                     content_type="multipart/form-data").get_json()
     assert r["created"] == 1 and "warranty_days" in r["warnings"][0]
@@ -614,3 +615,95 @@ def test_mercancia_recibida_con_numero_de_serie_alfanumerico(client):
     reloj = _product(client, name="Smartwatch", serialized=1, initial_stock=0, imeis="SN-A1B2C3\nSN-Z9Y8X7", warranty_days=30)
     incoming = {r["name"]: r for r in client.get("/api/inventory/incoming").get_json()}
     assert incoming["Smartwatch"]["imeis"] == ["SN-A1B2C3", "SN-Z9Y8X7"] and reloj["stock"] == 2
+
+
+
+# ---------------------------------------------------------------- con serie / sin serie y recepción
+def test_alta_exige_indicar_serie(client):
+    base = {"name": "Producto X", "category_id": 2, "price": 99, "warranty_days": 30}
+    r = client.post("/api/products", json=base)
+    assert r.status_code == 400 and "serie" in r.get_json()["error"]
+    assert client.post("/api/products", json={**base, "serialized": 0}).status_code == 201
+    # con serie: el inventario inicial no se acepta solo con cantidad
+    r = client.post("/api/products", json={**base, "name": "Tel 1", "serialized": 1, "initial_stock": 4})
+    assert r.status_code == 400 and "serie" in r.get_json()["error"]
+    r = client.post("/api/products", json={**base, "name": "Tel 2", "serialized": 1, "initial_stock": 3, "imeis": "351\n352"})
+    assert r.status_code == 400 and "3 piezas" in r.get_json()["error"]
+    t = client.post("/api/products", json={**base, "name": "Tel 3", "serialized": 1, "imeis": "353\n354"}).get_json()
+    assert t["stock"] == 2
+    # sin serie no acepta series
+    assert client.post("/api/products", json={**base, "name": "Cable", "serialized": 0, "imeis": "355"}).status_code == 400
+    # alta rápida y CSV también exigen indicarlo
+    r = client.post("/api/products/bulk", json={"rows": [{"name": "Sin decir", "price": 1, "warranty_days": 0}]}).get_json()
+    assert not r["created"] and "serie" in r["errors"][0]
+    data = "name,category,price\nCable sin decir,Cables,99\n"
+    r = client.post("/api/products/import", data={"file": (io.BytesIO(data.encode()), "p.csv")},
+                    content_type="multipart/form-data").get_json()
+    assert r["created"] == 0 and "serie" in r["errors"][0]
+
+
+def test_recepcion_de_mercancia(client):
+    """Recibí 10 piezas de un accesorio y 4 celulares con sus 4 series."""
+    funda = _product(client, name="Funda A07", initial_stock=0, warranty_days=30)
+    tel = _product(client, name="Galaxy A07", category_id=1, price=2899, serialized=1, initial_stock=0, warranty_days=365)
+    series = ["350000000000101", "350000000000102", "350000000000103", "350000000000104"]
+    # el celular no se acepta solo con cantidad
+    r = client.post("/api/inventory/receive", json={"lines": [{"product_id": funda["id"], "qty": 10},
+                                                              {"product_id": tel["id"], "qty": 4}]})
+    assert r.status_code == 400 and "lleva serie" in r.get_json()["error"]
+    assert client.get(f"/api/products/{funda['id']}").get_json()["stock"] == 0  # no se registró nada
+    # ni por la entrada individual
+    assert client.post("/api/inventory/adjust", json={"product_id": tel["id"], "kind": "entrada", "qty": 4}).status_code == 400
+    # cantidad que no coincide con las series
+    r = client.post("/api/inventory/receive", json={"lines": [{"product_id": tel["id"], "qty": 5, "serials": "\n".join(series)}]})
+    assert r.status_code == 400 and "5 piezas" in r.get_json()["error"]
+    # accesorio con series: rechazado
+    r = client.post("/api/inventory/receive", json={"lines": [{"product_id": funda["id"], "serials": "ABC"}]})
+    assert r.status_code == 400 and "no lleva serie" in r.get_json()["error"]
+    # correcta
+    r = client.post("/api/inventory/receive", json={"lines": [{"product_id": funda["id"], "qty": 10, "cost": 55},
+                                                              {"product_id": tel["id"], "qty": 4, "serials": "\n".join(series)}],
+                                                    "reference": "Factura 123"})
+    assert r.status_code == 200, r.get_json()
+    assert client.get(f"/api/products/{funda['id']}").get_json()["stock"] == 10
+    assert client.get(f"/api/products/{funda['id']}").get_json()["cost"] == 55
+    assert client.get(f"/api/products/{tel['id']}").get_json()["stock"] == 4
+    assert client.get(f"/api/lookup?code={series[0]}").get_json()["imei"] == series[0]
+    # series repetidas se rechazan
+    r = client.post("/api/inventory/receive", json={"lines": [{"product_id": tel["id"], "serials": series[0]}]})
+    assert r.status_code == 400 and "ya están registradas" in r.get_json()["error"]
+    # y aparecen en Mercancía recibida para etiquetar
+    inc = {x["name"]: x for x in client.get("/api/inventory/incoming").get_json()}
+    assert inc["Galaxy A07"]["imeis"] == series and inc["Funda A07"]["pending"] == 10
+
+
+def test_no_cambia_a_sin_serie_con_equipos(client):
+    tel = _product(client, name="Galaxy A07", category_id=1, serialized=1, initial_stock=0, imeis="350000000000201", warranty_days=365)
+    r = client.put(f"/api/products/{tel['id']}", json={"serialized": 0})
+    assert r.status_code == 400 and "sin serie" in r.get_json()["error"]
+
+
+def test_cajero_cancela_con_clave(app, client):
+    client.post("/api/users", json={"username": "caja", "full_name": "Ana", "role": "cajero", "password": "1234", "branch_id": 2})
+    client.post("/api/users", json={"username": "cajagg", "full_name": "Beto", "role": "cajero", "password": "1234", "branch_id": 3})
+    p = _product(client, name="Funda", initial_stock=5, warranty_days=30)
+    caja = login(app, "caja", "1234")
+    sale = caja.post("/api/sales", json={"items": [{"product_id": p["id"], "qty": 1}], "payment_method": "tarjeta",
+                                         "print": False}).get_json()["sale"]
+    url = f"/api/sales/{sale['id']}/cancel"
+    # sin clave definida por Administración
+    r = caja.post(url, json={"reason": "error", "password": "x"})
+    assert r.status_code == 403 and "clave de cancelación" in r.get_json()["error"]
+    assert client.put("/api/cancel-password", json={"password": "7788"}).status_code == 200
+    assert client.get("/api/settings").get_json()["settings"]["cancel_password_set"] == "1"
+    assert "7788" not in str(client.get("/api/settings").get_json())
+    assert caja.post(url, json={"reason": "error", "password": "mal"}).status_code == 403
+    assert caja.post(url, json={"password": "7788"}).status_code == 400  # falta motivo
+    # otra sucursal no puede, aunque tenga la clave
+    assert login(app, "cajagg", "1234").post(url, json={"reason": "x", "password": "7788"}).status_code == 403
+    r = caja.post(url, json={"reason": "se cobró doble", "password": "7788"})
+    assert r.status_code == 200 and r.get_json()["status"] == "cancelada" and "Cancelada por Ana: se cobró doble" in r.get_json()["notes"]
+    assert caja.get(f"/api/products/{p['id']}").get_json()["stock"] == 5
+    # el vendedor no puede cancelar
+    client.post("/api/users", json={"username": "vend", "full_name": "Luis", "role": "vendedor", "password": "1234", "branch_id": 2})
+    assert login(app, "vend", "1234").post(url, json={"reason": "x", "password": "7788"}).status_code == 403
