@@ -71,6 +71,13 @@ teléfono (salen en el ticket de esa sucursal). En **Usuarios** asigna la sucurs
 Para mover mercancía: **Inventario** → selecciona el producto → “Traspaso a otra sucursal”
 (los celulares se traspasan escaneando su IMEI).
 
+### Etiqueta de productos de la tienda (2.9 x 2.2 cm)
+La plantilla predeterminada es **"Hospital 2.9 x 2.2 cm (ZD220)"**, con la misma configuración que la
+etiqueta de ZebraDesigner de la tienda: Zebra ZD220 a 203 dpi, 232 x 176 puntos, etiquetas con separación
+(`^MNY`), margen 8x6 puntos y sin acentos; impresora USB `ZDesigner ZD220-203dpi ZPL`. Lleva SKU, precio
+grande, marca, modelo y código de barras (en celulares, el del IMEI). Si sale al revés, en Configuración →
+Etiquetas Zebra marca "girar 180°". Las otras plantillas siguen disponibles.
+
 ### Etiquetas en cada sucursal
 Cada sucursal tiene su propia Zebra y etiqueta **lo que tiene en su inventario**. Ejemplo: la Matriz traspasa
 8 Samsung A07 a González Gallo → en González Gallo, **Etiquetas Zebra → Mercancía recibida** muestra

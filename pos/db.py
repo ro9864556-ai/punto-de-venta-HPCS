@@ -145,13 +145,14 @@ DEFAULT_SETTINGS = {
     "label_printer_mode": "local",
     "label_printer_host": "",
     "label_printer_port": "9100",
-    "label_printer_name": "",
+    "label_printer_name": "ZDesigner ZD220-203dpi ZPL",
     "label_dpi": "203",
     "label_darkness": "15",
     "label_speed": "4",
     "label_offset_x": "0",
     "label_offset_y": "0",
-    "label_template": "accesorio_50x25",
+    "label_template": "hospital_29x22",
+    "label_invert": "0",
     "label_show_store": "1",
     "price_rounding": "9",
     "default_markup": "100",
@@ -283,7 +284,7 @@ BRANCH_KEYS = [
     "ticket_printer_mode", "ticket_printer_host", "ticket_printer_port", "ticket_printer_name", "ticket_width",
     "ticket_open_drawer", "ticket_copies", "ticket_zebra_width_mm",
     "label_printer_mode", "label_printer_host", "label_printer_port", "label_printer_name", "label_dpi",
-    "label_darkness", "label_speed", "label_offset_x", "label_offset_y", "label_template",
+    "label_darkness", "label_speed", "label_offset_x", "label_offset_y", "label_template", "label_invert",
 ]
 
 
@@ -372,12 +373,18 @@ def update_default_texts(conn):
         # antes el valor predeterminado era 'garantia'; ahora las políticas van en todas las notas
         conn.execute("UPDATE settings SET value='siempre' WHERE key='warranty_policy_print' AND value='garantia'")
         conn.execute("INSERT INTO settings(key, value) VALUES ('policy_always_migrated', '1')")
+    if not conn.execute("SELECT 1 FROM settings WHERE key='label_hospital_migrated'").fetchone():
+        # el rollo de la tienda es de 2.9 x 2.2 cm en una ZD220 (configuración de su etiqueta de ZebraDesigner)
+        conn.execute("UPDATE settings SET value='hospital_29x22' WHERE key='label_template' AND value='accesorio_50x25'")
+        conn.execute("UPDATE settings SET value='ZDesigner ZD220-203dpi ZPL' WHERE key='label_printer_name' AND value=''")
+        conn.execute("INSERT INTO settings(key, value) VALUES ('label_hospital_migrated', '1')")
 
 
 def get_settings(conn, branch_id=None):
     """Ajustes generales con los de la sucursal encima."""
     out = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")
-           if r["key"] not in ("secret_key", "branch_stock_migrated", "policy_always_migrated", "cancel_password_hash")}
+           if r["key"] not in ("secret_key", "branch_stock_migrated", "policy_always_migrated", "cancel_password_hash",
+                               "label_hospital_migrated")}
     if branch_id:
         for r in conn.execute("SELECT key, value FROM branch_settings WHERE branch_id=?", (branch_id,)):
             out[r["key"]] = r["value"]

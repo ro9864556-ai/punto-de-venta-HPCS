@@ -1723,6 +1723,7 @@ VIEWS.config = async () => {
       ${field("label_darkness", "Oscuridad (0–30)")}${field("label_speed", "Velocidad (pulg/seg)")}
       ${field("label_offset_x", "Desplazamiento X (mm)")}${field("label_offset_y", "Desplazamiento Y (mm)")}
       ${field("label_show_store", "Imprimir nombre de la tienda en la etiqueta", { type: "check", span: 2 })}
+      ${field("label_invert", "La etiqueta sale al revés: girar 180° (^POI)", { type: "check", span: 2 })}
       </div><div class="row" style="margin-top:12px"><button id="z-test">🏷️ Etiqueta de prueba</button><span class="small muted">Para USB en Windows instala el driver ZDesigner y <span class="mono">pip install pywin32</span>.</span></div></div>
     <div data-p="precios" class="card hidden"><div class="form-grid">
       ${field("currency_symbol", "Símbolo de moneda")}${field("tax_rate", "IVA %")}

@@ -707,3 +707,32 @@ def test_cajero_cancela_con_clave(app, client):
     # el vendedor no puede cancelar
     client.post("/api/users", json={"username": "vend", "full_name": "Luis", "role": "vendedor", "password": "1234", "branch_id": 2})
     assert login(app, "vend", "1234").post(url, json={"reason": "x", "password": "7788"}).status_code == 403
+
+
+
+def test_etiqueta_hospital_29x22(client):
+    """Misma configuración que su etiqueta de ZebraDesigner: ZD220, 203 dpi, 2.9 x 2.2 cm, ^MNY, sin acentos."""
+    from pos.labels import label_zpl
+    s = client.get("/api/settings").get_json()["settings"]
+    assert s["label_template"] == "hospital_29x22" and s["label_printer_name"] == "ZDesigner ZD220-203dpi ZPL"
+    tel = _product(client, name="Samsung Galaxy A07 4GB/128GB Verde", brand="Samsung", model="Galaxy A07", category_id=1,
+                   price=2899, serialized=1, initial_stock=0, imeis="350000000000000", warranty_days=365)
+    funda = _product(client, name="Funda uso rudo Galaxy A07 rosa", brand="Genérico", category_id=2, price=199, warranty_days=30)
+    r = client.post("/api/labels/zpl", json={"items": [{"product_id": tel["id"], "all_imeis": True},
+                                                       {"product_id": funda["id"], "qty": 3}]}).get_json()
+    zpl = r["zpl"]
+    assert r["count"] == 4 and zpl.count("^XA") == 2
+    for frag in ("^PW232", "^LL176", "^MNY", "$2,899", "MARCA: Samsung", "MODELO: Galaxy A07", "IMEI: 350000000000000",
+                 "$199", "MARCA: Generico", "^PQ3"):
+        assert frag in zpl, frag
+    assert "é" not in zpl and "Genérico" not in zpl  # sin acentos, como su sistema
+    # cabe en la etiqueta: nada se sale de 232 x 176 puntos
+    import re
+    for x, y in re.findall(r"\^FO(\d+),(\d+)", zpl):
+        assert int(x) < 232 and int(y) < 176
+    # vista previa
+    p = client.post("/api/labels/preview", json={"item": {"product_id": funda["id"]}}).get_json()
+    assert "<svg" in p["svg"] and "Generico" in p["svg"]
+    # girar 180° si sale al revés
+    client.put("/api/settings", json={"label_invert": "1"})
+    assert "^POI" in client.post("/api/labels/zpl", json={"items": [{"product_id": funda["id"], "qty": 1}]}).get_json()["zpl"]
